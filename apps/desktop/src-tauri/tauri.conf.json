@@ -26,10 +26,7 @@
       "icons/icon.icns",
       "icons/icon.ico"
     ],
-    "targets": "all",
-    "windows": {
-      "webviewInstallMode": "embedBootstrapper"
-    }
+    "targets": "all"
   },
   "identifier": "com.streamflow.lite",
   "productName": "StreamFlow Lite",
