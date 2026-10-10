@@ -1,0 +1,10 @@
+[package]
+name = "sf-capture"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+thiserror.workspace = true
+v4l = "0.14"
+ffmpeg-next = "6"

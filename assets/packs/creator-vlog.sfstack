@@ -1,0 +1,50 @@
+{
+  "slots": [
+    {
+      "id": "966911a6-e421-42e9-b72c-830a6c5cb783",
+      "filter": {
+        "Look": {
+          "preset_id": "vlog-fresh",
+          "intensity": 0.9
+        }
+      },
+      "enabled": true,
+      "intensity": 1.0,
+      "mask": null
+    },
+    {
+      "id": "a01d4547-8944-4445-bb00-92693fddff67",
+      "filter": {
+        "Effect": {
+          "kind": "Sharpen",
+          "params": {
+            "amount": 0.5,
+            "radius": 0.0,
+            "softness": 0.5,
+            "center": [
+              0.5,
+              0.5
+            ],
+            "color": [
+              0.0,
+              0.5,
+              0.0
+            ],
+            "threshold": 0.8,
+            "zoom": 1.5,
+            "aspect": 2.39,
+            "k1": 0.0,
+            "k2": 0.0,
+            "axis": "Horizontal",
+            "spill": 0.5,
+            "tolerance": 0.15,
+            "key_softness": 0.2
+          }
+        }
+      },
+      "enabled": true,
+      "intensity": 0.5,
+      "mask": null
+    }
+  ]
+}

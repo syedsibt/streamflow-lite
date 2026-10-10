@@ -1,0 +1,9 @@
+{
+  "name": "Broadcast Neutral",
+  "version": 1,
+  "category": "Natural",
+  "params": {
+    "saturation": 100
+  },
+  "skin_protect": true
+}

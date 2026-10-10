@@ -1,0 +1,9 @@
+{
+  "name": "Classic B&W",
+  "version": 1,
+  "category": "B&W",
+  "params": {
+    "saturation": 0
+  },
+  "skin_protect": false
+}

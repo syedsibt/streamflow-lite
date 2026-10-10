@@ -1,0 +1,12 @@
+{
+  "name": "Moody",
+  "version": 1,
+  "category": "Cinematic",
+  "params": {
+    "exposure": -0.3,
+    "contrast": 18,
+    "saturation": 85,
+    "shadows": -15
+  },
+  "skin_protect": true
+}

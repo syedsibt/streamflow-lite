@@ -1,0 +1,20 @@
+[package]
+name = "sf-engine"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+wgpu.workspace = true
+sf-render = { path = "../sf-render" }
+sf-scopes = { path = "../sf-scopes" }
+sf-state = { path = "../sf-state" }
+sf-filters = { path = "../sf-filters" }
+sf-filterfx = { path = "../sf-filterfx" }
+sf-ai-color = { path = "../sf-ai-color" }
+sf-ai-runtime = { path = "../sf-ai-runtime" }
+thiserror.workspace = true
+
+[dev-dependencies]
+uuid.workspace = true
+serde_json.workspace = true

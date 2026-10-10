@@ -1,0 +1,13 @@
+{
+  "name": "Polaroid",
+  "version": 1,
+  "category": "Vintage",
+  "params": {
+    "exposure": 0.2,
+    "contrast": -10,
+    "saturation": 90,
+    "temperature": 5600,
+    "whites": -15
+  },
+  "skin_protect": true
+}

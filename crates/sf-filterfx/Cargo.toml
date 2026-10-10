@@ -1,0 +1,12 @@
+[package]
+name = "sf-filterfx"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+wgpu.workspace = true
+bytemuck.workspace = true
+thiserror.workspace = true
+sf-filters = { path = "../sf-filters" }
+sf-render = { path = "../sf-render" }

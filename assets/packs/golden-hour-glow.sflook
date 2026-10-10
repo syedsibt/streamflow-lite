@@ -1,0 +1,20 @@
+{
+  "name": "Golden Hour Glow",
+  "version": 1,
+  "category": "Creator",
+  "params": {
+    "exposure": 0.15,
+    "contrast": 10,
+    "saturation": 108,
+    "temperature": 5200,
+    "tint": 3,
+    "shadows": 8,
+    "gain": [
+      1.04,
+      1.0,
+      0.95,
+      1.0
+    ]
+  },
+  "skin_protect": true
+}

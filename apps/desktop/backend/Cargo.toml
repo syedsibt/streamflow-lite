@@ -1,0 +1,28 @@
+[package]
+name = "sf-ui-backend"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Headless-testable engine bindings for the StreamFlow Lite Tauri+React shell (apps/desktop). No tauri dependency here — src-tauri is a thin adapter over this crate."
+
+[dependencies]
+sf-engine = { path = "../../../crates/sf-engine" }
+sf-ipc = { path = "../../../crates/sf-ipc" }
+sf-color = { path = "../../../crates/sf-color" }
+sf-filters = { path = "../../../crates/sf-filters" }
+sf-scopes = { path = "../../../crates/sf-scopes" }
+sf-ai-color = { path = "../../../crates/sf-ai-color" }
+sf-state = { path = "../../../crates/sf-state" }
+sf-capture = { path = "../../../crates/sf-capture" }
+sf-encode = { path = "../../../crates/sf-encode" }
+sf-output = { path = "../../../crates/sf-output" }
+sf-audio = { path = "../../../crates/sf-audio" }
+serde = { workspace = true }
+serde_json = { workspace = true }
+uuid = { workspace = true }
+thiserror = { workspace = true }
+# PNG encoding for preview frames only (default-features off keeps it lean).
+image = { version = "0.25", default-features = false, features = ["png"] }
+
+[dev-dependencies]
+serde_json = { workspace = true }

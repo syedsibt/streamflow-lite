@@ -1,0 +1,76 @@
+# StreamFlow Lite — Windows CI.
+# Builds the Tauri v2 app on a GitHub-hosted Windows runner and uploads the
+# NSIS installer (+ portable exe) as artifacts.
+#
+# Notes:
+# - FFmpeg comes from vcpkg (ffmpeg-sys-next has built-in vcpkg support).
+#   First run takes ~20-30 min to build FFmpeg from source.
+# - GPU tests cannot pass on the runner (no GPU) -> tests are non-blocking,
+#   same as the v0.1.0 workflow. The .exe is the deliverable.
+# - FFmpeg DLLs are staged into src-tauri/ffmpeg-dlls and injected into
+#   bundle.resources (CI-only; local builds untouched).
+name: Windows Build
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main, master]
+
+jobs:
+  build-windows:
+    runs-on: windows-2022
+    defaults:
+      run:
+        shell: powershell
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+          cache-dependency-path: apps/desktop/package-lock.json
+
+      - name: Install frontend deps
+        working-directory: apps/desktop
+        run: npm ci
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install FFmpeg (vcpkg)
+        run: |
+          C:\vcpkg\vcpkg install ffmpeg:x64-windows --clean-after-build
+          "VCPKG_ROOT=C:\vcpkg" >> $env:GITHUB_ENV
+
+      - name: Generate app icons
+        working-directory: apps/desktop
+        run: npx -y @tauri-apps/cli@2 icon src-tauri/icons/icon.png
+
+      - name: Cargo test (workspace)
+        run: cargo test --workspace
+        # GPU tests need a real GPU; the runner has none. Non-blocking.
+        continue-on-error: true
+
+      - name: Stage FFmpeg DLLs + wire into bundle
+        run: |
+          New-Item -ItemType Directory -Force -Path "apps\desktop\src-tauri\ffmpeg-dlls" | Out-Null
+          Copy-Item "C:\vcpkg\installed\x64-windows\bin\av*.dll" "apps\desktop\src-tauri\ffmpeg-dlls\"
+          Copy-Item "C:\vcpkg\installed\x64-windows\bin\sw*.dll" "apps\desktop\src-tauri\ffmpeg-dlls\"
+          $confPath = "apps\desktop\src-tauri\tauri.conf.json"
+          $json = Get-Content $confPath -Raw | ConvertFrom-Json
+          $json.bundle | Add-Member -NotePropertyName "resources" -NotePropertyValue @("ffmpeg-dlls/av*.dll", "ffmpeg-dlls/sw*.dll") -Force
+          $json | ConvertTo-Json -Depth 30 | Set-Content $confPath -Encoding UTF8
+          Get-ChildItem "apps\desktop\src-tauri\ffmpeg-dlls\"
+
+      - name: Build Tauri app
+        uses: tauri-apps/tauri-action@v0
+        with:
+          projectPath: apps/desktop
+
+      - name: Upload portable exe
+        uses: actions/upload-artifact@v4
+        with:
+          name: streamflow-lite-windows-x64-portable
+          path: apps/desktop/src-tauri/target/release/*.exe

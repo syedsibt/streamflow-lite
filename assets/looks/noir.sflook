@@ -1,0 +1,12 @@
+{
+  "name": "Noir",
+  "version": 1,
+  "category": "B&W",
+  "params": {
+    "saturation": 0,
+    "exposure": -0.2,
+    "contrast": 20,
+    "shadows": -20
+  },
+  "skin_protect": false
+}

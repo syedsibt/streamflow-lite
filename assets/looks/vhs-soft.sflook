@@ -1,0 +1,11 @@
+{
+  "name": "VHS Soft",
+  "version": 1,
+  "category": "Vintage",
+  "params": {
+    "saturation": 85,
+    "contrast": -8,
+    "temperature": 6000
+  },
+  "skin_protect": true
+}

@@ -1,0 +1,11 @@
+{
+  "name": "Concert Vivid",
+  "version": 1,
+  "category": "Event",
+  "params": {
+    "saturation": 125,
+    "vibrance": 20,
+    "contrast": 12
+  },
+  "skin_protect": true
+}

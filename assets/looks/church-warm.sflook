@@ -1,0 +1,11 @@
+{
+  "name": "Church Warm",
+  "version": 1,
+  "category": "Event",
+  "params": {
+    "temperature": 5200,
+    "exposure": 0.2,
+    "saturation": 105
+  },
+  "skin_protect": true
+}

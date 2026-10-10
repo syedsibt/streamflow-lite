@@ -1,0 +1,21 @@
+[package]
+name = "streamflow-lite-desktop"
+version = "0.1.0"
+edition = "2021"
+description = "StreamFlow Lite desktop shell (Tauri 2 + React). Thin adapter over sf-ui-backend — all engine logic lives there."
+
+[build-dependencies]
+# Note: tauri-build is versioned independently from tauri (2.7.x is current
+# for tauri 2.12.x) — hence the bare "2" requirement.
+tauri-build = { version = "2" }
+
+[dependencies]
+tauri = { version = "2" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+base64 = "0.22"
+uuid = { version = "1", features = ["v4"] }
+sf-ui-backend = { path = "../backend" }
+sf-ipc = { path = "../../../crates/sf-ipc" }
+sf-filters = { path = "../../../crates/sf-filters" }
+sf-color = { path = "../../../crates/sf-color" }

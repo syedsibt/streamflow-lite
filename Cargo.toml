@@ -1,0 +1,22 @@
+[workspace]
+members = ["crates/*", "tools/gen-lut", "apps/desktop/backend"]
+# src-tauri is intentionally NOT a workspace member: it builds as a standalone
+# Tauri app (avoids feature unification with the engine workspace).
+exclude = ["apps/desktop/src-tauri"]
+resolver = "2"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+authors = ["StreamFlow"]
+
+[workspace.dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+uuid = { version = "1", features = ["v4", "serde"] }
+bytemuck = { version = "1", features = ["derive"] }
+thiserror = "1"
+pollster = "0.3"
+# Pinned by the C0 implementer — verify with `cargo build` after any change.
+wgpu = "22"

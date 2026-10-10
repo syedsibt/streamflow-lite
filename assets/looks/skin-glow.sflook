@@ -1,0 +1,17 @@
+{
+  "name": "Skin Glow",
+  "version": 1,
+  "category": "Creator",
+  "params": {
+    "saturation": 103,
+    "temperature": 5600,
+    "highlights": -10,
+    "gain": [
+      1.02,
+      1.0,
+      0.98,
+      1.0
+    ]
+  },
+  "skin_protect": true
+}

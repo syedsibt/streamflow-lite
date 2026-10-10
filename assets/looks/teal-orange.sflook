@@ -1,0 +1,24 @@
+{
+  "name": "Teal Orange",
+  "version": 1,
+  "category": "Cinematic",
+  "params": {
+    "temperature": 7000,
+    "tint": -8,
+    "saturation": 110,
+    "contrast": 12,
+    "lift": [
+      0,
+      0.01,
+      0.02,
+      0
+    ],
+    "gain": [
+      1.05,
+      1.0,
+      0.95,
+      1.0
+    ]
+  },
+  "skin_protect": true
+}

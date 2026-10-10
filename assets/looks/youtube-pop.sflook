@@ -1,0 +1,12 @@
+{
+  "name": "YouTube Pop",
+  "version": 1,
+  "category": "Creator",
+  "params": {
+    "contrast": 15,
+    "saturation": 118,
+    "vibrance": 15,
+    "sharpness": 20
+  },
+  "skin_protect": true
+}

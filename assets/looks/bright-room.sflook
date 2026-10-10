@@ -1,0 +1,12 @@
+{
+  "name": "Bright Room",
+  "version": 1,
+  "category": "Natural",
+  "params": {
+    "exposure": 0.3,
+    "shadows": 20,
+    "blacks": 10,
+    "temperature": 6000
+  },
+  "skin_protect": true
+}

@@ -1,0 +1,11 @@
+{
+  "name": "Conference Cool",
+  "version": 1,
+  "category": "Event",
+  "params": {
+    "temperature": 7000,
+    "saturation": 98,
+    "contrast": 8
+  },
+  "skin_protect": true
+}

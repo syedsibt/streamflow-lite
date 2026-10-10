@@ -1,0 +1,14 @@
+[package]
+name = "sf-ai-color"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+sf-color = { path = "../sf-color" }
+sf-filters = { path = "../sf-filters" }
+sf-scopes = { path = "../sf-scopes" }
+sf-ai-runtime = { path = "../sf-ai-runtime" }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }

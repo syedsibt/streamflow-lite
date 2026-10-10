@@ -1,0 +1,12 @@
+{
+  "name": "Soft Natural",
+  "version": 1,
+  "category": "Natural",
+  "params": {
+    "contrast": -5,
+    "saturation": 95,
+    "highlights": -10,
+    "temperature": 5800
+  },
+  "skin_protect": true
+}

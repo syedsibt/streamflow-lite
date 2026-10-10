@@ -1,0 +1,10 @@
+[package]
+name = "gen-lut"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+description = "Committed generator for the built-in podcast_warm.cube 3D LUT (C8)"
+
+[[bin]]
+name = "gen-lut"
+path = "src/main.rs"

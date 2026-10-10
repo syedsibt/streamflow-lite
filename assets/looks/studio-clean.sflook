@@ -1,0 +1,10 @@
+{
+  "name": "Studio Clean",
+  "version": 1,
+  "category": "Natural",
+  "params": {
+    "contrast": 5,
+    "saturation": 102
+  },
+  "skin_protect": true
+}

@@ -1,0 +1,29 @@
+{
+  "name": "Podcast Warm",
+  "version": 1,
+  "category": "Creator",
+  "params": {
+    "exposure": 0.1,
+    "contrast": 8,
+    "saturation": 104,
+    "temperature": 5400,
+    "tint": 2,
+    "lift": [
+      0,
+      0,
+      0.01,
+      0
+    ],
+    "gain": [
+      1.03,
+      1.0,
+      0.97,
+      1.0
+    ]
+  },
+  "lut": {
+    "file": "color/luts/podcast_warm.cube",
+    "intensity": 0.6
+  },
+  "skin_protect": true
+}

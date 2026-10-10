@@ -1,0 +1,14 @@
+{
+  "name": "Arctic Clean",
+  "version": 1,
+  "category": "Natural",
+  "params": {
+    "exposure": 0.05,
+    "contrast": 6,
+    "saturation": 96,
+    "temperature": 7200,
+    "tint": -2,
+    "whites": 5
+  },
+  "skin_protect": true
+}

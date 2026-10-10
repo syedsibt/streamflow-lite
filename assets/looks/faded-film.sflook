@@ -1,0 +1,17 @@
+{
+  "name": "Faded Film",
+  "version": 1,
+  "category": "Vintage",
+  "params": {
+    "contrast": -15,
+    "blacks": 30,
+    "saturation": 80,
+    "lift": [
+      0.04,
+      0.04,
+      0.04,
+      0
+    ]
+  },
+  "skin_protect": true
+}

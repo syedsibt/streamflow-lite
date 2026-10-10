@@ -1,0 +1,12 @@
+{
+  "name": "Fix Flat Camera",
+  "version": 1,
+  "category": "Fix",
+  "params": {
+    "contrast": 20,
+    "saturation": 110,
+    "blacks": -8,
+    "whites": 8
+  },
+  "skin_protect": true
+}

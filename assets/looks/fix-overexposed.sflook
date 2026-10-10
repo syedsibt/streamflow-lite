@@ -1,0 +1,11 @@
+{
+  "name": "Fix Overexposed",
+  "version": 1,
+  "category": "Fix",
+  "params": {
+    "exposure": -0.7,
+    "highlights": -30,
+    "whites": -20
+  },
+  "skin_protect": true
+}

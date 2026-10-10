@@ -1,0 +1,12 @@
+{
+  "name": "Vlog Fresh",
+  "version": 1,
+  "category": "Creator",
+  "params": {
+    "exposure": 0.2,
+    "saturation": 108,
+    "temperature": 6200,
+    "shadows": 15
+  },
+  "skin_protect": true
+}

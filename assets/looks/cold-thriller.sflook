@@ -1,0 +1,18 @@
+{
+  "name": "Cold Thriller",
+  "version": 1,
+  "category": "Cinematic",
+  "params": {
+    "temperature": 7500,
+    "tint": 5,
+    "saturation": 90,
+    "contrast": 15,
+    "lift": [
+      0.01,
+      0.01,
+      0.02,
+      0
+    ]
+  },
+  "skin_protect": true
+}

@@ -1,0 +1,18 @@
+{
+  "name": "Neon Night",
+  "version": 1,
+  "category": "Gaming/Screen",
+  "params": {
+    "saturation": 115,
+    "temperature": 7500,
+    "tint": -10,
+    "contrast": 15,
+    "gain": [
+      0.95,
+      1.0,
+      1.1,
+      1.0
+    ]
+  },
+  "skin_protect": true
+}

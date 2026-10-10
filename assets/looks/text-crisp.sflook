@@ -1,0 +1,10 @@
+{
+  "name": "Text Crisp",
+  "version": 1,
+  "category": "Gaming/Screen",
+  "params": {
+    "contrast": 18,
+    "sharpness": 40
+  },
+  "skin_protect": true
+}

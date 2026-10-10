@@ -1,0 +1,12 @@
+{
+  "name": "Talking Head",
+  "version": 1,
+  "category": "Creator",
+  "params": {
+    "exposure": 0.15,
+    "contrast": 10,
+    "temperature": 5800,
+    "sharpness": 15
+  },
+  "skin_protect": true
+}

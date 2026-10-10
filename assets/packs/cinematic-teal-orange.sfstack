@@ -1,0 +1,118 @@
+{
+  "slots": [
+    {
+      "id": "b768186a-a25f-478b-972a-ccc41abe52f5",
+      "filter": {
+        "Look": {
+          "preset_id": "teal-orange",
+          "intensity": 1.0
+        }
+      },
+      "enabled": true,
+      "intensity": 1.0,
+      "mask": null
+    },
+    {
+      "id": "ae8185dc-6fec-43de-bc58-ac3b1c3d3e03",
+      "filter": {
+        "Effect": {
+          "kind": "FilmGrain",
+          "params": {
+            "amount": 0.4,
+            "radius": 0.0,
+            "softness": 0.5,
+            "center": [
+              0.5,
+              0.5
+            ],
+            "color": [
+              0.0,
+              0.5,
+              0.0
+            ],
+            "threshold": 0.8,
+            "zoom": 1.5,
+            "aspect": 2.39,
+            "k1": 0.0,
+            "k2": 0.0,
+            "axis": "Horizontal",
+            "spill": 0.5,
+            "tolerance": 0.15,
+            "key_softness": 0.2
+          }
+        }
+      },
+      "enabled": true,
+      "intensity": 0.5,
+      "mask": null
+    },
+    {
+      "id": "07d4908c-baa8-4280-bc46-1302507ecbed",
+      "filter": {
+        "Effect": {
+          "kind": "Vignette",
+          "params": {
+            "amount": 0.5,
+            "radius": 0.0,
+            "softness": 0.5,
+            "center": [
+              0.5,
+              0.5
+            ],
+            "color": [
+              0.0,
+              0.5,
+              0.0
+            ],
+            "threshold": 0.8,
+            "zoom": 1.5,
+            "aspect": 2.39,
+            "k1": 0.0,
+            "k2": 0.0,
+            "axis": "Horizontal",
+            "spill": 0.5,
+            "tolerance": 0.15,
+            "key_softness": 0.2
+          }
+        }
+      },
+      "enabled": true,
+      "intensity": 0.7,
+      "mask": null
+    },
+    {
+      "id": "3e62b013-bf3a-44fa-84e4-dfe92ea14d0b",
+      "filter": {
+        "Effect": {
+          "kind": "Letterbox",
+          "params": {
+            "amount": 1.0,
+            "radius": 0.0,
+            "softness": 0.5,
+            "center": [
+              0.5,
+              0.5
+            ],
+            "color": [
+              0.0,
+              0.5,
+              0.0
+            ],
+            "threshold": 0.8,
+            "zoom": 1.5,
+            "aspect": 2.39,
+            "k1": 0.0,
+            "k2": 0.0,
+            "axis": "Horizontal",
+            "spill": 0.5,
+            "tolerance": 0.15,
+            "key_softness": 0.2
+          }
+        }
+      },
+      "enabled": true,
+      "intensity": 1.0,
+      "mask": null
+    }
+  ]
+}

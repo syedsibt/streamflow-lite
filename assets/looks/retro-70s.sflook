@@ -1,0 +1,23 @@
+{
+  "name": "Retro 70s",
+  "version": 1,
+  "category": "Vintage",
+  "params": {
+    "temperature": 5200,
+    "saturation": 85,
+    "contrast": -5,
+    "lift": [
+      0.03,
+      0.02,
+      0,
+      0
+    ],
+    "gain": [
+      1.05,
+      0.98,
+      0.9,
+      1.0
+    ]
+  },
+  "skin_protect": true
+}

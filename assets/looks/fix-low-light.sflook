@@ -1,0 +1,12 @@
+{
+  "name": "Fix Low Light",
+  "version": 1,
+  "category": "Fix",
+  "params": {
+    "exposure": 0.8,
+    "shadows": 30,
+    "blacks": 15,
+    "saturation": 95
+  },
+  "skin_protect": true
+}

@@ -1,0 +1,12 @@
+{
+  "name": "Matte Cinema",
+  "version": 1,
+  "category": "Cinematic",
+  "params": {
+    "contrast": -8,
+    "blacks": 25,
+    "whites": -10,
+    "saturation": 92
+  },
+  "skin_protect": true
+}

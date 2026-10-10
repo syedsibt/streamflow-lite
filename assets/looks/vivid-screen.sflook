@@ -1,0 +1,11 @@
+{
+  "name": "Vivid Screen",
+  "version": 1,
+  "category": "Gaming/Screen",
+  "params": {
+    "saturation": 120,
+    "contrast": 10,
+    "sharpness": 25
+  },
+  "skin_protect": true
+}
