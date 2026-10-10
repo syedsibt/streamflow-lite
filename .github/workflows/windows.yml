@@ -65,8 +65,9 @@ jobs:
       - name: Stage FFmpeg DLLs + wire into bundle
         run: |
           New-Item -ItemType Directory -Force -Path "apps\desktop\src-tauri\ffmpeg-dlls" | Out-Null
-          Copy-Item "C:\ffmpeg\bin\av*.dll" "apps\desktop\src-tauri\ffmpeg-dlls\"
-          Copy-Item "C:\ffmpeg\bin\sw*.dll" "apps\desktop\src-tauri\ffmpeg-dlls\"
+          # ALL FFmpeg DLLs (av*, sw*, postproc, …) — the loader reports them
+          # one at a time, so a partial set just moves the error to the next.
+          Copy-Item "C:\ffmpeg\bin\*.dll" "apps\desktop\src-tauri\ffmpeg-dlls\"
           $confPath = "apps\desktop\src-tauri\tauri.conf.json"
           $json = Get-Content $confPath -Raw | ConvertFrom-Json
           # Map each DLL to the bundle root so it lands NEXT TO the exe.
