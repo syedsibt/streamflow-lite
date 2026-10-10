@@ -81,11 +81,18 @@ pub enum SourceKind {
 
 impl SourceKind {
     /// True for kinds that produce real frames today.
+    ///
+    /// `Camera` is real on Windows (DirectShow via `sf-capture::dshow`);
+    /// on other platforms it has no backend yet.
     pub fn is_real(&self) -> bool {
-        matches!(
-            self,
-            SourceKind::TestPattern | SourceKind::Color { .. } | SourceKind::Media { .. }
-        )
+        match self {
+            SourceKind::TestPattern | SourceKind::Color { .. } | SourceKind::Media { .. } => true,
+            #[cfg(windows)]
+            SourceKind::Camera => true,
+            #[cfg(not(windows))]
+            SourceKind::Camera => false,
+            _ => false,
+        }
     }
 
     /// Why a pending kind has no frames, if pending.
@@ -737,10 +744,14 @@ impl Shell {
     ) -> Result<SourceState, ShellError> {
         let kind = parse_source_kind(kind, color, text, path)?;
         let id = Uuid::new_v4().to_string();
-        // Open media producers BEFORE the source is pushed, so a bad file
-        // fails cleanly without leaving a half-added source.
+        // Open producers BEFORE the source is pushed, so a bad file or
+        // missing camera fails cleanly without leaving a half-added source.
         if let SourceKind::Media { path } = &kind {
             self.open_media_producer(&id, path)?;
+        }
+        #[cfg(windows)]
+        if matches!(kind, SourceKind::Camera) {
+            self.open_camera_producer(&id)?;
         }
         let input_id = kind.is_real().then(|| source_input_id(&id));
         let order = self
@@ -941,9 +952,9 @@ impl Shell {
                 .as_ref()
                 .ok_or_else(|| ShellError::UnknownSource(src.id.clone()))?;
             let pixels = match &src.kind {
-                SourceKind::Media { .. } => {
-                    // Pull the next decoded frame; skip the source for this
-                    // frame when none is ready (producer handles pacing).
+                SourceKind::Media { .. } | SourceKind::Camera => {
+                    // Pull the next decoded/live frame; skip the source for
+                    // this frame when none is ready (producer handles pacing).
                     match self.pull_media_frame(&src.id, w, h) {
                         Some(px) => px,
                         None => continue,

@@ -16,10 +16,12 @@
 //!   RTMP streaming attempts via `sf-output`'s `Streamer` + `RealTransport`
 //!   (connects for real; fails cleanly with a redacted error when the
 //!   server is unreachable; exponential-backoff reconnect is live).
-//! - HONEST stubs: `Camera`/`Screen` (no capture hardware on a headless
-//!   VM; `#[cfg(windows)]` scaffolds exist in `sf-capture`);
-//!   hardware encoders (selection logic is real; NVENC/QSV/AMF only exist
-//!   on Windows GPUs — here libx264 is used, verified by roundtrip tests).
+//! - HONEST stubs: `Screen` (no capture hardware on a headless VM;
+//!   `#[cfg(windows)]` scaffolds exist in `sf-capture`); `Camera` on
+//!   non-Windows (on Windows, DirectShow capture via `sf-capture::dshow`
+//!   is wired — hardware-unverified); hardware encoders (selection logic
+//!   is real; NVENC/QSV/AMF only exist on Windows GPUs — here libx264 is
+//!   used, verified by roundtrip tests).
 //!
 //! # Stream-key hygiene
 //!
@@ -31,7 +33,9 @@
 use std::time::{Duration, Instant};
 
 use sf_audio::AudioFrame;
-use sf_capture::{media::MediaFileProducer, CaptureError, FrameProducer};
+use sf_capture::{
+    media::MediaFileProducer, CapturedFrame, CaptureError, FrameProducer, StreamInfo,
+};
 use sf_encode::{AudioEncoder, EncodedPacket, VideoEncoder, VideoEncoderOpts};
 use sf_engine::Frame;
 use sf_output::{
@@ -88,18 +92,27 @@ pub(crate) struct ActiveStream {
 // thread affinity, all access serialized by the shell's `Mutex`.
 unsafe impl Send for ActiveStream {}
 
-/// `MediaFileProducer` holds FFmpeg decoder/scaler contexts, which are raw
-/// pointers and therefore `!Send`. Every producer is only ever touched
-/// through the shell's `Mutex` (Tauri commands and the poll loop lock it
-/// exclusively), and FFmpeg contexts are safe to move between threads as
-/// long as concurrent use is serialized — so this wrapper is sound.
-pub(crate) struct SendProducer(pub(crate) MediaFileProducer);
+/// Producers hold FFmpeg decoder/scaler contexts, which are raw pointers
+/// and therefore `!Send`. Every producer is only ever touched through the
+/// shell's `Mutex` (Tauri commands and the poll loop lock it exclusively),
+/// and FFmpeg contexts are safe to move between threads as long as
+/// concurrent use is serialized — so this wrapper is sound.
+pub(crate) enum ProducerKind {
+    Media(MediaFileProducer),
+    #[cfg(windows)]
+    Camera(sf_capture::dshow::DshowProducer),
+}
+
+// SAFETY: see above — all access is serialized by the shell's `Mutex`.
+unsafe impl Send for ProducerKind {}
+
+pub(crate) struct SendProducer(pub(crate) ProducerKind);
 
 // SAFETY: see above — all access is serialized by the shell's `Mutex`.
 unsafe impl Send for SendProducer {}
 
 impl std::ops::Deref for SendProducer {
-    type Target = MediaFileProducer;
+    type Target = ProducerKind;
     fn deref(&self) -> &Self::Target {
         &self.0
     }
@@ -108,6 +121,36 @@ impl std::ops::Deref for SendProducer {
 impl std::ops::DerefMut for SendProducer {
     fn deref_mut(&mut self) -> &mut Self::Target {
         &mut self.0
+    }
+}
+
+impl FrameProducer for ProducerKind {
+    fn next_frame(&mut self) -> Result<Option<CapturedFrame>, CaptureError> {
+        match self {
+            ProducerKind::Media(p) => p.next_frame(),
+            #[cfg(windows)]
+            ProducerKind::Camera(p) => p.next_frame(),
+        }
+    }
+
+    fn stream_info(&self) -> StreamInfo {
+        match self {
+            ProducerKind::Media(p) => p.stream_info(),
+            #[cfg(windows)]
+            ProducerKind::Camera(p) => p.stream_info(),
+        }
+    }
+}
+
+impl ProducerKind {
+    /// Next normalized audio chunk, if the producer has audio.
+    /// Camera sources have no audio capture in this MVP.
+    fn next_audio(&mut self) -> Result<Option<sf_capture::media::DecodedAudio>, CaptureError> {
+        match self {
+            ProducerKind::Media(p) => p.next_audio(),
+            #[cfg(windows)]
+            ProducerKind::Camera(_) => Ok(None),
+        }
     }
 }
 
@@ -151,8 +194,24 @@ impl Shell {
     ) -> Result<(), ShellError> {
         let prod = MediaFileProducer::open(path)
             .map_err(|e| ShellError::Capture(format!("cannot open media '{path}': {e}")))?;
-        self.media_producers
-            .insert(source_id.to_string(), SendProducer(prod));
+        self.media_producers.insert(
+            source_id.to_string(),
+            SendProducer(ProducerKind::Media(prod)),
+        );
+        Ok(())
+    }
+
+    /// Opens a DirectShow camera producer for a source (Windows only).
+    /// Called from `source_add` before the source is pushed, so a missing
+    /// camera fails cleanly.
+    #[cfg(windows)]
+    pub(crate) fn open_camera_producer(&mut self, source_id: &str) -> Result<(), ShellError> {
+        let prod = sf_capture::dshow::DshowProducer::open_default(1280, 720, 30)
+            .map_err(|e| ShellError::Capture(format!("cannot open camera: {e}")))?;
+        self.media_producers.insert(
+            source_id.to_string(),
+            SendProducer(ProducerKind::Camera(prod)),
+        );
         Ok(())
     }
 

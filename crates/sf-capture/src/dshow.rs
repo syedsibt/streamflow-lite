@@ -1,0 +1,225 @@
+//! DirectShow camera capture (Windows only).
+//!
+//! Opens Windows cameras through FFmpeg's `dshow` input format and reuses
+//! the shared [`DemuxDecoder`] for decode → RGBA8 conversion, so only the
+//! input-opening path is dshow-specific.
+//!
+//! # Status
+//! Code-complete; **hardware-unverified** — no Windows camera exists on the
+//! CI/dev machines. The open path follows FFmpeg's documented `dshow`
+//! API (`av_find_input_format` + `avformat_open_input` with
+//! `video_size`/`framerate` options); decode, scaling, and PTS handling are
+//! the tested demuxer used by media files.
+//!
+//! [`DemuxDecoder`]: super::demux::DemuxDecoder
+
+use std::ffi::{CStr, CString};
+use std::os::raw::{c_char, c_int, c_void};
+use std::ptr;
+use std::sync::Mutex;
+
+use ffmpeg_next as ff;
+
+use super::demux::{ensure_init, DemuxDecoder};
+use super::{CaptureError, CapturedFrame, FrameProducer, StreamInfo};
+
+/// Log capture for [`list_devices`]: dshow reports devices via `av_log`,
+/// so we install a temporary callback, trigger the listing, then restore.
+static LOG_CAPTURE: Mutex<String> = Mutex::new(String::new());
+
+extern "C" {
+    /// msvcrt's vsnprintf — always available on Windows.
+    fn vsnprintf(s: *mut c_char, n: usize, fmt: *const c_char, ap: *mut c_char) -> c_int;
+}
+
+unsafe extern "C" fn log_capture_cb(
+    _ptr: *mut c_void,
+    _level: c_int,
+    fmt: *const c_char,
+    args: *mut c_char,
+) {
+    if fmt.is_null() {
+        return;
+    }
+    // Expand the varargs: dshow device lines are `"Name" (video)` with the
+    // name interpolated via %s. On x86_64 Windows, va_list is char*.
+    let mut buf = vec![0 as c_char; 4096];
+    let n = vsnprintf(buf.as_mut_ptr(), buf.len(), fmt, args);
+    if n > 0 {
+        let s = CStr::from_ptr(buf.as_ptr()).to_string_lossy().into_owned();
+        if let Ok(mut cap) = LOG_CAPTURE.lock() {
+            cap.push_str(&s);
+        }
+    }
+}
+
+/// List DirectShow video-capture device names.
+///
+/// Opens the dshow input with `list_devices=1`, which makes FFmpeg print
+/// the devices and fail; we capture the log and parse the quoted names.
+pub fn list_devices() -> Result<Vec<String>, CaptureError> {
+    ensure_init();
+    let fmt_name = CString::new("dshow").unwrap();
+    let fmt = unsafe { ff::ffi::av_find_input_format(fmt_name.as_ptr()) };
+    if fmt.is_null() {
+        return Err(CaptureError::OpenFailed(
+            "FFmpeg was built without dshow support".into(),
+        ));
+    }
+
+    // Install log capture.
+    {
+        let mut buf = LOG_CAPTURE.lock().unwrap();
+        buf.clear();
+    }
+    unsafe { ff::ffi::av_log_set_callback(Some(log_capture_cb)) };
+
+    let url = CString::new("dummy").unwrap();
+    let mut dict: *mut ff::ffi::AVDictionary = ptr::null_mut();
+    let key = CString::new("list_devices").unwrap();
+    let val = CString::new("1").unwrap();
+    unsafe { ff::ffi::av_dict_set(&mut dict, key.as_ptr(), val.as_ptr(), 0) };
+
+    let mut ctx: *mut ff::ffi::AVFormatContext = ptr::null_mut();
+    let ret = unsafe {
+        ff::ffi::avformat_open_input(
+            &mut ctx,
+            url.as_ptr(),
+            fmt as *mut ff::ffi::AVInputFormat,
+            &mut dict,
+        )
+    };
+    unsafe {
+        ff::ffi::av_dict_free(&mut dict);
+        if !ctx.is_null() {
+            ff::ffi::avformat_close_input(&mut ctx);
+        }
+        // Restore default logging.
+        ff::ffi::av_log_set_callback(None);
+    }
+    // `list_devices` always "fails" the open — that is expected.
+    let _ = ret;
+
+    let buf = LOG_CAPTURE.lock().unwrap().clone();
+    // dshow logs: `[dshow @ ...] "Device Name" (video)` / `(audio)`.
+    let mut devices = Vec::new();
+    for line in buf.lines() {
+        if !line.contains("(video)") {
+            continue;
+        }
+        // Take the first quoted string.
+        let mut in_quotes = false;
+        let mut name = String::new();
+        for ch in line.chars() {
+            if ch == '"' {
+                if in_quotes {
+                    break;
+                }
+                in_quotes = true;
+                continue;
+            }
+            if in_quotes {
+                name.push(ch);
+            }
+        }
+        if !name.is_empty() && !devices.contains(&name) {
+            devices.push(name);
+        }
+    }
+    Ok(devices)
+}
+
+/// DirectShow camera [`FrameProducer`] (Windows).
+///
+/// A live source: [`next_frame`](FrameProducer::next_frame) returns
+/// `Ok(None)` when no frame is ready yet and never reports end-of-stream.
+pub struct DshowProducer {
+    demux: DemuxDecoder,
+    info: StreamInfo,
+}
+
+impl DshowProducer {
+    /// Open `device` (a name from [`list_devices`]) at `width`×`height`,
+    /// `fps`. Frames are converted to RGBA8 by the shared demuxer.
+    pub fn open(
+        device: &str,
+        width: u32,
+        height: u32,
+        fps: u32,
+    ) -> Result<Self, CaptureError> {
+        ensure_init();
+        let fmt_name = CString::new("dshow").unwrap();
+        let fmt = unsafe { ff::ffi::av_find_input_format(fmt_name.as_ptr()) };
+        if fmt.is_null() {
+            return Err(CaptureError::OpenFailed(
+                "FFmpeg was built without dshow support".into(),
+            ));
+        }
+
+        // `video=Device Name` selects the capture device.
+        let url = CString::new(format!("video={device}"))
+            .map_err(|_| CaptureError::OpenFailed("device name contains NUL".into()))?;
+
+        let mut dict: *mut ff::ffi::AVDictionary = ptr::null_mut();
+        let set_opt = |k: &str, v: &str| unsafe {
+            let key = CString::new(k).unwrap();
+            let val = CString::new(v).unwrap();
+            ff::ffi::av_dict_set(&mut dict, key.as_ptr(), val.as_ptr(), 0);
+        };
+        set_opt("video_size", &format!("{width}x{height}"));
+        set_opt("framerate", &fps.to_string());
+        // Ask for a common raw format; the demuxer's swscale converts to
+        // RGBA regardless of what dshow negotiates.
+        set_opt("pixel_format", "yuv420p");
+
+        let mut ctx: *mut ff::ffi::AVFormatContext = ptr::null_mut();
+        let ret = unsafe {
+            ff::ffi::avformat_open_input(
+                &mut ctx,
+                url.as_ptr(),
+                fmt as *mut ff::ffi::AVInputFormat,
+                &mut dict,
+            )
+        };
+        unsafe { ff::ffi::av_dict_free(&mut dict) };
+        if ret < 0 || ctx.is_null() {
+            return Err(CaptureError::OpenFailed(format!(
+                "dshow: cannot open camera '{device}' (no such device or it is in use)"
+            )));
+        }
+
+        // SAFETY: `ctx` is a valid open input context owned by us now;
+        // `Input::wrap` takes ownership and closes it on drop.
+        let ictx = unsafe { ff::format::context::Input::wrap(ctx) };
+        let nominal_frame_us = if fps > 0 { 1_000_000u64 / fps as u64 } else { 33_333 };
+        let demux = DemuxDecoder::from_input(ictx, nominal_frame_us)?;
+        let info = demux.stream_info(false);
+        Ok(Self { demux, info })
+    }
+
+    /// Open the first available DirectShow camera.
+    pub fn open_default(width: u32, height: u32, fps: u32) -> Result<Self, CaptureError> {
+        let devices = list_devices()?;
+        let first = devices
+            .into_iter()
+            .next()
+            .ok_or_else(|| CaptureError::DeviceNotFound("no DirectShow cameras found".into()))?;
+        Self::open(&first, width, height, fps)
+    }
+}
+
+impl FrameProducer for DshowProducer {
+    fn next_frame(&mut self) -> Result<Option<CapturedFrame>, CaptureError> {
+        // Live source: the demuxer never yields EndOfStream for dshow;
+        // map it defensively to "no frame yet" so a live source can
+        // never terminate the consumer.
+        match self.demux.next_video() {
+            Err(CaptureError::EndOfStream) => Ok(None),
+            other => other,
+        }
+    }
+
+    fn stream_info(&self) -> StreamInfo {
+        self.info
+    }
+}

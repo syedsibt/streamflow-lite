@@ -121,8 +121,7 @@ export default function RecordPanel() {
           )}
         </div>
         <div className="note" style={{ marginTop: 8 }}>
-          Recording output is not implemented in the backend yet — starting
-          will report the backend's error.
+          Records the program bus to MP4 / MKV (libx264 + AAC).
         </div>
       </div>
     </div>

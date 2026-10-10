@@ -115,8 +115,8 @@ export default function StreamPanel() {
           </button>
         </div>
         <div className="note" style={{ marginTop: 8 }}>
-          Stream output is not implemented in the backend yet — starting will
-          report the backend's error. The stream key is never echoed back.
+          Streams the program bus over RTMP (libx264 + AAC). The stream key
+          is never echoed back or logged.
         </div>
       </div>
     </div>

@@ -211,6 +211,9 @@ pub mod camera;
 pub mod media;
 pub mod screen;
 
+#[cfg(windows)]
+pub mod dshow;
+
 mod demux;
 
 #[cfg(windows)]
