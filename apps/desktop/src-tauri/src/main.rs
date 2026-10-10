@@ -49,7 +49,7 @@ fn ue(e: ShellError) -> String {
 // ---------------------------------------------------------------------------
 
 /// `color.set_param` — the frontend throttles slider drags to 60 Hz (spec §8).
-#[tauri::command]
+#[tauri::command(rename_all = "snake_case")]
 fn color_set_param(
     state: State<'_, AppState>,
     input_id: String,
@@ -62,7 +62,7 @@ fn color_set_param(
 }
 
 /// Shell extension for spec §8 "double-click a slider = reset".
-#[tauri::command]
+#[tauri::command(rename_all = "snake_case")]
 fn color_reset_param(
     state: State<'_, AppState>,
     input_id: String,
@@ -72,7 +72,7 @@ fn color_reset_param(
 }
 
 /// `color.set_curve`.
-#[tauri::command]
+#[tauri::command(rename_all = "snake_case")]
 fn color_set_curve(
     state: State<'_, AppState>,
     input_id: String,
@@ -85,7 +85,7 @@ fn color_set_curve(
 }
 
 /// `color.load_lut` — `position`: `"before"` | `"after"`.
-#[tauri::command]
+#[tauri::command(rename_all = "snake_case")]
 fn color_load_lut(
     state: State<'_, AppState>,
     input_id: String,
@@ -99,7 +99,7 @@ fn color_load_lut(
 }
 
 /// `color.reset` — `section`: `"basic"` | `"wheels"` | `"curves"` | `"lut"` | null.
-#[tauri::command]
+#[tauri::command(rename_all = "snake_case")]
 fn color_reset(
     state: State<'_, AppState>,
     input_id: String,
@@ -111,13 +111,13 @@ fn color_reset(
 }
 
 /// `color.auto` — one-click AI auto color (editable params + explanations).
-#[tauri::command]
+#[tauri::command(rename_all = "snake_case")]
 fn color_auto(state: State<'_, AppState>, input_id: String) -> CmdResult<AiResultView> {
     lock(&state)?.color_auto(&input_id).map_err(ue)
 }
 
 /// `color.match` — AI camera match.
-#[tauri::command]
+#[tauri::command(rename_all = "snake_case")]
 fn color_match(
     state: State<'_, AppState>,
     reference_id: String,
@@ -129,7 +129,7 @@ fn color_match(
 }
 
 /// Applies a full grade snapshot (A/B slots, before/after compare).
-#[tauri::command]
+#[tauri::command(rename_all = "snake_case")]
 fn apply_grade(
     state: State<'_, AppState>,
     input_id: String,
@@ -139,7 +139,7 @@ fn apply_grade(
 }
 
 /// Current grade snapshot (slider positions).
-#[tauri::command]
+#[tauri::command(rename_all = "snake_case")]
 fn grade_snapshot(state: State<'_, AppState>, input_id: String) -> CmdResult<sf_color::ColorGrade> {
     lock(&state)?.grade_snapshot(&input_id).map_err(ue)
 }
@@ -149,7 +149,7 @@ fn grade_snapshot(state: State<'_, AppState>, input_id: String) -> CmdResult<sf_
 // ---------------------------------------------------------------------------
 
 /// `filter.add`.
-#[tauri::command]
+#[tauri::command(rename_all = "snake_case")]
 fn filter_add(
     state: State<'_, AppState>,
     target: FilterTarget,
@@ -162,7 +162,7 @@ fn filter_add(
 }
 
 /// `filter.reorder` — `order`: slot ids in the new order.
-#[tauri::command]
+#[tauri::command(rename_all = "snake_case")]
 fn filter_reorder(
     state: State<'_, AppState>,
     target: FilterTarget,
@@ -179,7 +179,7 @@ fn filter_reorder(
 }
 
 /// `filter.set_intensity`.
-#[tauri::command]
+#[tauri::command(rename_all = "snake_case")]
 fn filter_set_intensity(
     state: State<'_, AppState>,
     target: FilterTarget,
@@ -195,7 +195,7 @@ fn filter_set_intensity(
 }
 
 /// `filter.toggle` — one-click bypass.
-#[tauri::command]
+#[tauri::command(rename_all = "snake_case")]
 fn filter_toggle(
     state: State<'_, AppState>,
     target: FilterTarget,
@@ -211,7 +211,7 @@ fn filter_toggle(
 }
 
 /// Removes a slot (UI affordance).
-#[tauri::command]
+#[tauri::command(rename_all = "snake_case")]
 fn filter_remove(
     state: State<'_, AppState>,
     target: FilterTarget,
@@ -224,7 +224,7 @@ fn filter_remove(
 }
 
 /// `look.apply` — one click + intensity.
-#[tauri::command]
+#[tauri::command(rename_all = "snake_case")]
 fn look_apply(
     state: State<'_, AppState>,
     target: FilterTarget,
@@ -238,19 +238,19 @@ fn look_apply(
 }
 
 /// Stack snapshot for the Filters tab.
-#[tauri::command]
+#[tauri::command(rename_all = "snake_case")]
 fn stack_snapshot(state: State<'_, AppState>, target: FilterTarget) -> CmdResult<Vec<SlotView>> {
     lock(&state)?.stack_snapshot(&target).map_err(ue)
 }
 
 /// Built-in looks for the looks strip.
-#[tauri::command]
+#[tauri::command(rename_all = "snake_case")]
 fn list_looks(state: State<'_, AppState>) -> Vec<LookInfo> {
     lock(&state).map(|mut s| s.list_looks()).unwrap_or_default()
 }
 
 /// Effect-kind catalog for the Filters tab "add" menu.
-#[tauri::command]
+#[tauri::command(rename_all = "snake_case")]
 fn list_effect_kinds(state: State<'_, AppState>) -> Vec<EffectKindInfo> {
     lock(&state)
         .map(|s| s.list_effect_kinds())
@@ -262,13 +262,13 @@ fn list_effect_kinds(state: State<'_, AppState>) -> Vec<EffectKindInfo> {
 // ---------------------------------------------------------------------------
 
 /// `scopes.subscribe` — `kind`: waveform|vectorscope|histogram|false_color|zebra.
-#[tauri::command]
+#[tauri::command(rename_all = "snake_case")]
 fn scopes_subscribe(state: State<'_, AppState>, input_id: String, kind: String) -> CmdResult<()> {
     lock(&state)?.scopes_subscribe(&input_id, &kind).map_err(ue)
 }
 
 /// `scopes.unsubscribe`.
-#[tauri::command]
+#[tauri::command(rename_all = "snake_case")]
 fn scopes_unsubscribe(state: State<'_, AppState>, input_id: String, kind: String) -> CmdResult<()> {
     lock(&state)?
         .scopes_unsubscribe(&input_id, &kind)
@@ -277,7 +277,7 @@ fn scopes_unsubscribe(state: State<'_, AppState>, input_id: String, kind: String
 
 /// `preview.get_frame` — PNG data URL, ~10 Hz throttled by the backend.
 /// Production will replace this with a zero-copy path; the command shape stays.
-#[tauri::command]
+#[tauri::command(rename_all = "snake_case")]
 fn preview_get_frame(
     state: State<'_, AppState>,
     input_id: String,
@@ -305,13 +305,13 @@ fn png_data_url(png: &[u8]) -> String {
 // ---------------------------------------------------------------------------
 
 /// Creates a production scene.
-#[tauri::command]
+#[tauri::command(rename_all = "snake_case")]
 fn scene_create(state: State<'_, AppState>, name: String) -> CmdResult<ProdScene> {
     Ok(lock(&state)?.scene_create(&name))
 }
 
 /// Renames a production scene.
-#[tauri::command]
+#[tauri::command(rename_all = "snake_case")]
 fn scene_rename(
     state: State<'_, AppState>,
     scene_id: String,
@@ -321,19 +321,19 @@ fn scene_rename(
 }
 
 /// Deletes a production scene (errors on the last scene).
-#[tauri::command]
+#[tauri::command(rename_all = "snake_case")]
 fn scene_delete(state: State<'_, AppState>, scene_id: String) -> CmdResult<()> {
     lock(&state)?.scene_delete(&scene_id).map_err(ue)
 }
 
 /// Duplicates a production scene (fresh source ids + engine inputs).
-#[tauri::command]
+#[tauri::command(rename_all = "snake_case")]
 fn scene_duplicate(state: State<'_, AppState>, scene_id: String) -> CmdResult<ProdScene> {
     lock(&state)?.scene_duplicate(&scene_id).map_err(ue)
 }
 
 /// Lists all production scenes.
-#[tauri::command]
+#[tauri::command(rename_all = "snake_case")]
 fn scene_list(state: State<'_, AppState>) -> Vec<ProdScene> {
     lock(&state).map(|s| s.scene_list()).unwrap_or_default()
 }
@@ -342,7 +342,7 @@ fn scene_list(state: State<'_, AppState>) -> Vec<ProdScene> {
 /// `screen` | `media` | `text`. `color_*` apply to the `color` kind;
 /// `text`/`path` to the `text`/`media` kinds. Pending kinds report
 /// `status: "pending"` and are skipped in the composite.
-#[tauri::command]
+#[tauri::command(rename_all = "snake_case")]
 fn source_add(
     state: State<'_, AppState>,
     scene_id: String,
@@ -367,7 +367,7 @@ fn source_add(
 }
 
 /// Removes a source from a scene.
-#[tauri::command]
+#[tauri::command(rename_all = "snake_case")]
 fn source_remove(state: State<'_, AppState>, scene_id: String, source_id: String) -> CmdResult<()> {
     lock(&state)?
         .source_remove(&scene_id, &source_id)
@@ -375,7 +375,7 @@ fn source_remove(state: State<'_, AppState>, scene_id: String, source_id: String
 }
 
 /// Drag-reorders a scene's sources: `order` holds source ids bottom to top.
-#[tauri::command]
+#[tauri::command(rename_all = "snake_case")]
 fn source_reorder(
     state: State<'_, AppState>,
     scene_id: String,
@@ -385,7 +385,7 @@ fn source_reorder(
 }
 
 /// Shows or hides a source.
-#[tauri::command]
+#[tauri::command(rename_all = "snake_case")]
 fn source_set_visible(
     state: State<'_, AppState>,
     scene_id: String,
@@ -403,32 +403,32 @@ fn source_set_visible(
 
 /// Full production snapshot (scenes, preview/program, transition, mixer,
 /// stream/record lifecycles, macros).
-#[tauri::command]
+#[tauri::command(rename_all = "snake_case")]
 fn production_state(state: State<'_, AppState>) -> CmdResult<ProductionStateView> {
     Ok(lock(&state)?.production_state())
 }
 
 /// Sets the preview (standby) scene. Retargets an in-flight transition.
-#[tauri::command]
+#[tauri::command(rename_all = "snake_case")]
 fn production_set_preview(state: State<'_, AppState>, scene_id: String) -> CmdResult<()> {
     lock(&state)?.production_set_preview(&scene_id).map_err(ue)
 }
 
 /// Sets the program scene directly (cancels any in-flight transition).
-#[tauri::command]
+#[tauri::command(rename_all = "snake_case")]
 fn production_set_program(state: State<'_, AppState>, scene_id: String) -> CmdResult<()> {
     lock(&state)?.production_set_program(&scene_id).map_err(ue)
 }
 
 /// Instant cut: program = preview.
-#[tauri::command]
+#[tauri::command(rename_all = "snake_case")]
 fn transition_cut(state: State<'_, AppState>) -> CmdResult<()> {
     lock(&state)?.transition_cut().map_err(ue)
 }
 
 /// Starts an auto transition. `kind`: `"mix"` (only kind today).
 /// The 66 ms poll loop advances it via `transition_tick()`.
-#[tauri::command]
+#[tauri::command(rename_all = "snake_case")]
 fn transition_auto(
     state: State<'_, AppState>,
     duration_ms: u64,
@@ -440,7 +440,7 @@ fn transition_auto(
 }
 
 /// Scene monitor frame as a PNG data URL (graded sources, CPU-composited).
-#[tauri::command]
+#[tauri::command(rename_all = "snake_case")]
 fn scene_preview_png(
     state: State<'_, AppState>,
     scene_id: String,
@@ -458,7 +458,7 @@ fn scene_preview_png(
 // ---------------------------------------------------------------------------
 
 /// Sets a source channel gain (`0.0..=2.0`, clamped).
-#[tauri::command]
+#[tauri::command(rename_all = "snake_case")]
 fn mixer_set_gain(
     state: State<'_, AppState>,
     source_id: String,
@@ -468,7 +468,7 @@ fn mixer_set_gain(
 }
 
 /// Mutes/unmutes a source channel.
-#[tauri::command]
+#[tauri::command(rename_all = "snake_case")]
 fn mixer_set_mute(
     state: State<'_, AppState>,
     source_id: String,
@@ -478,13 +478,13 @@ fn mixer_set_mute(
 }
 
 /// Sets the master gain (`0.0..=2.0`, clamped).
-#[tauri::command]
+#[tauri::command(rename_all = "snake_case")]
 fn mixer_set_master_gain(state: State<'_, AppState>, gain: f32) -> CmdResult<ChannelStrip> {
     Ok(lock(&state)?.mixer_set_master_gain(gain))
 }
 
 /// Mutes/unmutes the master.
-#[tauri::command]
+#[tauri::command(rename_all = "snake_case")]
 fn mixer_set_master_mute(state: State<'_, AppState>, mute: bool) -> CmdResult<ChannelStrip> {
     Ok(lock(&state)?.mixer_set_master_mute(mute))
 }
@@ -496,7 +496,7 @@ fn mixer_set_master_mute(state: State<'_, AppState>, mute: bool) -> CmdResult<Ch
 /// Stores stream settings. `platform`: `youtube` | `twitch` | `facebook` |
 /// `custom_rtmp`. The key is kept in memory only — never logged, never
 /// serialized, never in error strings.
-#[tauri::command]
+#[tauri::command(rename_all = "snake_case")]
 fn stream_set_settings(
     state: State<'_, AppState>,
     url: String,
@@ -510,19 +510,19 @@ fn stream_set_settings(
 
 /// Starts streaming. Fails honestly: `sf-output` is a stub, so the
 /// lifecycle moves to `error` with a clear message.
-#[tauri::command]
+#[tauri::command(rename_all = "snake_case")]
 fn stream_start(state: State<'_, AppState>) -> CmdResult<()> {
     lock(&state)?.stream_start().map_err(ue)
 }
 
 /// Stops streaming (any state → idle).
-#[tauri::command]
+#[tauri::command(rename_all = "snake_case")]
 fn stream_stop(state: State<'_, AppState>) -> CmdResult<()> {
     lock(&state)?.stream_stop().map_err(ue)
 }
 
 /// Stores record settings. `format`: `mp4` | `mkv`.
-#[tauri::command]
+#[tauri::command(rename_all = "snake_case")]
 fn record_set_settings(
     state: State<'_, AppState>,
     path: String,
@@ -535,25 +535,25 @@ fn record_set_settings(
 }
 
 /// Starts recording. Fails honestly: `sf-encode` is a stub.
-#[tauri::command]
+#[tauri::command(rename_all = "snake_case")]
 fn record_start(state: State<'_, AppState>) -> CmdResult<()> {
     lock(&state)?.record_start().map_err(ue)
 }
 
 /// Stops recording (any state → idle).
-#[tauri::command]
+#[tauri::command(rename_all = "snake_case")]
 fn record_stop(state: State<'_, AppState>) -> CmdResult<()> {
     lock(&state)?.record_stop().map_err(ue)
 }
 
 /// Pauses an active recording (elapsed time excludes pauses).
-#[tauri::command]
+#[tauri::command(rename_all = "snake_case")]
 fn record_pause(state: State<'_, AppState>) -> CmdResult<()> {
     lock(&state)?.record_pause().map_err(ue)
 }
 
 /// Resumes a paused recording.
-#[tauri::command]
+#[tauri::command(rename_all = "snake_case")]
 fn record_resume(state: State<'_, AppState>) -> CmdResult<()> {
     lock(&state)?.record_resume().map_err(ue)
 }
@@ -566,7 +566,7 @@ fn record_resume(state: State<'_, AppState>) -> CmdResult<()> {
 /// `{"action":"cut"}`, `{"action":"auto_transition","duration_ms":500}`,
 /// `{"action":"toggle_stream"}`, `{"action":"toggle_record"}`,
 /// `{"action":"apply_look","look_id":"podcast-warm","intensity":0.8}`.
-#[tauri::command]
+#[tauri::command(rename_all = "snake_case")]
 fn macro_add(
     state: State<'_, AppState>,
     name: String,
@@ -577,19 +577,19 @@ fn macro_add(
 }
 
 /// Removes a macro by id.
-#[tauri::command]
+#[tauri::command(rename_all = "snake_case")]
 fn macro_remove(state: State<'_, AppState>, macro_id: String) -> CmdResult<()> {
     lock(&state)?.macro_remove(&macro_id).map_err(ue)
 }
 
 /// Lists all bound macros.
-#[tauri::command]
+#[tauri::command(rename_all = "snake_case")]
 fn macro_list(state: State<'_, AppState>) -> Vec<Macro> {
     lock(&state).map(|s| s.macro_list()).unwrap_or_default()
 }
 
 /// Executes the macro bound to `hotkey`; reports what happened.
-#[tauri::command]
+#[tauri::command(rename_all = "snake_case")]
 fn macro_dispatch(state: State<'_, AppState>, hotkey: String) -> CmdResult<MacroDispatchResult> {
     lock(&state)?.macro_dispatch(&hotkey).map_err(ue)
 }
