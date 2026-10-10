@@ -52,12 +52,10 @@ jobs:
           $dir = Get-ChildItem "C:\ffmpeg-tmp" -Directory | Select-Object -First 1
           Move-Item $dir.FullName "C:\ffmpeg"
           "FFMPEG_DIR=C:\ffmpeg" >> $env:GITHUB_ENV
+          # DLLs on PATH so test executables can load them at runtime.
+          "C:\ffmpeg\bin" >> $env:GITHUB_PATH
           Get-ChildItem "C:\ffmpeg\include\libavcodec\avcodec.h"
           Get-ChildItem "C:\ffmpeg\lib\avcodec.lib"
-
-      - name: Generate app icons
-        working-directory: apps/desktop
-        run: npx -y @tauri-apps/cli@2 icon src-tauri/icons/icon.png
 
       - name: Cargo test (workspace)
         run: cargo test --workspace
