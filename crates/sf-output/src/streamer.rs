@@ -618,13 +618,16 @@ mod tests {
         // DTS interleave order (see recorder test).
         pkts.sort_by_key(|p| (p.dts_us, p.stream_index));
 
-        let path = "/tmp/stream-test.flv";
-        let _ = std::fs::remove_file(path);
+        let path_str = std::env::temp_dir()
+            .join("stream-test.flv")
+            .to_string_lossy()
+            .into_owned();
+        let _ = std::fs::remove_file(&path_str);
         // NOTE: a file path as the "RTMP URL" — format::output_as(path, "flv")
         // runs the identical libavformat FLV mux path as a real rtmp:// URL;
         // only the AVIO target differs (file vs network).
         let mut t = RealTransport::new(
-            StreamTarget::Rtmp(path.to_string()),
+            StreamTarget::Rtmp(path_str.clone()),
             venc.parameters(),
             Some(aenc.parameters()),
         );
@@ -642,7 +645,7 @@ mod tests {
                 "stream=codec_name",
                 "-of",
                 "csv",
-                path,
+                path_str.as_str(),
             ])
             .output()
             .expect("run ffprobe");
@@ -665,7 +668,7 @@ mod tests {
                 "format=duration",
                 "-of",
                 "default=nw=1",
-                path,
+                path_str.as_str(),
             ])
             .output()
             .expect("run ffprobe");

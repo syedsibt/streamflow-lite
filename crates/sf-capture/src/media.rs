@@ -129,7 +129,10 @@ mod tests {
     /// Generate the 2 s A/V test file with the FFmpeg CLI.
     /// 320×240 @ 30 fps testsrc (60 frames) + 440 Hz sine, yuv420p + aac.
     fn make_test_file() -> String {
-        let path = "/tmp/sf-capture-test.mp4";
+        let path_str = std::env::temp_dir()
+            .join("sf-capture-test.mp4")
+            .to_string_lossy()
+            .into_owned();
         let st = Command::new("ffmpeg")
             .args([
                 "-y",
@@ -148,12 +151,12 @@ mod tests {
                 "-c:a",
                 "aac",
                 "-shortest",
-                path,
+                path_str.as_str(),
             ])
             .status()
             .expect("ffmpeg CLI must be installed");
         assert!(st.success(), "ffmpeg failed to generate test file");
-        path.to_string()
+        path_str
     }
 
     #[test]

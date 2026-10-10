@@ -312,9 +312,13 @@ mod tests {
             .collect();
         all.sort_by_key(|(p, _)| (p.dts_us, p.stream_index));
 
-        let path = "/tmp/rec-test.mp4";
-        let _ = std::fs::remove_file(path);
-        let mut rec = Recorder::create(path, ContainerFormat::Mp4Fragmented).expect("create");
+        let path_str = std::env::temp_dir()
+            .join("rec-test.mp4")
+            .to_string_lossy()
+            .into_owned();
+        let _ = std::fs::remove_file(&path_str);
+        let mut rec =
+            Recorder::create(&path_str, ContainerFormat::Mp4Fragmented).expect("create");
         rec.add_video_stream(&venc.parameters())
             .expect("video stream");
         rec.add_audio_stream(&aenc.parameters(), aenc.sample_rate())
@@ -339,7 +343,7 @@ mod tests {
             stats.duration_us
         );
 
-        let meta = std::fs::metadata(path).expect("output file exists");
+        let meta = std::fs::metadata(&path_str).expect("output file exists");
         assert!(meta.len() > 10_000, "suspiciously small file");
 
         // Prove playability with the ffprobe CLI.
@@ -352,7 +356,7 @@ mod tests {
                 "format=duration:stream=codec_name,nb_read_frames",
                 "-of",
                 "default=noprint_wrappers=1",
-                path,
+                path_str.as_str(),
             ])
             .output()
             .expect("run ffprobe");
@@ -382,8 +386,14 @@ mod tests {
 
     #[test]
     fn write_without_video_stream_errors() {
-        let mut rec =
-            Recorder::create("/tmp/rec-novid.mp4", ContainerFormat::Mp4Flat).expect("create");
+        let mut rec = Recorder::create(
+            std::env::temp_dir()
+                .join("rec-novid.mp4")
+                .to_str()
+                .expect("temp path"),
+            ContainerFormat::Mp4Flat,
+        )
+        .expect("create");
         let pkt = EncodedPacket {
             data: vec![0u8; 16],
             pts_us: 0,
