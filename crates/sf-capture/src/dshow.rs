@@ -161,7 +161,7 @@ impl DshowProducer {
             .map_err(|_| CaptureError::OpenFailed("device name contains NUL".into()))?;
 
         let mut dict: *mut ff::ffi::AVDictionary = ptr::null_mut();
-        let set_opt = |k: &str, v: &str| unsafe {
+        let mut set_opt = |k: &str, v: &str| unsafe {
             let key = CString::new(k).unwrap();
             let val = CString::new(v).unwrap();
             ff::ffi::av_dict_set(&mut dict, key.as_ptr(), val.as_ptr(), 0);
