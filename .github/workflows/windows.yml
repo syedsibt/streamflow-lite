@@ -3,12 +3,18 @@
 # NSIS installer (+ portable exe) as artifacts.
 #
 # Notes:
-# - FFmpeg comes from vcpkg (ffmpeg-sys-next has built-in vcpkg support).
-#   First run takes ~20-30 min to build FFmpeg from source.
+# - FFmpeg 6.1.1 (Gyan full-shared build: headers + import libs + DLLs) via
+#   the FFMPEG_DIR env var that ffmpeg-sys-next understands. This matches the
+#   FFmpeg 6.1 the engine was developed/verified against on Linux.
+#   (vcpkg's FFmpeg 8.x was tried first: ffmpeg-sys-next 6.1.0 can't bind it
+#   because libavcodec/avfft.h was removed upstream.)
+# - v4l (Linux-only camera dep) is cfg-gated to Linux in sf-capture.
 # - GPU tests cannot pass on the runner (no GPU) -> tests are non-blocking,
 #   same as the v0.1.0 workflow. The .exe is the deliverable.
 # - FFmpeg DLLs are staged into src-tauri/ffmpeg-dlls and injected into
-#   bundle.resources (CI-only; local builds untouched).
+#   bundle.resources (CI-only; local builds untouched). The JSON is written
+#   WITHOUT a UTF-8 BOM (PowerShell 5.1's Set-Content -Encoding UTF8 adds one,
+#   which the Tauri CLI cannot parse).
 name: Windows Build
 
 on:
@@ -39,10 +45,15 @@ jobs:
       - name: Setup Rust
         uses: dtolnay/rust-toolchain@stable
 
-      - name: Install FFmpeg (vcpkg)
+      - name: Install FFmpeg 6.1.1 (dev files)
         run: |
-          C:\vcpkg\vcpkg install ffmpeg:x64-windows --clean-after-build
-          "VCPKG_ROOT=C:\vcpkg" >> $env:GITHUB_ENV
+          Invoke-WebRequest -Uri "https://github.com/GyanD/codexffmpeg/releases/download/6.1.1/ffmpeg-6.1.1-full_build-shared.7z" -OutFile "$env:TEMP\ffmpeg.7z"
+          7z x "$env:TEMP\ffmpeg.7z" -o"C:\ffmpeg-tmp"
+          $dir = Get-ChildItem "C:\ffmpeg-tmp" -Directory | Select-Object -First 1
+          Move-Item $dir.FullName "C:\ffmpeg"
+          "FFMPEG_DIR=C:\ffmpeg" >> $env:GITHUB_ENV
+          Get-ChildItem "C:\ffmpeg\include\libavcodec\avcodec.h"
+          Get-ChildItem "C:\ffmpeg\lib\avcodec.lib"
 
       - name: Generate app icons
         working-directory: apps/desktop
@@ -56,12 +67,13 @@ jobs:
       - name: Stage FFmpeg DLLs + wire into bundle
         run: |
           New-Item -ItemType Directory -Force -Path "apps\desktop\src-tauri\ffmpeg-dlls" | Out-Null
-          Copy-Item "C:\vcpkg\installed\x64-windows\bin\av*.dll" "apps\desktop\src-tauri\ffmpeg-dlls\"
-          Copy-Item "C:\vcpkg\installed\x64-windows\bin\sw*.dll" "apps\desktop\src-tauri\ffmpeg-dlls\"
+          Copy-Item "C:\ffmpeg\bin\av*.dll" "apps\desktop\src-tauri\ffmpeg-dlls\"
+          Copy-Item "C:\ffmpeg\bin\sw*.dll" "apps\desktop\src-tauri\ffmpeg-dlls\"
           $confPath = "apps\desktop\src-tauri\tauri.conf.json"
           $json = Get-Content $confPath -Raw | ConvertFrom-Json
           $json.bundle | Add-Member -NotePropertyName "resources" -NotePropertyValue @("ffmpeg-dlls/av*.dll", "ffmpeg-dlls/sw*.dll") -Force
-          $json | ConvertTo-Json -Depth 30 | Set-Content $confPath -Encoding UTF8
+          $utf8NoBom = New-Object System.Text.UTF8Encoding $false
+          [System.IO.File]::WriteAllText($confPath, ($json | ConvertTo-Json -Depth 30), $utf8NoBom)
           Get-ChildItem "apps\desktop\src-tauri\ffmpeg-dlls\"
 
       - name: Build Tauri app

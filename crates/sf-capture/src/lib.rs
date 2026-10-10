@@ -206,6 +206,7 @@ impl FrameProducer for MockProducer {
     }
 }
 
+#[cfg(target_os = "linux")]
 pub mod camera;
 pub mod media;
 pub mod screen;
