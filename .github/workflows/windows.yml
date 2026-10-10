@@ -69,7 +69,12 @@ jobs:
           Copy-Item "C:\ffmpeg\bin\sw*.dll" "apps\desktop\src-tauri\ffmpeg-dlls\"
           $confPath = "apps\desktop\src-tauri\tauri.conf.json"
           $json = Get-Content $confPath -Raw | ConvertFrom-Json
-          $json.bundle | Add-Member -NotePropertyName "resources" -NotePropertyValue @("ffmpeg-dlls/av*.dll", "ffmpeg-dlls/sw*.dll") -Force
+          # Map each DLL to the bundle root so it lands NEXT TO the exe.
+          # (A plain glob preserves the ffmpeg-dlls/ subfolder, which the
+          # Windows loader does not search.)
+          $res = @{}
+          Get-ChildItem "apps\desktop\src-tauri\ffmpeg-dlls\*.dll" | ForEach-Object { $res["ffmpeg-dlls/$($_.Name)"] = $_.Name }
+          $json.bundle | Add-Member -NotePropertyName "resources" -NotePropertyValue $res -Force
           $utf8NoBom = New-Object System.Text.UTF8Encoding $false
           [System.IO.File]::WriteAllText($confPath, ($json | ConvertTo-Json -Depth 30), $utf8NoBom)
           Get-ChildItem "apps\desktop\src-tauri\ffmpeg-dlls\"
@@ -79,11 +84,18 @@ jobs:
         with:
           projectPath: apps/desktop
 
+      - name: Zip portable exe with DLLs
+        run: |
+          New-Item -ItemType Directory -Force -Path "portable-dist" | Out-Null
+          Copy-Item "apps\desktop\src-tauri\target\release\streamflow-lite-desktop.exe" "portable-dist\"
+          Copy-Item "apps\desktop\src-tauri\ffmpeg-dlls\*.dll" "portable-dist\"
+          Compress-Archive -Path "portable-dist\*" -DestinationPath "streamflow-lite-windows-x64-portable.zip" -Force
+
       - name: Upload portable exe
         uses: actions/upload-artifact@v4
         with:
           name: streamflow-lite-windows-x64-portable
-          path: apps/desktop/src-tauri/target/release/*.exe
+          path: streamflow-lite-windows-x64-portable.zip
 
       - name: Upload NSIS installer
         uses: actions/upload-artifact@v4
