@@ -22,7 +22,7 @@ use sf_ai_runtime::{InferenceSession, StubSession};
 use sf_filterfx::EffectPass;
 use sf_filters::{resolve_grade, EffectKind, EffectParams, Filter, LookRegistry, MaskRef};
 use sf_render::lut::CubeFile;
-use sf_render::{GradePass, RenderContext, RenderError};
+use sf_render::{CompositePass, GradePass, RenderContext, RenderError, ScalePass};
 use sf_scopes::{ScopeFrame, ScopeKind, ScopeParams, ScopePass, SCOPE_INTERVAL_MICROS};
 use sf_state::State;
 
@@ -265,6 +265,8 @@ struct WorkTargets {
 pub struct Engine {
     ctx: RenderContext,
     pass: GradePass,
+    scale_pass: Option<ScalePass>,
+    composite_pass: Option<CompositePass>,
     scope_pass: ScopePass,
     fx: EffectPass,
     look_registry: LookRegistry,
@@ -307,11 +309,23 @@ impl Engine {
     pub fn new_headless() -> Result<Self, EngineError> {
         let ctx = RenderContext::new_headless()?;
         let pass = GradePass::new(&ctx)?;
+        // GPU hybrid passes are optional: if the GPU doesn't support the
+        // required features, fall back to CPU.
+        // Note: CompositePass disabled for now (ReadWrite storage needs
+        // wider GPU support); ScalePass is the priority for the hybrid.
+        let scale_pass = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            ScalePass::new(&ctx)
+        }))
+        .ok()
+        .and_then(|r| r.ok());
+        let composite_pass: Option<CompositePass> = None;
         let scope_pass = ScopePass::new(&ctx)?;
         let fx = EffectPass::new(&ctx)?;
         Ok(Self {
             ctx,
             pass,
+            scale_pass,
+            composite_pass,
             scope_pass,
             fx,
             look_registry: LookRegistry::default(),
@@ -506,6 +520,44 @@ impl Engine {
     /// # Errors
     ///
     /// Returns [`EngineError::UnknownInput`] when the input does not exist.
+    /// GPU-accelerated RGBA8 resize (bilinear). Replaces CPU `resize_rgba_nearest`
+    /// for the hybrid pipeline. Falls back to CPU on GPU error.
+    pub fn gpu_resize_rgba(
+        &self,
+        pixels: &[u8],
+        sw: u32,
+        sh: u32,
+        dw: u32,
+        dh: u32,
+    ) -> Result<Vec<u8>, EngineError> {
+        let scale_pass = self.scale_pass.as_ref().ok_or(EngineError::UnknownInput(
+            "GPU scale not available".into(),
+        ))?;
+        // Upload source.
+        let src_tex = self.ctx.upload_rgba8(sw, sh, pixels).map_err(EngineError::Render)?;
+        let src_view = src_tex.create_view(&wgpu::TextureViewDescriptor::default());
+        // Create destination texture.
+        let dst_tex = self.ctx.device().create_texture(&wgpu::TextureDescriptor {
+            label: Some("sf-engine gpu_resize dst"),
+            size: wgpu::Extent3d { width: dw, height: dh, depth_or_array_layers: 1 },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::Rgba8Unorm,
+            usage: wgpu::TextureUsages::STORAGE_BINDING
+                | wgpu::TextureUsages::COPY_SRC
+                | wgpu::TextureUsages::TEXTURE_BINDING,
+            view_formats: &[],
+        });
+        let dst_view = dst_tex.create_view(&wgpu::TextureViewDescriptor::default());
+        // Scale on GPU.
+        scale_pass
+            .scale(&self.ctx, &src_view, &dst_view, sw, sh, dw, dh)
+            .map_err(EngineError::Render)?;
+        // Download result.
+        self.ctx.download_rgba8(&dst_tex).map_err(EngineError::Render)
+    }
+
     pub fn scopes_subscribe(&mut self, input_id: &str, kind: ScopeKind) -> Result<(), EngineError> {
         if self.state.input_color(input_id).is_none() {
             return Err(EngineError::UnknownInput(input_id.to_string()));

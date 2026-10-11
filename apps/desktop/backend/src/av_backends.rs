@@ -271,7 +271,11 @@ impl Shell {
                 let px = if f.width == w && f.height == h {
                     f.data
                 } else {
-                    resize_rgba_nearest(&f.data, f.width, f.height, w, h)
+                    // Hybrid: GPU resize first, fall back to CPU on error.
+                    match self.engine.gpu_resize_rgba(&f.data, f.width, f.height, w, h) {
+                        Ok(px) => px,
+                        Err(_) => resize_rgba_nearest(&f.data, f.width, f.height, w, h),
+                    }
                 };
                 self.media_last_frame
                     .insert(source_id.to_string(), (w, h, px.clone()));
