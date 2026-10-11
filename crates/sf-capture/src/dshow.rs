@@ -434,7 +434,7 @@ impl DshowProducer {
         let info = demux.stream_info(false);
         // Compact single-line form for the UI badge, e.g.
         // "mjpeg 1920×1080@60fps" — what the camera actually gave.
-        let negotiated_format = format!(
+        let mut negotiated_format = format!(
             "{} {}×{}@{}fps",
             negotiated_codec,
             info.width,
