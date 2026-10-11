@@ -18,6 +18,7 @@ const KIND_OPTIONS = [
   "screen",
   "media",
   "text",
+  "audio_input",
 ] as const;
 type KindKey = (typeof KIND_OPTIONS)[number];
 
@@ -75,6 +76,8 @@ export default function SourcesPanel() {
   const [cameraDevice, setCameraDevice] = useState<string>("");
   const [cameraRes, setCameraRes] = useState<string>("720p");
   const [cameraFps, setCameraFps] = useState<string>("30");
+  const [audioDevices, setAudioDevices] = useState<string[]>([]);
+  const [audioDevice, setAudioDevice] = useState<string>("");
 
   // Load camera devices when the camera kind is selected.
   useEffect(() => {
@@ -89,6 +92,25 @@ export default function SourcesPanel() {
       })
       .catch(() => {
         if (!cancelled) setCameras([]);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [kind]);
+
+  // Load audio input devices when the audio_input kind is selected.
+  useEffect(() => {
+    if (kind !== "audio_input") return;
+    let cancelled = false;
+    void api
+      .listAudioDevices()
+      .then((list) => {
+        if (cancelled) return;
+        setAudioDevices(list);
+        setAudioDevice((prev) => prev || list[0] || "");
+      })
+      .catch(() => {
+        if (!cancelled) setAudioDevices([]);
       });
     return () => {
       cancelled = true;
@@ -129,6 +151,8 @@ export default function SourcesPanel() {
       }
       case "screen":
         return { screen: {} };
+      case "audio_input":
+        return { audio_input: { device: audioDevice || null } };
       default:
         return { test_pattern: {} };
     }
@@ -328,13 +352,28 @@ export default function SourcesPanel() {
               </select>
             </>
           )}
+          {kind === "audio_input" && (
+            <select
+              value={audioDevice}
+              onChange={(e) => setAudioDevice(e.target.value)}
+              title="Microphone / line-in device"
+            >
+              {audioDevices.length === 0 && (
+                <option value="">No audio inputs found</option>
+              )}
+              {audioDevices.map((d) => (
+                <option key={d} value={d}>
+                  {d}
+                </option>
+              ))}
+            </select>
+          )}
           <button className="btn ghost" onClick={add}>
             Add
           </button>
-          {(kind === "screen") && (
+          {(kind === "audio_input") && (
             <div className="note">
-              Screen capture has no backend yet — it will show a
-              "pending capture backend" badge.
+              Audio-only source: feeds the mixer and meters, no video.
             </div>
           )}
         </div>
@@ -357,6 +396,8 @@ function kindLabel(k: string): string {
       return "Media";
     case "text":
       return "Text";
+    case "audio_input":
+      return "Audio Input";
     default:
       return k;
   }

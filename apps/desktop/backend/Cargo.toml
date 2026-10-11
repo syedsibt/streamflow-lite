@@ -17,6 +17,7 @@ sf-capture = { path = "../../../crates/sf-capture" }
 sf-encode = { path = "../../../crates/sf-encode" }
 sf-output = { path = "../../../crates/sf-output" }
 sf-audio = { path = "../../../crates/sf-audio" }
+sf-graphics = { path = "../../../crates/sf-graphics" }
 serde = { workspace = true }
 serde_json = { workspace = true }
 uuid = { workspace = true }

@@ -214,6 +214,12 @@ pub mod screen;
 #[cfg(windows)]
 pub mod dshow;
 
+#[cfg(windows)]
+pub mod audio_in;
+
+#[cfg(windows)]
+pub mod gdigrab;
+
 mod demux;
 
 #[cfg(windows)]

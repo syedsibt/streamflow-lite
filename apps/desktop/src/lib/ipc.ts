@@ -136,6 +136,9 @@ export const api = {
     } else if ("text" in kind) {
       kindStr = "text";
       text = kind.text.text;
+    } else if ("audio_input" in kind) {
+      kindStr = "audio_input";
+      device = kind.audio_input.device ?? null;
     }
     return cmd<SourceView>("source_add", {
       scene_id,

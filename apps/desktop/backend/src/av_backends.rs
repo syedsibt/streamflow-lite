@@ -169,6 +169,8 @@ pub(crate) enum ProducerKind {
     Media(MediaFileProducer),
     #[cfg(windows)]
     Camera(sf_capture::dshow::DshowProducer),
+    #[cfg(windows)]
+    Screen(sf_capture::gdigrab::ScreenProducer),
 }
 
 // SAFETY: see above — all access is serialized by the shell's `Mutex`.
@@ -198,6 +200,8 @@ impl FrameProducer for ProducerKind {
             ProducerKind::Media(p) => p.next_frame(),
             #[cfg(windows)]
             ProducerKind::Camera(p) => p.next_frame(),
+            #[cfg(windows)]
+            ProducerKind::Screen(p) => p.next_frame(),
         }
     }
 
@@ -206,6 +210,8 @@ impl FrameProducer for ProducerKind {
             ProducerKind::Media(p) => p.stream_info(),
             #[cfg(windows)]
             ProducerKind::Camera(p) => p.stream_info(),
+            #[cfg(windows)]
+            ProducerKind::Screen(p) => p.stream_info(),
         }
     }
 }
@@ -318,11 +324,69 @@ impl Shell {
         Ok(())
     }
 
+    /// Opens a desktop screen producer (Windows gdigrab). Called from
+    /// `source_add` before the source is pushed, so a failed grab fails
+    /// cleanly.
+    #[cfg(windows)]
+    pub(crate) fn open_screen_producer(&mut self, source_id: &str) -> Result<(), ShellError> {
+        let opened = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            sf_capture::gdigrab::ScreenProducer::open(30)
+        }));
+        let prod = match opened {
+            Ok(Ok(p)) => p,
+            Ok(Err(e)) => {
+                return Err(ShellError::Capture(format!("cannot open screen capture: {e}")))
+            }
+            Err(_) => {
+                return Err(ShellError::Capture(
+                    "cannot open screen capture: the capture backend crashed while opening the device"
+                        .into(),
+                ))
+            }
+        };
+        self.media_producers.insert(
+            source_id.to_string(),
+            SendProducer(ProducerKind::Screen(prod)),
+        );
+        Ok(())
+    }
+
     /// Negotiated camera format for a source, e.g.
     /// `"mjpeg 1920x1080 @30fps (via mjpeg)"`. `None` for non-camera
     /// sources or when the camera was never opened.
     pub fn camera_format(&self, source_id: &str) -> Option<String> {
         self.camera_formats.get(source_id).cloned()
+    }
+
+    /// Opens a DirectShow audio-input producer (microphone/line-in,
+    /// Windows only). Called from `source_add` before the source is
+    /// pushed, so a missing device fails cleanly.
+    #[cfg(windows)]
+    pub(crate) fn open_audio_producer(
+        &mut self,
+        source_id: &str,
+        device: Option<&str>,
+    ) -> Result<(), ShellError> {
+        // Guard against a panic in the FFmpeg/dshow open path taking down
+        // the whole app: convert it into a clean capture error instead.
+        let device_owned = device.map(|d| d.to_string());
+        let opened = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            sf_capture::audio_in::AudioInputProducer::open(device_owned.as_deref())
+        }));
+        let prod = match opened {
+            Ok(Ok(p)) => p,
+            Ok(Err(e)) => {
+                return Err(ShellError::Capture(format!("cannot open audio input: {e}")))
+            }
+            Err(_) => {
+                return Err(ShellError::Capture(
+                    "cannot open audio input: the capture backend crashed while opening the device"
+                        .into(),
+                ))
+            }
+        };
+        self.audio_producers.insert(source_id.to_string(), prod);
+        Ok(())
     }
 
     /// Pulls the next decoded frame for a media source, resized to the
@@ -366,9 +430,18 @@ impl Shell {
 
     /// True when any open media producer has an audio stream.
     fn has_audio_sources(&self) -> bool {
-        self.media_producers
+        if self
+            .media_producers
             .values()
             .any(|p| p.stream_info().has_audio)
+        {
+            return true;
+        }
+        #[cfg(windows)]
+        if !self.audio_producers.is_empty() {
+            return true;
+        }
+        false
     }
 
     // ------------------------------------------------------------------
@@ -380,8 +453,13 @@ impl Shell {
     /// mixed samples (empty when nothing flowed). This is the single
     /// place meters become real.
     pub(crate) fn pump_audio(&mut self) -> Vec<f32> {
-        // Sync mixer registration with the current media sources.
-        let ids: Vec<String> = self.media_producers.keys().cloned().collect();
+        // Sync mixer registration with the current media + audio-input sources.
+        let ids: Vec<String> = {
+            let mut v: Vec<String> = self.media_producers.keys().cloned().collect();
+            #[cfg(windows)]
+            v.extend(self.audio_producers.keys().cloned());
+            v
+        };
         for id in &ids {
             if !self.audio_mixer.source_ids().contains(id) {
                 let gain = self.mixer.channels.get(id).map(|c| c.gain).unwrap_or(1.0);
@@ -413,6 +491,20 @@ impl Shell {
                         }
                         _ => break,
                     }
+                }
+            }
+        }
+        // Live audio inputs: drain up to 2 chunks per tick (~42 ms of
+        // 48 kHz audio covers the 33 ms tick; the producer's queue is
+        // newest-wins so nothing accumulates).
+        #[cfg(windows)]
+        for (id, prod) in self.audio_producers.iter_mut() {
+            for _ in 0..2 {
+                match prod.next_audio() {
+                    Ok(Some(c)) => {
+                        chunks.push((id.clone(), c.samples, c.channels, c.sample_rate))
+                    }
+                    _ => break,
                 }
             }
         }

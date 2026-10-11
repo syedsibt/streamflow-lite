@@ -236,7 +236,8 @@ export type SourceKind =
   | { camera: { device?: string | null; width?: number; height?: number; fps?: number } }
   | { screen: Record<string, never> }
   | { media: { path: string } }
-  | { text: { text: string } };
+  | { text: { text: string } }
+  | { audio_input: { device?: string | null } };
 
 /** Camera source summary for the Video panel — mirrors the backend. */
 export interface CameraSourceInfo {
@@ -350,7 +351,7 @@ export interface ProductionStateData {
  * camera on Windows, media files everywhere) — their pending state comes
  * from the backend's per-platform `status` field, not this list.
  */
-export const PENDING_CAPTURE_KINDS = ["screen", "text"];
+export const PENDING_CAPTURE_KINDS = ["text"];
 
 export function isPendingCaptureSource(s: SourceView): boolean {
   const kind = s.kind.toLowerCase();

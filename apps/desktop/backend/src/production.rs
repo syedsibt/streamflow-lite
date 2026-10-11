@@ -75,14 +75,22 @@ pub enum SourceKind {
         /// Capture fps (0 = default 30).
         fps: u32,
     },
-    /// Screen share (pending: `sf-capture` stub).
+    /// Microphone / line-in audio input (Windows DirectShow audio;
+    /// `device` selects which, None = first available). Audio-only:
+    /// contributes to the mixer, renders no video.
+    AudioInput {
+        /// DirectShow audio device name, e.g. from `list_audio_devices`.
+        device: Option<String>,
+    },
+    /// Screen share (Windows: real desktop capture via FFmpeg gdigrab;
+    /// Linux: x11grab via `sf-capture::screen`, needs an X server).
     Screen,
     /// Media file (real: decoded via `sf-capture`'s `MediaFileProducer`).
     Media {
         /// File path.
         path: String,
     },
-    /// Text / lower-third (pending: `sf-graphics` stub).
+    /// Text / lower-third (real: rasterized via `sf-graphics` + fontdue).
     Text {
         /// Text content.
         text: String,
@@ -96,12 +104,22 @@ impl SourceKind {
     /// on other platforms it has no backend yet.
     pub fn is_real(&self) -> bool {
         match self {
-            SourceKind::TestPattern | SourceKind::Color { .. } | SourceKind::Media { .. } => true,
+            SourceKind::TestPattern
+            | SourceKind::Color { .. }
+            | SourceKind::Media { .. }
+            | SourceKind::Text { .. } => true,
             #[cfg(windows)]
             SourceKind::Camera { .. } => true,
             #[cfg(not(windows))]
             SourceKind::Camera { .. } => false,
-            _ => false,
+            #[cfg(windows)]
+            SourceKind::AudioInput { .. } => true,
+            #[cfg(not(windows))]
+            SourceKind::AudioInput { .. } => false,
+            #[cfg(windows)]
+            SourceKind::Screen => true,
+            #[cfg(not(windows))]
+            SourceKind::Screen => false,
         }
     }
 
@@ -796,6 +814,9 @@ fn parse_source_kind(
             fps,
         }),
         "screen" => Ok(SourceKind::Screen),
+        "audio_input" => Ok(SourceKind::AudioInput {
+            device: device.map(|d| d.to_string()),
+        }),
         "media" => Ok(SourceKind::Media {
             path: path.unwrap_or("").to_string(),
         }),
@@ -871,7 +892,17 @@ impl Shell {
             let f = if *fps == 30 || *fps == 60 { *fps } else { 30 };
             self.open_camera_producer(&id, device.as_deref(), w, h, f)?;
         }
-        let input_id = kind.is_real().then(|| source_input_id(&id));
+        #[cfg(windows)]
+        if let SourceKind::AudioInput { device } = &kind {
+            self.open_audio_producer(&id, device.as_deref())?;
+        }
+        #[cfg(windows)]
+        if matches!(kind, SourceKind::Screen) {
+            self.open_screen_producer(&id)?;
+        }
+        // Audio-only sources need no video input record.
+        let input_id = (kind.is_real() && !matches!(kind, SourceKind::AudioInput { .. }))
+            .then(|| source_input_id(&id));
         let order = self
             .find_scene(scene_id)
             .ok_or_else(|| ShellError::UnknownScene(scene_id.to_string()))?
@@ -919,8 +950,12 @@ impl Shell {
         }
         self.mixer.channels.remove(source_id);
         self.media_producers.remove(source_id);
+        #[cfg(windows)]
+        self.audio_producers.remove(source_id);
         self.media_last_frame.remove(source_id);
         self.camera_formats.remove(source_id);
+        // Drop any cached text rasterizations for this source.
+        self.text_cache.retain(|(sid, _, _, _), _| sid != source_id);
         self.meter_values.remove(source_id);
         if let Some(input_id) = removed.input_id {
             self.engine.state_mut().inputs.retain(|i| i.id != input_id);
@@ -1009,6 +1044,31 @@ fn source_pixels(kind: &SourceKind, width: u32, height: u32) -> Vec<u8> {
     }
 }
 
+impl Shell {
+    /// Rasterized text overlay for a `Text` source, cached by
+    /// (source_id, text, w, h) so the font rasterizer runs once per
+    /// distinct text — not on every tick.
+    pub(crate) fn text_pixels(&mut self, source_id: &str, text: &str, w: u32, h: u32) -> Vec<u8> {
+        let key = (
+            source_id.to_string(),
+            text.to_string(),
+            w.max(1),
+            h.max(1),
+        );
+        if let Some(px) = self.text_cache.get(&key) {
+            return px.clone();
+        }
+        let px = sf_graphics::render_text_rgba(text, w, h);
+        // Bound the cache: text sources are few and static; 32 entries is
+        // ample and keeps memory trivially small.
+        if self.text_cache.len() >= 32 {
+            self.text_cache.clear();
+        }
+        self.text_cache.insert(key, px.clone());
+        px
+    }
+}
+
 /// Alpha "over" composite of `src` onto `canvas` (both RGBA8, same size).
 fn composite_over(canvas: &mut [u8], src: &[u8]) {
     for (d, s) in canvas.chunks_exact_mut(4).zip(src.chunks_exact(4)) {
@@ -1066,12 +1126,16 @@ impl Shell {
             if !src.kind.is_real() {
                 continue;
             }
+            // Audio-only sources feed the mixer, not the picture.
+            if matches!(src.kind, SourceKind::AudioInput { .. }) {
+                continue;
+            }
             let input_id = src
                 .input_id
                 .as_ref()
                 .ok_or_else(|| ShellError::UnknownSource(src.id.clone()))?;
             let pixels = match &src.kind {
-                SourceKind::Media { .. } | SourceKind::Camera { .. } => {
+                SourceKind::Media { .. } | SourceKind::Camera { .. } | SourceKind::Screen => {
                     // Pull the next decoded/live frame; skip the source for
                     // this frame when none is ready (producer handles pacing).
                     match self.pull_media_frame(&src.id, w, h) {
@@ -1079,6 +1143,7 @@ impl Shell {
                         None => continue,
                     }
                 }
+                SourceKind::Text { text } => self.text_pixels(&src.id, text, w, h),
                 _ => source_pixels(&src.kind, w, h),
             };
             let frame = self.engine.grade_input_frame(input_id, w, h, &pixels)?;
