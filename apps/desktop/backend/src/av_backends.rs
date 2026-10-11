@@ -393,10 +393,10 @@ impl Shell {
         VideoEncoderOpts {
             width: AV_W,
             height: AV_H,
-            fps_num: 15,
+            fps_num: 30,
             fps_den: 1,
             bitrate_bps: RECORD_BITRATE_BPS,
-            gop: 30,
+            gop: 60,
             preset: "veryfast".to_string(),
         }
     }

@@ -118,6 +118,12 @@ impl VideoEncoder {
             }
             _ => {}
         }
+        // Live streaming: disable encoder buffering so frames are output
+        // immediately (otherwise x264 lookahead delays the first packets
+        // and YouTube sees "No data").
+        if id == EncoderId::H264Libx264 {
+            dict.set("tune", "zerolatency");
+        }
         let encoder = v
             .open_with(dict)
             .map_err(|e| EncodeError::Open(format!("{}: {e}", id.ffmpeg_name())))?;
