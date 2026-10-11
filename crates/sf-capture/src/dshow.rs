@@ -175,6 +175,9 @@ pub struct DshowProducer {
 /// on that poll (2 seconds). The next poll tries again.
 const READ_TIMEOUT_US: u64 = 2_000_000;
 
+/// Max time to wait for a dshow device to open (15 seconds per attempt).
+const OPEN_TIMEOUT_US: u64 = 15_000_000;
+
 impl DshowProducer {
     /// Open `device` (a name from [`list_devices`]) at `width`×`height`,
     /// `fps`. Frames are converted to RGBA8 by the shared demuxer.
@@ -238,7 +241,22 @@ impl DshowProducer {
             set_opt(k, v);
         }
 
-        let mut ctx: *mut ff::ffi::AVFormatContext = ptr::null_mut();
+        // Allocate the context first so we can install the interrupt
+        // callback BEFORE opening — a stalled device must not hang
+        // `avformat_open_input` / `find_stream_info` forever.
+        let deadline = Arc::new(ReadDeadline {
+            deadline_us: AtomicU64::new(now_us() + OPEN_TIMEOUT_US),
+        });
+        let mut ctx: *mut ff::ffi::AVFormatContext =
+            unsafe { ff::ffi::avformat_alloc_context() };
+        if ctx.is_null() {
+            unsafe { ff::ffi::av_dict_free(&mut dict) };
+            return Err("avformat_alloc_context failed".into());
+        }
+        unsafe {
+            (*ctx).interrupt_callback.callback = Some(interrupt_cb);
+            (*ctx).interrupt_callback.opaque = Arc::as_ptr(&deadline) as *mut c_void;
+        }
         let ret = unsafe {
             ff::ffi::avformat_open_input(
                 &mut ctx,
@@ -249,29 +267,26 @@ impl DshowProducer {
         };
         unsafe { ff::ffi::av_dict_free(&mut dict) };
         if ret < 0 || ctx.is_null() {
+            // `avformat_open_input` frees `ctx` on failure; do not touch it.
             return Err("avformat_open_input failed".into());
         }
 
         // Populate stream parameters (codec, dimensions, pixel format).
         // dshow is a live device; without this the stream params may be
         // incomplete and the decoder setup below can misbehave.
+        // The open deadline is still armed, bounding this call too.
         let si_ret = unsafe { ff::ffi::avformat_find_stream_info(ctx, ptr::null_mut()) };
+        // Open phase done — disarm the deadline; per-read timeouts are
+        // armed in `next_frame`.
+        deadline.deadline_us.store(0, Ordering::Relaxed);
         if si_ret < 0 {
             unsafe { ff::ffi::avformat_close_input(&mut ctx) };
             return Err("avformat_find_stream_info failed".into());
         }
 
-        // Install the read-timeout interrupt callback before handing the
-        // context to the safe wrapper. `deadline` lives in an `Arc` owned
-        // by `Self`, so the opaque pointer stays valid for the context's
-        // whole lifetime.
-        let deadline = Arc::new(ReadDeadline {
-            deadline_us: AtomicU64::new(0),
-        });
-        unsafe {
-            (*ctx).interrupt_callback.callback = Some(interrupt_cb);
-            (*ctx).interrupt_callback.opaque = Arc::as_ptr(&deadline) as *mut c_void;
-        }
+        // The interrupt callback stays installed for the context's lifetime;
+        // `deadline` (Arc) is owned by `Self`, so the opaque pointer stays
+        // valid until drop.
 
         // SAFETY: `ctx` is a valid open input context owned by us now;
         // `Input::wrap` takes ownership and closes it on drop.
