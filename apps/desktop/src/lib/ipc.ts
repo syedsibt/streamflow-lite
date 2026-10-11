@@ -22,6 +22,8 @@ import type {
   SourceKind,
   SourceView,
   UiEvent,
+  VideoSettings,
+  CameraSourceInfo,
 } from "./types";
 
 declare global {
@@ -114,6 +116,7 @@ export const api = {
     let device: string | null = null;
     let width = 0;
     let height = 0;
+    let fps = 0;
     if ("color" in kind) {
       kindStr = "color";
       color_r = kind.color.r;
@@ -124,6 +127,7 @@ export const api = {
       device = kind.camera.device ?? null;
       width = kind.camera.width ?? 0;
       height = kind.camera.height ?? 0;
+      fps = kind.camera.fps ?? 0;
     } else if ("screen" in kind) {
       kindStr = "screen";
     } else if ("media" in kind) {
@@ -145,11 +149,23 @@ export const api = {
       device,
       width,
       height,
+      fps,
     });
   },
   listCameras: () => cmd<string[]>("list_cameras", {}),
   cameraFormat: (source_id: string) =>
     cmd<string | null>("camera_format", { source_id }),
+  cameraReconfigure: (args: {
+    source_id: string;
+    device: string | null;
+    width: number;
+    height: number;
+    fps: number;
+  }) => cmd<string>("camera_reconfigure", args),
+  cameraSources: () => cmd<CameraSourceInfo[]>("camera_sources", {}),
+  videoSettingsGet: () => cmd<VideoSettings>("video_settings_get", {}),
+  videoSettingsSet: (settings: VideoSettings) =>
+    cmd<void>("video_settings_set", { settings }),
   listAudioDevices: () => cmd<string[]>("list_audio_devices", {}),
   perfStats: () => cmd<number[]>("perf_stats", {}),
   perfStages: () => cmd<number[]>("perf_stages", {}),

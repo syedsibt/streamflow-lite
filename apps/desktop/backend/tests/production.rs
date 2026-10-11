@@ -17,7 +17,7 @@ fn empty_scene(s: &mut Shell) -> String {
 }
 
 fn add_pattern(s: &mut Shell, scene_id: &str, name: &str) -> String {
-    s.source_add(scene_id, "test_pattern", name, [0, 0, 0], None, None, None, 0, 0)
+    s.source_add(scene_id, "test_pattern", name, [0, 0, 0], None, None, None, 0, 0, 0)
         .expect("add test pattern source")
         .id
 }
@@ -100,7 +100,7 @@ fn source_crud_reorder_visibility() {
 
     let p1 = add_pattern(&mut s, &scene, "P1");
     let red = s
-        .source_add(&scene, "color", "Red", [255, 0, 0], None, None, None, 0, 0)
+        .source_add(&scene, "color", "Red", [255, 0, 0], None, None, None, 0, 0, 0)
         .unwrap();
     assert!(matches!(red.kind, SourceKind::Color { r: 255, g: 0, b: 0 }));
     assert!(red.input_id.is_some());
@@ -108,7 +108,7 @@ fn source_crud_reorder_visibility() {
 
     // Pending kinds are honest: status pending + reason, no engine input.
     let cam = s
-        .source_add(&scene, "camera", "Cam", [0, 0, 0], None, None, None, 0, 0)
+        .source_add(&scene, "camera", "Cam", [0, 0, 0], None, None, None, 0, 0, 0)
         .unwrap();
     assert!(cam.input_id.is_none());
     assert!(matches!(cam.kind, SourceKind::Camera { .. }));
@@ -118,14 +118,14 @@ fn source_crud_reorder_visibility() {
     );
     // Media with a bad path fails cleanly (no half-added source).
     let media_err = s
-        .source_add(&scene, "media", "Clip", [0, 0, 0], None, Some("/tmp/x.mp4"), None, 0, 0)
+        .source_add(&scene, "media", "Clip", [0, 0, 0], None, Some("/tmp/x.mp4"), None, 0, 0, 0)
         .expect_err("nonexistent media must fail");
     assert!(
         media_err.to_string().contains("cannot open media"),
         "unexpected: {media_err}"
     );
     assert!(s
-        .source_add(&scene, "bogus", "X", [0, 0, 0], None, None, None, 0, 0)
+        .source_add(&scene, "bogus", "X", [0, 0, 0], None, None, None, 0, 0, 0)
         .is_err());
 
     // Reorder: red to the bottom.
@@ -186,7 +186,7 @@ fn scene_render_returns_valid_nonblank_png_via_real_pipeline() {
     assert!(mx - mn > 40, "frame looks blank: {mn}..{mx}");
 
     // Pending sources are skipped, not faked: adding a camera still renders.
-    s.source_add(&scene, "camera", "Cam", [0, 0, 0], None, None, None, 0, 0)
+    s.source_add(&scene, "camera", "Cam", [0, 0, 0], None, None, None, 0, 0, 0)
         .unwrap();
     let png2 = s.scene_render_png(&scene, 160, 90).unwrap();
     assert_eq!(png, png2); // camera contributed nothing
@@ -201,7 +201,7 @@ fn composite_order_and_visibility() {
     // Bottom: test pattern. Top: opaque red — covers everything.
     add_pattern(&mut s, &scene, "P1");
     let red = s
-        .source_add(&scene, "color", "Red", [255, 0, 0], None, None, None, 0, 0)
+        .source_add(&scene, "color", "Red", [255, 0, 0], None, None, None, 0, 0, 0)
         .unwrap();
 
     let px = decode_rgba(&s.scene_render_png(&scene, 64, 36).unwrap());
@@ -552,4 +552,88 @@ fn macro_apply_look_hits_program_sources_through_real_pipeline() {
     assert_eq!(slots.len(), 1);
     assert_eq!(slots[0].kind, "look");
     assert!((slots[0].intensity - 0.8).abs() < 1e-6);
+}
+
+// ---------------------------------------------------------------------------
+// Video settings (Video menu panel)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn video_settings_defaults_and_roundtrip() {
+    let mut s = shell();
+    let d = s.video_settings_get();
+    assert_eq!((d.output_width, d.output_height), (1920, 1080));
+    assert_eq!(d.output_fps, 30);
+    assert_eq!(d.encoder, "auto");
+    assert_eq!(d.bitrate_kbps, 8000);
+    assert_eq!(s.frame_interval_us(), 33_333);
+
+    let mut upd = d.clone();
+    upd.output_width = 1280;
+    upd.output_height = 720;
+    upd.output_fps = 60;
+    upd.encoder = "libx264".to_string();
+    upd.bitrate_kbps = 6000;
+    s.video_settings_set(upd).expect("valid settings");
+    let back = s.video_settings_get();
+    assert_eq!((back.output_width, back.output_height), (1280, 720));
+    assert_eq!(back.output_fps, 60);
+    assert_eq!(back.encoder, "libx264");
+    assert_eq!(s.frame_interval_us(), 16_666);
+}
+
+#[test]
+fn video_settings_rejects_bad_values() {
+    let mut s = shell();
+    let d = s.video_settings_get();
+    let mut bad = d.clone();
+    bad.output_width = 999;
+    assert!(s.video_settings_set(bad).is_err());
+
+    let mut bad = d.clone();
+    bad.output_fps = 25;
+    assert!(s.video_settings_set(bad).is_err());
+
+    let mut bad = d.clone();
+    bad.encoder = "h264_foo".to_string();
+    assert!(s.video_settings_set(bad).is_err());
+
+    let mut bad = d.clone();
+    bad.bitrate_kbps = 100;
+    assert!(s.video_settings_set(bad).is_err());
+
+    let mut bad = d;
+    bad.camera_fps = 120;
+    assert!(s.video_settings_set(bad).is_err());
+}
+
+#[test]
+fn camera_reconfigure_updates_kind_and_lists_sources() {
+    let mut s = shell();
+    let scene = empty_scene(&mut s);
+    // fps=0 → default; on non-Windows no producer opens but kind is stored.
+    let id = s
+        .source_add(&scene, "camera", "Cam", [0, 0, 0], None, None, None, 1280, 720, 0)
+        .expect("add camera")
+        .id;
+    let cams = s.camera_sources();
+    assert_eq!(cams.len(), 1);
+    assert_eq!(cams[0].id, id);
+
+    let negotiated = s
+        .camera_reconfigure(&id, Some("FakeCam".to_string()), 1920, 1080, 60)
+        .expect("reconfigure");
+    assert!(!negotiated.is_empty());
+
+    let cams = s.camera_sources();
+    assert_eq!(cams.len(), 1);
+    assert_eq!(cams[0].device.as_deref(), Some("FakeCam"));
+    assert_eq!((cams[0].width, cams[0].height), (1920, 1080));
+    assert_eq!(cams[0].fps, 60);
+
+    // Non-camera source must be rejected.
+    let pat = add_pattern(&mut s, &scene, "Pat");
+    assert!(s.camera_reconfigure(&pat, None, 640, 480, 30).is_err());
+    // Unknown source must be rejected.
+    assert!(s.camera_reconfigure("nope", None, 640, 480, 30).is_err());
 }

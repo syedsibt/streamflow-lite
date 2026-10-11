@@ -1073,6 +1073,7 @@ body {
 
 .form-grid input[type="text"],
 .form-grid input[type="password"],
+.form-grid input[type="number"],
 .form-grid select {
   background: var(--bg-raised);
   color: var(--text);
@@ -1081,4 +1082,27 @@ body {
   padding: 7px 10px;
   font-size: 12px;
   width: 100%;
+}
+
+/* Video settings view: manual input/output structure. */
+.video-settings {
+  display: flex;
+  flex: 1;
+  min-height: 0;
+  gap: 10px;
+  padding: 10px;
+  overflow-y: auto;
+  align-items: flex-start;
+  flex-wrap: wrap;
+}
+
+.video-settings .panel {
+  width: 380px;
+  max-width: 100%;
+  flex-shrink: 0;
+}
+
+.video-settings .mono {
+  font-family: ui-monospace, monospace;
+  font-size: 11px;
 }

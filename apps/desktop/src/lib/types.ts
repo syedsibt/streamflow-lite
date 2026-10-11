@@ -233,10 +233,34 @@ export const WHEELS = [
 export type SourceKind =
   | { test_pattern: Record<string, never> }
   | { color: { r: number; g: number; b: number } }
-  | { camera: { device?: string | null; width?: number; height?: number } }
+  | { camera: { device?: string | null; width?: number; height?: number; fps?: number } }
   | { screen: Record<string, never> }
   | { media: { path: string } }
   | { text: { text: string } };
+
+/** Camera source summary for the Video panel — mirrors the backend. */
+export interface CameraSourceInfo {
+  id: string;
+  name: string;
+  device: string | null;
+  width: number;
+  height: number;
+  fps: number;
+  negotiated: string | null;
+}
+
+/** Video input/output settings (Video menu panel) — mirrors the backend. */
+export interface VideoSettings {
+  output_width: number;
+  output_height: number;
+  output_fps: number;
+  encoder: string;
+  bitrate_kbps: number;
+  camera_device: string | null;
+  camera_width: number;
+  camera_height: number;
+  camera_fps: number;
+}
 
 export interface SourceView {
   id: string;

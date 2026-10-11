@@ -49,9 +49,10 @@ mod production;
 /// Production state machine (scenes, sources, transitions, mixer, stream,
 /// record, macros) — all headless-testable, no tauri dependency.
 pub use production::{
-    transition_progress, ChannelStrip, Macro, MacroAction, MacroDispatchResult, MixerView,
-    ProdScene, ProductionStateView, RecordFormat, RecordLifecycle, RecordSettings, SourceKind,
-    SourceState, StreamLifecycle, StreamPlatform, StreamSettings, TransitionKind, TransitionView,
+    transition_progress, CameraSourceInfo, ChannelStrip, Macro, MacroAction, MacroDispatchResult,
+    MixerView, ProdScene, ProductionStateView, RecordFormat, RecordLifecycle, RecordSettings,
+    SourceKind, SourceState, StreamLifecycle, StreamPlatform, StreamSettings, TransitionKind,
+    TransitionView, VideoSettings,
 };
 
 /// How often `preview_png` may re-render per input (spec has no preview rule;
@@ -133,6 +134,9 @@ pub enum ShellError {
     /// Capture backend error (media file open/decode).
     #[error("capture error: {0}")]
     Capture(String),
+    /// Invalid video/setting value from the UI.
+    #[error("invalid setting: {0}")]
+    InvalidSetting(String),
 }
 
 impl ShellError {
@@ -379,6 +383,8 @@ pub struct Shell {
     mixer: production::MixerState,
     /// Stream settings (key redacted everywhere).
     stream_settings: production::StreamSettings,
+    /// Video input/output settings (Video menu panel).
+    video_settings: production::VideoSettings,
     /// Stream output lifecycle.
     stream_lifecycle: production::StreamLifecycle,
     /// Record settings.
@@ -452,6 +458,7 @@ impl Shell {
             transition: None,
             mixer: production::MixerState::default(),
             stream_settings: production::StreamSettings::default(),
+            video_settings: production::VideoSettings::default(),
             stream_lifecycle: production::StreamLifecycle::Idle,
             record_settings: production::RecordSettings::default(),
             record_runtime: None,
@@ -500,6 +507,7 @@ impl Shell {
             transition: None,
             mixer: production::MixerState::default(),
             stream_settings: production::StreamSettings::default(),
+            video_settings: production::VideoSettings::default(),
             stream_lifecycle: production::StreamLifecycle::Idle,
             record_settings: production::RecordSettings::default(),
             record_runtime: None,

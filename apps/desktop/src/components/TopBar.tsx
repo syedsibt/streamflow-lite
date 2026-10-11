@@ -1,11 +1,11 @@
-export type ViewId = "production" | "studio";
+export type ViewId = "production" | "studio" | "video";
 
 interface TopBarProps {
   view: ViewId;
   setView: (v: ViewId) => void;
 }
 
-/** Slim top-level view switch: Production | Color Studio. */
+/** Slim top-level view switch: Production | Color Studio | Video. */
 export default function TopBar({ view, setView }: TopBarProps) {
   return (
     <div className="viewbar">
@@ -22,6 +22,12 @@ export default function TopBar({ view, setView }: TopBarProps) {
           onClick={() => setView("studio")}
         >
           Color Studio
+        </button>
+        <button
+          className={view === "video" ? "active" : ""}
+          onClick={() => setView("video")}
+        >
+          Video
         </button>
       </div>
     </div>

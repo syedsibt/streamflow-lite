@@ -35,7 +35,19 @@ use sf_audio::AudioFrame;
 use sf_capture::{
     media::MediaFileProducer, CapturedFrame, CaptureError, FrameProducer, StreamInfo,
 };
-use sf_encode::{AudioEncoder, EncodedPacket, VideoEncoder, VideoEncoderOpts};
+use sf_encode::{AudioEncoder, EncodedPacket, EncoderId, VideoEncoder, VideoEncoderOpts};
+
+/// Maps a Video panel encoder name to [`EncoderId`]. `"auto"` is handled by
+/// the caller (registry probing); unknown names yield `None`.
+fn encoder_id_from_name(name: &str) -> Option<EncoderId> {
+    match name {
+        "h264_nvenc" => Some(EncoderId::H264Nvenc),
+        "h264_qsv" => Some(EncoderId::H264Qsv),
+        "h264_amf" => Some(EncoderId::H264Amf),
+        "libx264" => Some(EncoderId::H264Libx264),
+        _ => None,
+    }
+}
 use sf_engine::Frame;
 use sf_output::{
     redact_url, ContainerFormat, RealTransport, ReconnectPolicy, Recorder,
@@ -46,16 +58,14 @@ use super::production::{transition_progress, RecordFormat, RecordRuntime, Stream
 use super::{Shell, ShellError};
 use crate::production::crossfade;
 
-/// Program-bus capture size for recording/streaming in the shell.
-/// 640×360 keeps libx264 ultrafast inside the 33.3 ms media-tick budget on
-/// modest CPUs; production will capture at the full program size on a thread.
+/// Legacy fixed program size / tick constants. The live values now come
+/// from [`crate::production::VideoSettings`] (`video_settings` on the
+/// shell); these remain for reference.
 pub const AV_W: u32 = 640;
 /// See [`AV_W`].
 pub const AV_H: u32 = 360;
-/// Microseconds per output frame at the 30 fps media-tick cadence.
+/// See [`AV_W`].
 pub const AV_FRAME_US: i64 = 33_333;
-/// Recording bitrate (bits/s) for the shell.
-const RECORD_BITRATE_BPS: u32 = 4_000_000;
 
 /// An active recording session: encoders + muxer + clocks.
 pub(crate) struct ActiveRecording {
@@ -224,14 +234,15 @@ impl Shell {
         device: Option<&str>,
         width: u32,
         height: u32,
+        fps: u32,
     ) -> Result<(), ShellError> {
         // Guard against a panic in the FFmpeg/dshow open path taking down
         // the whole app: convert it into a clean capture error instead.
         let device_owned = device.map(|d| d.to_string());
         let opened = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             match device_owned.as_deref() {
-                Some(d) => sf_capture::dshow::DshowProducer::open(d, width, height, 30),
-                None => sf_capture::dshow::DshowProducer::open_default(width, height, 30),
+                Some(d) => sf_capture::dshow::DshowProducer::open(d, width, height, fps),
+                None => sf_capture::dshow::DshowProducer::open_default(width, height, fps),
             }
         }));
         let prod = match opened {
@@ -417,16 +428,37 @@ impl Shell {
     // Recording
     // ------------------------------------------------------------------
 
-    fn video_encoder_opts() -> VideoEncoderOpts {
+    fn video_encoder_opts(&self) -> VideoEncoderOpts {
+        let vs = &self.video_settings;
         VideoEncoderOpts {
-            width: AV_W,
-            height: AV_H,
-            fps_num: 30,
+            width: vs.output_width,
+            height: vs.output_height,
+            fps_num: vs.output_fps,
             fps_den: 1,
-            bitrate_bps: RECORD_BITRATE_BPS,
-            gop: 60,
+            bitrate_bps: vs.bitrate_kbps * 1000,
+            gop: vs.output_fps * 2,
             preset: "veryfast".to_string(),
         }
+    }
+
+    /// Opens the video encoder honoring the Video panel's encoder override:
+    /// `"auto"` probes the registry (NVENC → QSV → AMF → x264 → mpeg4),
+    /// anything else forces that encoder (falls back to auto on failure).
+    fn open_video_encoder(&self, opts: VideoEncoderOpts) -> Result<VideoEncoder, ShellError> {
+        let name = self.video_settings.encoder.as_str();
+        if name != "auto" {
+            if let Some(id) = encoder_id_from_name(name) {
+                match VideoEncoder::open_with_encoder(id, opts.clone()) {
+                    Ok(enc) => return Ok(enc),
+                    Err(e) => {
+                        // Forced encoder failed (e.g. NVENC without NVIDIA
+                        // GPU) — fall through to auto so start still works.
+                        eprintln!("video: forced encoder {name} failed ({e}); falling back to auto");
+                    }
+                }
+            }
+        }
+        VideoEncoder::open(opts).map_err(|e| ShellError::Capture(format!("video encoder: {e}")))
     }
 
     /// Starts recording the program bus to `record_settings.path`.
@@ -451,8 +483,9 @@ impl Shell {
             RecordFormat::Mkv => ContainerFormat::Mkv,
         };
         let build = || -> Result<ActiveRecording, String> {
-            let video_enc = VideoEncoder::open(Self::video_encoder_opts())
-                .map_err(|e| format!("video encoder: {e}"))?;
+            let video_enc = self
+                .open_video_encoder(self.video_encoder_opts())
+                .map_err(|e| e.to_string())?;
             let mut recorder =
                 Recorder::create(&path, fmt).map_err(|e| format!("recorder: {e}"))?;
             recorder
@@ -560,6 +593,7 @@ impl Shell {
     /// the recording loudly (lifecycle `Error`) rather than dropping
     /// silently.
     pub(crate) fn record_tick(&mut self, frame: &Frame, audio: &[f32]) {
+        let frame_us = self.frame_interval_us();
         let rec = match self.active_recording.as_mut() {
             Some(r) => r,
             None => return,
@@ -574,7 +608,7 @@ impl Shell {
         }
         let mut failed: Option<String> = None;
         let vpts = rec.video_pts_us;
-        rec.video_pts_us += AV_FRAME_US;
+        rec.video_pts_us += frame_us as i64;
         match rec.video_enc.encode_rgba(&frame.pixels, vpts) {
             Ok(pkts) => {
                 for p in &pkts {
@@ -645,8 +679,9 @@ impl Shell {
             format!("{url}/{key}")
         };
         let build = || -> Result<ActiveStream, String> {
-            let video_enc = VideoEncoder::open(Self::video_encoder_opts())
-                .map_err(|e| format!("video encoder: {e}"))?;
+            let video_enc = self
+                .open_video_encoder(self.video_encoder_opts())
+                .map_err(|e| e.to_string())?;
             let audio_enc = if self.has_audio_sources() {
                 Some(AudioEncoder::open().map_err(|e| format!("audio encoder: {e}"))?)
             } else {
@@ -770,12 +805,13 @@ impl Shell {
         // Live path: encode the rendered frame, send.
         let url = self.stream_settings.url.clone();
         let key = self.stream_settings.key.clone();
+        let frame_us = self.frame_interval_us();
         let a = match self.active_stream.as_mut() {
             Some(a) => a,
             None => return,
         };
         let vpts = a.video_pts_us;
-        a.video_pts_us += AV_FRAME_US;
+        a.video_pts_us += frame_us as i64;
         let mut send_failed: Option<String> = None;
         // (No helper closure: `a` is already mutably borrowed, so the
         // send is inlined to keep borrowck happy.)
@@ -856,7 +892,11 @@ impl Shell {
             return;
         }
         let t0 = std::time::Instant::now();
-        let frame = match self.program_frame_raw(AV_W, AV_H) {
+        let (ow, oh) = (
+            self.video_settings.output_width,
+            self.video_settings.output_height,
+        );
+        let frame = match self.program_frame_raw(ow, oh) {
             Ok(f) => f,
             Err(_) => {
                 // Render stage couldn't produce a frame this tick: count it

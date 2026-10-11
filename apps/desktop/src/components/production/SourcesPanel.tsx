@@ -74,6 +74,7 @@ export default function SourcesPanel() {
   const [cameras, setCameras] = useState<string[]>([]);
   const [cameraDevice, setCameraDevice] = useState<string>("");
   const [cameraRes, setCameraRes] = useState<string>("720p");
+  const [cameraFps, setCameraFps] = useState<string>("30");
 
   // Load camera devices when the camera kind is selected.
   useEffect(() => {
@@ -122,6 +123,7 @@ export default function SourcesPanel() {
             device: cameraDevice || null,
             width: res.width,
             height: res.height,
+            fps: cameraFps === "60" ? 60 : 30,
           },
         };
       }
@@ -315,6 +317,14 @@ export default function SourcesPanel() {
                     {r.label}
                   </option>
                 ))}
+              </select>
+              <select
+                value={cameraFps}
+                onChange={(e) => setCameraFps(e.target.value)}
+                title="Capture frame rate"
+              >
+                <option value="30">30 fps</option>
+                <option value="60">60 fps</option>
               </select>
             </>
           )}

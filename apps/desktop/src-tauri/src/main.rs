@@ -26,9 +26,9 @@ use std::time::Duration;
 use sf_filters::Filter;
 use sf_ipc::FilterTarget;
 use sf_ui_backend::{
-    AiResultView, ChannelStrip, EffectKindInfo, LookInfo, Macro, MacroAction, MacroDispatchResult,
-    ProdScene, ProductionStateView, Shell, ShellError, SlotView, SourceState, TransitionView,
-    UiEvent,
+    AiResultView, CameraSourceInfo, ChannelStrip, EffectKindInfo, LookInfo, Macro, MacroAction,
+    MacroDispatchResult, ProdScene, ProductionStateView, Shell, ShellError, SlotView, SourceState,
+    TransitionView, UiEvent, VideoSettings,
 };
 use tauri::{AppHandle, Emitter, Manager, State};
 
@@ -359,6 +359,7 @@ fn source_add(
     device: Option<String>,
     width: u32,
     height: u32,
+    fps: u32,
 ) -> CmdResult<SourceState> {
     lock(&state)?
         .source_add(
@@ -371,6 +372,7 @@ fn source_add(
             device.as_deref(),
             width,
             height,
+            fps,
         )
         .map_err(ue)
 }
@@ -387,6 +389,42 @@ fn list_cameras(state: State<'_, AppState>) -> Vec<String> {
 #[tauri::command(rename_all = "snake_case")]
 fn camera_format(state: State<'_, AppState>, source_id: String) -> Option<String> {
     lock(&state).ok().and_then(|s| s.camera_format(&source_id))
+}
+
+/// Current video input/output settings for the Video menu panel.
+#[tauri::command(rename_all = "snake_case")]
+fn video_settings_get(state: State<'_, AppState>) -> CmdResult<VideoSettings> {
+    lock(&state).map(|s| s.video_settings_get())
+}
+
+/// Validates and stores video settings. Output size/fps/encoder/bitrate
+/// apply the next time streaming/recording starts; the media-tick cadence
+/// follows `output_fps` immediately.
+#[tauri::command(rename_all = "snake_case")]
+fn video_settings_set(state: State<'_, AppState>, settings: VideoSettings) -> CmdResult<()> {
+    lock(&state)?.video_settings_set(settings).map_err(ue)
+}
+
+/// Reconfigures a camera source live (device/resolution/fps) and returns
+/// what the camera actually negotiated.
+#[tauri::command(rename_all = "snake_case")]
+fn camera_reconfigure(
+    state: State<'_, AppState>,
+    source_id: String,
+    device: Option<String>,
+    width: u32,
+    height: u32,
+    fps: u32,
+) -> CmdResult<String> {
+    lock(&state)?
+        .camera_reconfigure(&source_id, device, width, height, fps)
+        .map_err(ue)
+}
+
+/// All camera sources with live config + negotiated format (Video panel).
+#[tauri::command(rename_all = "snake_case")]
+fn camera_sources(state: State<'_, AppState>) -> Vec<CameraSourceInfo> {
+    lock(&state).map(|s| s.camera_sources()).unwrap_or_default()
 }
 
 /// Lists available audio input devices (Windows DirectShow; empty elsewhere).
@@ -662,22 +700,28 @@ fn main() {
             Shell::new().expect("engine must open a GPU adapter (headless: lavapipe)"),
         )))
         .setup(|app| {
-            // Media pipeline: fixed 33.3 ms master tick (30 fps). Renders one
-            // program frame and advances record/stream encoders. Runs on its
-            // own thread so UI polling, PNG previews, and transitions can
-            // never stall the program feed. If the camera is late, the last
-            // frame is repeated (tick never waits).
+            // Media pipeline: master tick at the Video panel's output fps
+            // (30 → 33.3 ms, 60 → 16.7 ms). Renders one program frame and
+            // advances record/stream encoders. Runs on its own thread so UI
+            // polling, PNG previews, and transitions can never stall the
+            // program feed. If the camera is late, the last frame is
+            // repeated (tick never waits).
             let media_handle = app.handle().clone();
             std::thread::spawn(move || loop {
                 let tick = std::time::Instant::now();
-                if let Ok(mut s) = media_handle.state::<AppState>().0.lock() {
-                    // Never panics; backend failures degrade to Error states.
-                    s.av_tick();
-                }
-                // Monotonic fixed cadence: sleep the remainder of 33.3 ms.
+                let interval_us =
+                    if let Ok(mut s) = media_handle.state::<AppState>().0.lock() {
+                        // Never panics; backend failures degrade to Error states.
+                        s.av_tick();
+                        s.frame_interval_us()
+                    } else {
+                        33_333
+                    };
+                // Monotonic fixed cadence: sleep the remainder of the frame.
                 let elapsed = tick.elapsed();
-                if elapsed < Duration::from_micros(33_333) {
-                    std::thread::sleep(Duration::from_micros(33_333) - elapsed);
+                let target = Duration::from_micros(interval_us);
+                if elapsed < target {
+                    std::thread::sleep(target - elapsed);
                 }
             });
             // Engine → UI event pump: advance auto-transitions, then poll
@@ -735,6 +779,10 @@ fn main() {
             source_add,
             list_cameras,
             camera_format,
+            video_settings_get,
+            video_settings_set,
+            camera_reconfigure,
+            camera_sources,
             list_audio_devices,
             perf_stats,
             perf_stages,

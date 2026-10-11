@@ -72,6 +72,8 @@ pub enum SourceKind {
         width: u32,
         /// Capture height (0 = default 720).
         height: u32,
+        /// Capture fps (0 = default 30).
+        fps: u32,
     },
     /// Screen share (pending: `sf-capture` stub).
     Screen,
@@ -296,6 +298,56 @@ impl fmt::Debug for StreamSettings {
     }
 }
 
+/// Video input/output settings, configured from the Video menu panel.
+///
+/// Output (program bus) drives the render size, tick rate, and the
+/// stream/record encoders. Input holds the camera defaults used when a new
+/// camera source is added (and the target of "Apply" for live reconfigure).
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct VideoSettings {
+    /// Program output width (1280 | 1920).
+    pub output_width: u32,
+    /// Program output height (720 | 1080).
+    pub output_height: u32,
+    /// Program output fps (30 | 60). Also sets the media-tick cadence.
+    pub output_fps: u32,
+    /// Encoder override: `"auto"` (default) or an FFmpeg encoder name
+    /// (`"h264_amf"`, `"h264_nvenc"`, `"h264_qsv"`, `"libx264"`).
+    pub encoder: String,
+    /// Target video bitrate for stream + record, kilobits per second.
+    pub bitrate_kbps: u32,
+    /// Default camera device (None = first available).
+    pub camera_device: Option<String>,
+    /// Default camera capture width.
+    pub camera_width: u32,
+    /// Default camera capture height.
+    pub camera_height: u32,
+    /// Default camera capture fps (30 | 60).
+    pub camera_fps: u32,
+}
+
+impl Default for VideoSettings {
+    fn default() -> Self {
+        Self {
+            output_width: 1920,
+            output_height: 1080,
+            output_fps: 30,
+            encoder: "auto".to_string(),
+            bitrate_kbps: 8000,
+            camera_device: None,
+            camera_width: 1280,
+            camera_height: 720,
+            camera_fps: 30,
+        }
+    }
+}
+
+/// Allowed values for the Video panel dropdowns (also the validation set).
+pub const VIDEO_OUTPUT_SIZES: [(u32, u32); 2] = [(1280, 720), (1920, 1080)];
+pub const VIDEO_FPS_OPTIONS: [u32; 2] = [30, 60];
+pub const VIDEO_ENCODER_OPTIONS: [&str; 5] =
+    ["auto", "h264_amf", "h264_nvenc", "h264_qsv", "libx264"];
+
 /// Stream output lifecycle.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(tag = "state", rename_all = "snake_case")]
@@ -470,6 +522,8 @@ pub struct ProductionStateView {
     pub record_settings: RecordSettings,
     /// Record lifecycle.
     pub record_lifecycle: RecordLifecycle,
+    /// Video input/output settings (Video menu panel).
+    pub video_settings: VideoSettings,
     /// Bound macros.
     pub macros: Vec<Macro>,
 }
@@ -494,6 +548,7 @@ impl Shell {
         self.scenes.push(scene);
         self.mixer = MixerState::default();
         self.stream_settings = StreamSettings::default();
+        self.video_settings = VideoSettings::default();
         self.stream_lifecycle = StreamLifecycle::Idle;
         self.record_settings = RecordSettings::default();
         self.record_runtime = None;
@@ -510,6 +565,7 @@ impl Shell {
             None,
             None,
             None,
+            0,
             0,
             0,
         );
@@ -722,6 +778,7 @@ fn parse_source_kind(
     device: Option<&str>,
     width: u32,
     height: u32,
+    fps: u32,
 ) -> Result<SourceKind, ShellError> {
     match kind {
         "test_pattern" => Ok(SourceKind::TestPattern),
@@ -734,6 +791,7 @@ fn parse_source_kind(
             device: device.map(|d| d.to_string()),
             width,
             height,
+            fps,
         }),
         "screen" => Ok(SourceKind::Screen),
         "media" => Ok(SourceKind::Media {
@@ -786,8 +844,9 @@ impl Shell {
         device: Option<&str>,
         width: u32,
         height: u32,
+        fps: u32,
     ) -> Result<SourceState, ShellError> {
-        let kind = parse_source_kind(kind, color, text, path, device, width, height)?;
+        let kind = parse_source_kind(kind, color, text, path, device, width, height, fps)?;
         let id = Uuid::new_v4().to_string();
         // Open producers BEFORE the source is pushed, so a bad file or
         // missing camera fails cleanly without leaving a half-added source.
@@ -799,6 +858,7 @@ impl Shell {
             device,
             width,
             height,
+            fps,
         } = &kind
         {
             let (w, h) = if *width > 0 && *height > 0 {
@@ -806,7 +866,8 @@ impl Shell {
             } else {
                 (1280, 720)
             };
-            self.open_camera_producer(&id, device.as_deref(), w, h)?;
+            let f = if *fps == 30 || *fps == 60 { *fps } else { 30 };
+            self.open_camera_producer(&id, device.as_deref(), w, h, f)?;
         }
         let input_id = kind.is_real().then(|| source_input_id(&id));
         let order = self
@@ -1103,6 +1164,7 @@ impl Shell {
             stream_lifecycle: self.stream_lifecycle.clone(),
             record_settings: self.record_settings.clone(),
             record_lifecycle: self.record_lifecycle(),
+            video_settings: self.video_settings.clone(),
             macros: self.macros.clone(),
         }
     }
@@ -1302,6 +1364,174 @@ impl Shell {
         };
         self.emit_stream_state();
         Ok(())
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Video input/output settings (Video menu panel)
+// ---------------------------------------------------------------------------
+
+/// Camera source summary for the Video panel's input section.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct CameraSourceInfo {
+    /// Source id (for `camera_reconfigure`).
+    pub id: String,
+    /// Display name.
+    pub name: String,
+    /// Device name (None = first available).
+    pub device: Option<String>,
+    /// Configured capture width.
+    pub width: u32,
+    /// Configured capture height.
+    pub height: u32,
+    /// Configured capture fps.
+    pub fps: u32,
+    /// What the camera actually negotiated (None = not opened / pending).
+    pub negotiated: Option<String>,
+}
+
+impl Shell {
+    /// Current video settings for the Video panel.
+    pub fn video_settings_get(&self) -> VideoSettings {
+        self.video_settings.clone()
+    }
+
+    /// All camera sources across scenes, with their live config and
+    /// negotiated format. Powers the Video panel input section.
+    pub fn camera_sources(&self) -> Vec<CameraSourceInfo> {
+        self.scenes
+            .iter()
+            .flat_map(|sc| sc.sources.iter())
+            .filter_map(|s| match &s.kind {
+                SourceKind::Camera {
+                    device,
+                    width,
+                    height,
+                    fps,
+                } => Some(CameraSourceInfo {
+                    id: s.id.clone(),
+                    name: s.name.clone(),
+                    device: device.clone(),
+                    width: *width,
+                    height: *height,
+                    fps: *fps,
+                    negotiated: self.camera_formats.get(&s.id).cloned(),
+                }),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Validates and stores video settings. Output size/fps/encoder apply
+    /// the next time streaming/recording starts (encoders are opened at
+    /// start); the media-tick cadence follows `output_fps` live.
+    pub fn video_settings_set(&mut self, s: VideoSettings) -> Result<(), ShellError> {
+        if !VIDEO_OUTPUT_SIZES.contains(&(s.output_width, s.output_height)) {
+            return Err(ShellError::InvalidSetting(format!(
+                "unsupported output size {}x{}",
+                s.output_width, s.output_height
+            )));
+        }
+        if !VIDEO_FPS_OPTIONS.contains(&s.output_fps) {
+            return Err(ShellError::InvalidSetting(format!(
+                "unsupported output fps {}",
+                s.output_fps
+            )));
+        }
+        if !VIDEO_ENCODER_OPTIONS.contains(&s.encoder.as_str()) {
+            return Err(ShellError::InvalidSetting(format!(
+                "unknown encoder '{}'",
+                s.encoder
+            )));
+        }
+        if !(500..=50_000).contains(&s.bitrate_kbps) {
+            return Err(ShellError::InvalidSetting(format!(
+                "bitrate {} kbps out of range (500-50000)",
+                s.bitrate_kbps
+            )));
+        }
+        if !VIDEO_OUTPUT_SIZES.contains(&(s.camera_width, s.camera_height))
+            && (s.camera_width, s.camera_height) != (640, 480)
+        {
+            return Err(ShellError::InvalidSetting(format!(
+                "unsupported camera size {}x{}",
+                s.camera_width, s.camera_height
+            )));
+        }
+        if !VIDEO_FPS_OPTIONS.contains(&s.camera_fps) {
+            return Err(ShellError::InvalidSetting(format!(
+                "unsupported camera fps {}",
+                s.camera_fps
+            )));
+        }
+        self.video_settings = s;
+        Ok(())
+    }
+
+    /// Media-tick frame interval in microseconds, derived from the output
+    /// fps setting (30 → 33_333, 60 → 16_667).
+    pub fn frame_interval_us(&self) -> u64 {
+        1_000_000 / self.video_settings.output_fps.max(1) as u64
+    }
+
+    /// Reconfigures a camera source live: closes its producer, updates the
+    /// stored kind, and reopens with the new device/resolution/fps.
+    /// Returns what the camera actually negotiated (for the Video panel).
+    /// On non-Windows there is no capture backend; the kind is still
+    /// updated so the settings travel with the source.
+    pub fn camera_reconfigure(
+        &mut self,
+        source_id: &str,
+        device: Option<String>,
+        width: u32,
+        height: u32,
+        fps: u32,
+    ) -> Result<String, ShellError> {
+        let scene_idx = self
+            .scenes
+            .iter()
+            .position(|sc| sc.sources.iter().any(|s| s.id == source_id))
+            .ok_or_else(|| ShellError::UnknownSource(source_id.to_string()))?;
+        {
+            let src = self.scenes[scene_idx]
+                .sources
+                .iter_mut()
+                .find(|s| s.id == source_id)
+                .expect("source exists");
+            match &src.kind {
+                SourceKind::Camera { .. } => {}
+                _ => {
+                    return Err(ShellError::InvalidSetting(format!(
+                        "source '{}' is not a camera source",
+                        src.name,
+                    )))
+                }
+            }
+            src.kind = SourceKind::Camera {
+                device: device.clone(),
+                width,
+                height,
+                fps,
+            };
+        }
+        // Drop the old producer + negotiated-format entry before reopening.
+        self.media_producers.remove(source_id);
+        self.camera_formats.remove(source_id);
+        #[cfg(windows)]
+        {
+            let (w, h) = if width > 0 && height > 0 {
+                (width, height)
+            } else {
+                (1280, 720)
+            };
+            let f = if fps == 30 || fps == 60 { fps } else { 30 };
+            self.open_camera_producer(source_id, device.as_deref(), w, h, f)?;
+        }
+        Ok(self
+            .camera_formats
+            .get(source_id)
+            .cloned()
+            .unwrap_or_else(|| "camera backend not available on this platform".to_string()))
     }
 }
 
