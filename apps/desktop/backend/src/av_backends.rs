@@ -210,11 +210,27 @@ impl Shell {
         source_id: &str,
         device: Option<&str>,
     ) -> Result<(), ShellError> {
-        let prod = match device {
-            Some(d) => sf_capture::dshow::DshowProducer::open(d, 1280, 720, 30),
-            None => sf_capture::dshow::DshowProducer::open_default(1280, 720, 30),
-        }
-        .map_err(|e| ShellError::Capture(format!("cannot open camera: {e}")))?;
+        // Guard against a panic in the FFmpeg/dshow open path taking down
+        // the whole app: convert it into a clean capture error instead.
+        let device_owned = device.map(|d| d.to_string());
+        let opened = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            match device_owned.as_deref() {
+                Some(d) => sf_capture::dshow::DshowProducer::open(d, 1280, 720, 30),
+                None => sf_capture::dshow::DshowProducer::open_default(1280, 720, 30),
+            }
+        }));
+        let prod = match opened {
+            Ok(Ok(p)) => p,
+            Ok(Err(e)) => {
+                return Err(ShellError::Capture(format!("cannot open camera: {e}")))
+            }
+            Err(_) => {
+                return Err(ShellError::Capture(
+                    "cannot open camera: the capture backend crashed while opening the device"
+                        .into(),
+                ))
+            }
+        };
         self.media_producers.insert(
             source_id.to_string(),
             SendProducer(ProducerKind::Camera(prod)),

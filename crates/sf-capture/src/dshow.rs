@@ -16,7 +16,9 @@
 use std::ffi::{CStr, CString};
 use std::os::raw::{c_char, c_int, c_void};
 use std::ptr;
-use std::sync::Mutex;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use ffmpeg_next as ff;
 
@@ -26,6 +28,34 @@ use super::{CaptureError, CapturedFrame, FrameProducer, StreamInfo};
 /// Log capture for [`list_devices`]: dshow reports devices via `av_log`,
 /// so we install a temporary callback, trigger the listing, then restore.
 static LOG_CAPTURE: Mutex<String> = Mutex::new(String::new());
+
+/// Deadline for blocking reads on a dshow device (microseconds since epoch).
+/// The interrupt callback aborts `av_read_frame` when the deadline passes,
+/// so a stalled device can never freeze the app — the read just fails and
+/// `next_frame` returns `Ok(None)`.
+struct ReadDeadline {
+    deadline_us: AtomicU64,
+}
+
+fn now_us() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_micros() as u64)
+        .unwrap_or(0)
+}
+
+unsafe extern "C" fn interrupt_cb(opaque: *mut c_void) -> c_int {
+    if opaque.is_null() {
+        return 0;
+    }
+    let rd = &*(opaque as *const ReadDeadline);
+    let dl = rd.deadline_us.load(Ordering::Relaxed);
+    if dl != 0 && now_us() >= dl {
+        1 // abort the blocking read
+    } else {
+        0
+    }
+}
 
 extern "C" {
     /// msvcrt's vsnprintf — always available on Windows.
@@ -133,10 +163,17 @@ pub fn list_devices() -> Result<Vec<String>, CaptureError> {
 ///
 /// A live source: [`next_frame`](FrameProducer::next_frame) returns
 /// `Ok(None)` when no frame is ready yet and never reports end-of-stream.
+/// Reads are bounded by [`READ_TIMEOUT_US`]: if the device stalls, the
+/// interrupt callback aborts the read instead of blocking forever.
 pub struct DshowProducer {
     demux: DemuxDecoder,
     info: StreamInfo,
+    deadline: Arc<ReadDeadline>,
 }
+
+/// Max time to wait for a frame from a dshow device before giving up
+/// on that poll (2 seconds). The next poll tries again.
+const READ_TIMEOUT_US: u64 = 2_000_000;
 
 impl DshowProducer {
     /// Open `device` (a name from [`list_devices`]) at `width`×`height`,
@@ -215,13 +252,38 @@ impl DshowProducer {
             return Err("avformat_open_input failed".into());
         }
 
+        // Populate stream parameters (codec, dimensions, pixel format).
+        // dshow is a live device; without this the stream params may be
+        // incomplete and the decoder setup below can misbehave.
+        let si_ret = unsafe { ff::ffi::avformat_find_stream_info(ctx, ptr::null_mut()) };
+        if si_ret < 0 {
+            unsafe { ff::ffi::avformat_close_input(&mut ctx) };
+            return Err("avformat_find_stream_info failed".into());
+        }
+
+        // Install the read-timeout interrupt callback before handing the
+        // context to the safe wrapper. `deadline` lives in an `Arc` owned
+        // by `Self`, so the opaque pointer stays valid for the context's
+        // whole lifetime.
+        let deadline = Arc::new(ReadDeadline {
+            deadline_us: AtomicU64::new(0),
+        });
+        unsafe {
+            (*ctx).interrupt_callback.callback = Some(interrupt_cb);
+            (*ctx).interrupt_callback.opaque = Arc::as_ptr(&deadline) as *mut c_void;
+        }
+
         // SAFETY: `ctx` is a valid open input context owned by us now;
         // `Input::wrap` takes ownership and closes it on drop.
         let ictx = unsafe { ff::format::context::Input::wrap(ctx) };
         let demux = DemuxDecoder::from_input(ictx, 33_333)
             .map_err(|e| format!("demuxer: {e}"))?;
         let info = demux.stream_info(false);
-        Ok(Self { demux, info })
+        Ok(Self {
+            demux,
+            info,
+            deadline,
+        })
     }
 
     /// Open the first available DirectShow camera.
@@ -237,11 +299,21 @@ impl DshowProducer {
 
 impl FrameProducer for DshowProducer {
     fn next_frame(&mut self) -> Result<Option<CapturedFrame>, CaptureError> {
+        // Bound the blocking read: if the device stalls, the interrupt
+        // callback aborts it and we report "no frame yet" instead of
+        // hanging the poll thread.
+        self.deadline
+            .deadline_us
+            .store(now_us() + READ_TIMEOUT_US, Ordering::Relaxed);
+        let r = self.demux.next_video();
+        self.deadline.deadline_us.store(0, Ordering::Relaxed);
         // Live source: the demuxer never yields EndOfStream for dshow;
         // map it defensively to "no frame yet" so a live source can
-        // never terminate the consumer.
-        match self.demux.next_video() {
+        // never terminate the consumer. A timed-out read surfaces as a
+        // `ReadFailed` — also map that to "no frame yet".
+        match r {
             Err(CaptureError::EndOfStream) => Ok(None),
+            Err(CaptureError::ReadFailed(_)) => Ok(None),
             other => other,
         }
     }
