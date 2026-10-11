@@ -302,6 +302,11 @@ impl DshowProducer {
         for (k, v) in opts {
             set_opt(k, v);
         }
+        // Minimize startup probing latency for live capture: we already
+        // know the format (or let dshow negotiate), so don't buffer
+        // megabytes probing it.
+        set_opt("probesize", "32");
+        set_opt("analyzeduration", "0");
 
         // Allocate the context first so we can install the interrupt
         // callback BEFORE opening — a stalled device must not hang
