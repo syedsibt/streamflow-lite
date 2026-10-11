@@ -10,14 +10,18 @@
 //! All wgpu usage is backend-agnostic (Vulkan on Linux, DX12 on Windows);
 //! nothing here touches a window or a surface.
 
+pub mod composite_pass;
 pub mod context;
 pub mod error;
 pub mod f16;
 pub mod grade_pass;
+pub mod scale_pass;
 
+pub use composite_pass::CompositePass;
 pub use context::RenderContext;
 pub use error::RenderError;
 pub use grade_pass::GradePass;
+pub use scale_pass::ScalePass;
 
 /// Re-exported so downstream crates (e.g. `sf-engine`) can name the grade
 /// parameter types in public signatures without depending on `sf-color`
