@@ -340,6 +340,7 @@ export interface ProductionStateData {
   stream: StreamStateView;
   record: RecordStateView;
   macros: MacroView[];
+  video_settings: VideoSettings;
 }
 
 /** Source kinds whose capture backend is not implemented yet. */

@@ -1,3 +1,7 @@
+import { useProduction } from "../lib/productionStore";
+import { useStudio } from "../lib/store";
+import { api } from "../lib/ipc";
+
 export type ViewId = "production" | "studio" | "video";
 
 interface TopBarProps {
@@ -5,8 +9,27 @@ interface TopBarProps {
   setView: (v: ViewId) => void;
 }
 
-/** Slim top-level view switch: Production | Color Studio | Video. */
+/**
+ * Slim top-level view switch: Production | Color Studio | Video,
+ * plus an always-visible FPS control. FPS applies in real time:
+ * the program tick follows immediately, and live stream/record
+ * encoders are rebuilt on the fly (continuous timestamps).
+ */
 export default function TopBar({ view, setView }: TopBarProps) {
+  const fps = useProduction((s) => s.state?.video_settings.output_fps ?? 30);
+  const refresh = useProduction((s) => s.refresh);
+
+  const setFps = async (next: number) => {
+    if (next === fps) return;
+    try {
+      const cur = await api.videoSettingsGet();
+      await api.videoSettingsSet({ ...cur, output_fps: next });
+      await refresh();
+    } catch (e) {
+      useStudio.getState().pushToast(`fps change failed: ${String(e)}`);
+    }
+  };
+
   return (
     <div className="viewbar">
       <div className="viewbar-title">StreamFlow Lite</div>
@@ -29,6 +52,18 @@ export default function TopBar({ view, setView }: TopBarProps) {
         >
           Video
         </button>
+      </div>
+      <div className="viewbar-fps" title="Output frame rate — applies in real time">
+        <span>FPS</span>
+        {[30, 60].map((f) => (
+          <button
+            key={f}
+            className={fps === f ? "active" : ""}
+            onClick={() => void setFps(f)}
+          >
+            {f}
+          </button>
+        ))}
       </div>
     </div>
   );

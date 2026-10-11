@@ -461,6 +461,29 @@ impl Shell {
         VideoEncoder::open(opts).map_err(|e| ShellError::Capture(format!("video encoder: {e}")))
     }
 
+    /// Rebuilds the live video encoders (stream and/or record) with the
+    /// current output settings — used for real-time FPS changes mid
+    /// session. Each encoder is replaced only after its successor opens,
+    /// so a failure leaves the working encoder untouched. The first packet
+    /// out of a fresh encoder is a keyframe, so decoders resync
+    /// immediately; PTS stays continuous via the running `video_pts_us`
+    /// clock (`VideoEncoder::encode_rgba` anchors to it).
+    pub(crate) fn reinit_video_encoders(&mut self) -> Result<(), ShellError> {
+        if self.active_stream.is_some() {
+            let enc = self.open_video_encoder(self.video_encoder_opts())?;
+            if let Some(a) = self.active_stream.as_mut() {
+                a.video_enc = enc;
+            }
+        }
+        if self.active_recording.is_some() {
+            let enc = self.open_video_encoder(self.video_encoder_opts())?;
+            if let Some(rec) = self.active_recording.as_mut() {
+                rec.video_enc = enc;
+            }
+        }
+        Ok(())
+    }
+
     /// Starts recording the program bus to `record_settings.path`.
     /// Real backend: libx264 (or the selected system encoder) + AAC into
     /// fragmented MP4 / MKV. Failures move the lifecycle to `Error`.

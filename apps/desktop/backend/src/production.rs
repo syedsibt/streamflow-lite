@@ -1464,7 +1464,17 @@ impl Shell {
                 s.camera_fps
             )));
         }
+        let fps_changed = s.output_fps != self.video_settings.output_fps;
         self.video_settings = s;
+        // FPS applies live — even mid stream/record. The media-tick cadence
+        // follows `output_fps` on the next tick; the encoders are rebuilt
+        // here so the encoded output matches immediately. PTS stays
+        // continuous: the new encoder anchors its first packet to the
+        // running `video_pts_us` clock (see `VideoEncoder::encode_rgba`).
+        // Other settings (size/encoder/bitrate) apply on next start.
+        if fps_changed {
+            self.reinit_video_encoders()?;
+        }
         Ok(())
     }
 

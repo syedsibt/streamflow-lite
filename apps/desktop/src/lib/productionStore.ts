@@ -231,6 +231,20 @@ function normalizeProductionState(raw: unknown): ProductionStateData {
       hotkey: String(m.hotkey ?? ""),
       action: macroActionLabel(m.action),
     })),
+    video_settings: {
+      output_width: Number(r.video_settings?.output_width ?? 1920),
+      output_height: Number(r.video_settings?.output_height ?? 1080),
+      output_fps: Number(r.video_settings?.output_fps ?? 30),
+      encoder: String(r.video_settings?.encoder ?? "auto"),
+      bitrate_kbps: Number(r.video_settings?.bitrate_kbps ?? 8000),
+      camera_device:
+        typeof r.video_settings?.camera_device === "string"
+          ? r.video_settings.camera_device
+          : null,
+      camera_width: Number(r.video_settings?.camera_width ?? 1280),
+      camera_height: Number(r.video_settings?.camera_height ?? 720),
+      camera_fps: Number(r.video_settings?.camera_fps ?? 30),
+    },
   };
 }
 

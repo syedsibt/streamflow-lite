@@ -1106,3 +1106,44 @@ body {
   font-family: ui-monospace, monospace;
   font-size: 11px;
 }
+
+/* Always-visible FPS control in the top bar. */
+.viewbar-fps {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  margin-left: auto;
+  background: var(--bg-raised);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 3px 6px;
+}
+
+.viewbar-fps span {
+  font-size: 10px;
+  font-weight: 700;
+  letter-spacing: 0.08em;
+  color: var(--text-dim);
+  margin-right: 2px;
+}
+
+.viewbar-fps button {
+  background: transparent;
+  border: 1px solid transparent;
+  color: var(--text-dim);
+  border-radius: 6px;
+  padding: 3px 10px;
+  font-size: 12px;
+  font-weight: 700;
+  cursor: pointer;
+}
+
+.viewbar-fps button:hover {
+  color: #fff;
+}
+
+.viewbar-fps button.active {
+  background: var(--accent-dim);
+  border-color: var(--accent);
+  color: #fff;
+}

@@ -298,9 +298,10 @@ export default function VideoSettingsView() {
               </div>
 
               <div className="note" style={{ marginTop: 10 }}>
-                Applies the next time you start streaming/recording — restart
-                them to pick up new output settings. The program tick rate
-                follows the frame rate immediately.
+                Frame rate applies <b>in real time</b> — the program tick
+                follows immediately, and live stream/record encoders are
+                rebuilt on the fly. Resolution, encoder, and bitrate apply
+                the next time you start streaming/recording.
               </div>
 
               <div style={{ marginTop: 10 }}>
