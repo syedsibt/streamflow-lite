@@ -657,6 +657,7 @@ fn forward(app: &AppHandle, event: &UiEvent) {
 
 fn main() {
     tauri::Builder::default()
+        .plugin(tauri_plugin_dialog::init())
         .manage(AppState(Mutex::new(
             Shell::new().expect("engine must open a GPU adapter (headless: lavapipe)"),
         )))

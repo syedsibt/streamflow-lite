@@ -319,7 +319,13 @@ export interface ProductionStateData {
 }
 
 /** Source kinds whose capture backend is not implemented yet. */
-export const PENDING_CAPTURE_KINDS = ["camera", "screen", "media", "text"];
+/**
+ * Source kinds with no capture backend on ANY platform (the backend reports
+ * `status: "pending"` for these). Camera/media are real backends (DirectShow
+ * camera on Windows, media files everywhere) — their pending state comes
+ * from the backend's per-platform `status` field, not this list.
+ */
+export const PENDING_CAPTURE_KINDS = ["screen", "text"];
 
 export function isPendingCaptureSource(s: SourceView): boolean {
   const kind = s.kind.toLowerCase();

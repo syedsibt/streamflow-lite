@@ -226,10 +226,17 @@ pub struct DshowProducer {
     info: StreamInfo,
     deadline: Arc<ReadDeadline>,
     /// Human-readable description of what the camera actually negotiated
-    /// (codec, resolution, fps) — e.g. `"mjpeg 1920x1080 @30fps"`.
+    /// (codec, resolution, fps) — e.g. `"mjpeg 1920×1080@60fps"`.
     /// Shown in diagnostics so users see what the camera gave, not just
     /// what was requested.
     negotiated_format: String,
+    /// Minimum microseconds between delivered frames (decimation): the
+    /// camera may run faster than our tick (e.g. 1080p60 in, 30fps tick).
+    /// Stale frames are consumed-and-dropped so the dshow packet queue can
+    /// never grow — a growing queue shows up as ever-increasing lag.
+    min_frame_interval_us: u64,
+    /// Timestamp of the last delivered frame (for decimation).
+    last_delivered_us: u64,
 }
 
 /// Max time to wait for a frame from a dshow device before giving up
@@ -237,6 +244,15 @@ pub struct DshowProducer {
 /// would stall it. When no frame is ready the consumer repeats the last
 /// frame (latest-frame-wins) and the next tick tries again.
 const READ_TIMEOUT_US: u64 = 25_000;
+
+/// Timeout for drain reads after the first frame (3ms): packets already
+/// queued in dshow return instantly; an empty queue aborts almost at once
+/// so the drain never stalls the tick.
+const DRAIN_TIMEOUT_US: u64 = 3_000;
+
+/// Max frames to drain per tick. Bounds the decode work when the camera
+/// outruns the tick (e.g. 60fps in, 30fps tick → ~2 per tick normally).
+const MAX_DRAIN_FRAMES: u32 = 4;
 
 /// Max time to wait for a dshow device to open (15 seconds per attempt).
 const OPEN_TIMEOUT_US: u64 = 15_000_000;
@@ -260,6 +276,12 @@ impl DshowProducer {
         fps: u32,
     ) -> Result<Self, CaptureError> {
         ensure_init();
+        // Decimate the camera to the requested fps: if the device delivers
+        // faster (e.g. 1080p60 negotiated while we tick at 30fps), stale
+        // frames are dropped instead of queueing up as lag. The gate is set
+        // to 90% of the nominal interval so normal tick jitter (±ms) never
+        // causes a false skip (which would halve the fps).
+        let min_frame_interval_us = 1_000_000 * 9 / (fps.max(1) as u64 * 10);
         // Try strict format first, then progressively looser.
         // Each entry is (label, dshow options). The label is recorded in
         // `negotiated_format` for diagnostics.
@@ -298,7 +320,7 @@ impl DshowProducer {
         ];
         let mut last_err = String::new();
         for (label, opts) in &attempts {
-            match Self::open_with_opts(device, label, opts) {
+            match Self::open_with_opts(device, label, opts, min_frame_interval_us) {
                 Ok(p) => return Ok(p),
                 Err(e) => last_err = e,
             }
@@ -312,6 +334,7 @@ impl DshowProducer {
         device: &str,
         label: &str,
         opts: &[(String, String)],
+        min_frame_interval_us: u64,
     ) -> Result<Self, String> {
         let fmt_name = CString::new("dshow").unwrap();
         let fmt = unsafe { ff::ffi::av_find_input_format(fmt_name.as_ptr()) };
@@ -409,24 +432,29 @@ impl DshowProducer {
         // unbounded memory growth when the device outpaces the poll loop).
         demux.set_live(true);
         let info = demux.stream_info(false);
+        // Compact single-line form for the UI badge, e.g.
+        // "mjpeg 1920×1080@60fps" — what the camera actually gave.
         let negotiated_format = format!(
-            "{} {}x{} @{:.0}fps (via {})",
+            "{} {}×{}@{}fps",
             negotiated_codec,
             info.width,
             info.height,
-            info.fps(),
-            label,
+            info.fps().round() as u32,
         );
+        // Keep the attempt label for diagnostics (which request succeeded).
+        negotiated_format.push_str(&format!(" [via {label}]"));
         Ok(Self {
             demux,
             info,
             deadline,
             negotiated_format,
+            min_frame_interval_us,
+            last_delivered_us: 0,
         })
     }
 
     /// Human-readable description of what the camera actually negotiated,
-    /// e.g. `"mjpeg 1920x1080 @30fps (via mjpeg)"`.
+    /// e.g. `"mjpeg 1920×1080@60fps [via negotiated]"`.
     pub fn negotiated_format(&self) -> &str {
         &self.negotiated_format
     }
@@ -444,23 +472,56 @@ impl DshowProducer {
 
 impl FrameProducer for DshowProducer {
     fn next_frame(&mut self) -> Result<Option<CapturedFrame>, CaptureError> {
-        // Bound the blocking read: if the device stalls, the interrupt
-        // callback aborts it and we report "no frame yet" instead of
-        // hanging the poll thread.
-        self.deadline
-            .deadline_us
-            .store(now_us() + READ_TIMEOUT_US, Ordering::Relaxed);
-        let r = self.demux.next_video();
-        self.deadline.deadline_us.store(0, Ordering::Relaxed);
-        // Live source: the demuxer never yields EndOfStream for dshow;
-        // map it defensively to "no frame yet" so a live source can
-        // never terminate the consumer. A timed-out read surfaces as a
-        // `ReadFailed` — also map that to "no frame yet".
-        match r {
-            Err(CaptureError::EndOfStream) => Ok(None),
-            Err(CaptureError::ReadFailed(_)) => Ok(None),
-            other => other,
+        // Drain all currently available frames, keeping the newest. The
+        // first read may block up to READ_TIMEOUT_US (device stall → "no
+        // frame yet"); drain reads use DRAIN_TIMEOUT_US so queued packets
+        // return instantly and an empty queue aborts at once. Draining is
+        // what keeps a 60fps camera from building an ever-growing queue
+        // behind our 30fps tick (the classic ever-increasing lag).
+        let mut newest: Option<CapturedFrame> = None;
+        let mut reads: u32 = 0;
+        loop {
+            let timeout_us = if reads == 0 {
+                READ_TIMEOUT_US
+            } else {
+                DRAIN_TIMEOUT_US
+            };
+            // Bound the blocking read: if the device stalls, the interrupt
+            // callback aborts it and we report "no frame yet" instead of
+            // hanging the tick thread.
+            self.deadline
+                .deadline_us
+                .store(now_us() + timeout_us, Ordering::Relaxed);
+            let r = self.demux.next_video();
+            self.deadline.deadline_us.store(0, Ordering::Relaxed);
+            // Live source: the demuxer never yields EndOfStream for dshow;
+            // map it defensively to "no frame yet" so a live source can
+            // never terminate the consumer. A timed-out read surfaces as a
+            // `ReadFailed` — also map that to "no frame yet".
+            match r {
+                Ok(Some(f)) => newest = Some(f),
+                Ok(None) => break,
+                Err(CaptureError::EndOfStream) => break,
+                Err(CaptureError::ReadFailed(_)) => break,
+                Err(e) => return Err(e),
+            }
+            reads += 1;
+            if reads >= MAX_DRAIN_FRAMES {
+                break;
+            }
         }
+        let Some(frame) = newest else {
+            return Ok(None);
+        };
+        // Decimate to the target fps: drop the frame when we delivered one
+        // too recently; the consumer repeats the last frame (no stutter,
+        // no accumulation).
+        let now = now_us();
+        if now.saturating_sub(self.last_delivered_us) < self.min_frame_interval_us {
+            return Ok(None);
+        }
+        self.last_delivered_us = now;
+        Ok(Some(frame))
     }
 
     fn stream_info(&self) -> StreamInfo {

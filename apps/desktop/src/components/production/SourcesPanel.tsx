@@ -1,5 +1,7 @@
 import { useEffect, useState } from "react";
+import { open } from "@tauri-apps/plugin-dialog";
 import { useProduction } from "../../lib/productionStore";
+import { useStudio } from "../../lib/store";
 import { api } from "../../lib/ipc";
 import { isPendingCaptureSource, type SourceKind } from "../../lib/types";
 
@@ -39,12 +41,16 @@ function CameraFormatBadge({ sourceId }: { sourceId: string }) {
     };
   }, [sourceId]);
   if (!fmt) return null;
+  // Backend appends " [via <attempt>]"; show the compact part in the badge,
+  // full string in the tooltip.
+  const short = fmt.split(" [")[0];
   return (
     <span
       className="camera-format"
-      title="Negotiated camera format — what the camera actually gave, not just what was requested"
+      title={`Negotiated camera format — what the camera actually gave: ${fmt}`}
+      style={{ whiteSpace: "nowrap" }}
     >
-      {fmt}
+      {short}
     </span>
   );
 }
@@ -128,11 +134,40 @@ export default function SourcesPanel() {
 
   const add = () => {
     if (!scene) return;
+    // Validate before hitting the backend: an empty media path used to
+    // produce a cryptic "cannot open media ''" capture error.
+    if (kind === "media" && !mediaPath.trim()) {
+      useStudio.getState().pushToast("Please choose a media file first (Browse…)");
+      return;
+    }
     const label = name.trim() || kindLabel(kind);
     void sourceAdd(scene.id, buildKind(), label);
     setName("");
     setText("");
     setMediaPath("");
+  };
+
+  const browseMedia = async () => {
+    try {
+      const picked = await open({
+        multiple: false,
+        title: "Choose media file",
+        filters: [
+          {
+            name: "Video",
+            extensions: ["mp4", "mkv", "mov", "avi", "webm", "m4v"],
+          },
+          {
+            name: "Audio",
+            extensions: ["mp3", "wav", "aac", "m4a", "ogg", "flac"],
+          },
+          { name: "All files", extensions: ["*"] },
+        ],
+      });
+      if (typeof picked === "string") setMediaPath(picked);
+    } catch {
+      /* dialog cancelled or unavailable — keep manual path entry */
+    }
   };
 
   const move = (id: string, dir: -1 | 1) => {
@@ -236,12 +271,23 @@ export default function SourcesPanel() {
             />
           )}
           {kind === "media" && (
-            <input
-              type="text"
-              placeholder="Media path"
-              value={mediaPath}
-              onChange={(e) => setMediaPath(e.target.value)}
-            />
+            <>
+              <input
+                type="text"
+                placeholder="Media path"
+                value={mediaPath}
+                onChange={(e) => setMediaPath(e.target.value)}
+                title="Media file path (or use Browse…)"
+                style={{ flex: 1, minWidth: 0 }}
+              />
+              <button
+                type="button"
+                onClick={() => void browseMedia()}
+                title="Choose a media file…"
+              >
+                Browse…
+              </button>
+            </>
           )}
           {kind === "camera" && (
             <>

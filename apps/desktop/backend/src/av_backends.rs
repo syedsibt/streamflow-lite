@@ -200,6 +200,11 @@ impl Shell {
         source_id: &str,
         path: &str,
     ) -> Result<(), ShellError> {
+        if path.trim().is_empty() {
+            return Err(ShellError::Capture(
+                "no media file selected — pick a file with Browse…".to_string(),
+            ));
+        }
         let prod = MediaFileProducer::open(path)
             .map_err(|e| ShellError::Capture(format!("cannot open media '{path}': {e}")))?;
         self.media_producers.insert(
