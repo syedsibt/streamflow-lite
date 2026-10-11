@@ -378,6 +378,12 @@ fn list_cameras(state: State<'_, AppState>) -> Vec<String> {
     lock(&state).map(|s| s.list_cameras()).unwrap_or_default()
 }
 
+/// Lists available audio input devices (Windows DirectShow; empty elsewhere).
+#[tauri::command(rename_all = "snake_case")]
+fn list_audio_devices(state: State<'_, AppState>) -> Vec<String> {
+    lock(&state).map(|s| s.list_audio_devices()).unwrap_or_default()
+}
+
 /// Removes a source from a scene.
 #[tauri::command(rename_all = "snake_case")]
 fn source_remove(state: State<'_, AppState>, scene_id: String, source_id: String) -> CmdResult<()> {
@@ -672,6 +678,7 @@ fn main() {
             scene_list,
             source_add,
             list_cameras,
+            list_audio_devices,
             source_remove,
             source_reorder,
             source_set_visible,

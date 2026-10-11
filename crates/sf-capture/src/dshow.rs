@@ -131,10 +131,66 @@ pub fn list_devices() -> Result<Vec<String>, CaptureError> {
     let _ = ret;
 
     let buf = LOG_CAPTURE.lock().unwrap().clone();
-    // dshow logs: `[dshow @ ...] "Device Name" (video)` / `(audio)`.
+    Ok(parse_dshow_devices(&buf, "(video)"))
+}
+
+/// List DirectShow audio-capture device names (microphones, line-in, etc.).
+pub fn list_audio_devices() -> Result<Vec<String>, CaptureError> {
+    // Reuse the same enumeration: trigger list_devices and parse audio entries.
+    // We call the internal list to avoid duplicating the FFmpeg dance.
+    let buf = {
+        // Run the device listing (same as list_devices but we parse audio).
+        list_devices_raw()?
+    };
+    Ok(parse_dshow_devices(&buf, "(audio)"))
+}
+
+/// Run the dshow device listing and return the raw captured log.
+fn list_devices_raw() -> Result<String, CaptureError> {
+    ensure_init();
+    let fmt_name = CString::new("dshow").unwrap();
+    let fmt = unsafe { ff::ffi::av_find_input_format(fmt_name.as_ptr()) };
+    if fmt.is_null() {
+        return Err(CaptureError::OpenFailed(
+            "FFmpeg was built without dshow support".into(),
+        ));
+    }
+    {
+        let mut buf = LOG_CAPTURE.lock().unwrap();
+        buf.clear();
+    }
+    unsafe { ff::ffi::av_log_set_callback(Some(log_capture_cb)) };
+    let url = CString::new("dummy").unwrap();
+    let mut dict: *mut ff::ffi::AVDictionary = ptr::null_mut();
+    let key = CString::new("list_devices").unwrap();
+    let val = CString::new("1").unwrap();
+    unsafe { ff::ffi::av_dict_set(&mut dict, key.as_ptr(), val.as_ptr(), 0) };
+    let mut ctx: *mut ff::ffi::AVFormatContext = ptr::null_mut();
+    let ret = unsafe {
+        ff::ffi::avformat_open_input(
+            &mut ctx,
+            url.as_ptr(),
+            fmt as *mut ff::ffi::AVInputFormat,
+            &mut dict,
+        )
+    };
+    unsafe {
+        ff::ffi::av_dict_free(&mut dict);
+        if !ctx.is_null() {
+            ff::ffi::avformat_close_input(&mut ctx);
+        }
+        ff::ffi::av_log_set_callback(None);
+    }
+    let _ = ret;
+    Ok(LOG_CAPTURE.lock().unwrap().clone())
+}
+
+/// Parse dshow device names from captured log output.
+/// dshow logs: `[dshow @ ...] "Device Name" (video)` / `(audio)`.
+fn parse_dshow_devices(buf: &str, kind_tag: &str) -> Vec<String> {
     let mut devices = Vec::new();
     for line in buf.lines() {
-        if !line.contains("(video)") {
+        if !line.contains(kind_tag) {
             continue;
         }
         // Take the first quoted string.
@@ -156,7 +212,7 @@ pub fn list_devices() -> Result<Vec<String>, CaptureError> {
             devices.push(name);
         }
     }
-    Ok(devices)
+    devices
 }
 
 /// DirectShow camera [`FrameProducer`] (Windows).
