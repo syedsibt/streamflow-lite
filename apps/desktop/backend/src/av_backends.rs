@@ -841,13 +841,16 @@ impl Shell {
         let streaming = self.active_stream.is_some();
         if !recording && !streaming {
             // Audio metering runs even when idle so the UI meters stay live.
+            let t = std::time::Instant::now();
             self.pump_audio();
+            self.perf_stages_us = [0, t.elapsed().as_micros() as u64, 0, 0];
             // Track perf even when idle so the panel shows live values.
             let tick_us = tick_start.elapsed().as_micros() as u64;
             self.perf_mark_tick(tick_us);
             self.perf_mark_frame();
             return;
         }
+        let t0 = std::time::Instant::now();
         let frame = match self.program_frame_raw(AV_W, AV_H) {
             Ok(f) => f,
             Err(_) => {
@@ -857,15 +860,23 @@ impl Shell {
                 return;
             }
         };
+        let render_us = t0.elapsed().as_micros() as u64;
         // Audio metering runs on every tick; the same mixed block feeds
         // the record/stream encoders below.
+        let t1 = std::time::Instant::now();
         let audio = self.pump_audio();
+        let audio_us = t1.elapsed().as_micros() as u64;
+        let t2 = std::time::Instant::now();
         if recording {
             self.record_tick(&frame, &audio);
         }
+        let record_us = t2.elapsed().as_micros() as u64;
+        let t3 = std::time::Instant::now();
         if streaming {
             self.stream_tick(&frame, &audio);
         }
+        let stream_us = t3.elapsed().as_micros() as u64;
+        self.perf_stages_us = [render_us, audio_us, record_us, stream_us];
         let tick_us = tick_start.elapsed().as_micros() as u64;
         self.perf_mark_tick(tick_us);
         self.perf_mark_frame();

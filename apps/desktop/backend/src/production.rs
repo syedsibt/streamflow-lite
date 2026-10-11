@@ -1019,7 +1019,12 @@ impl Shell {
                 _ => source_pixels(&src.kind, w, h),
             };
             let frame = self.engine.grade_input_frame(input_id, w, h, &pixels)?;
-            composite_over(&mut canvas, &frame.pixels);
+            // Hybrid composite: GPU "over" blend first (pooled out texture),
+            // CPU fallback when the GPU pass is unavailable or fails.
+            match self.engine.gpu_composite_over(&canvas, &frame.pixels, w, h) {
+                Ok(px) => canvas = px,
+                Err(_) => composite_over(&mut canvas, &frame.pixels),
+            }
         }
         Ok(Frame {
             width: w,

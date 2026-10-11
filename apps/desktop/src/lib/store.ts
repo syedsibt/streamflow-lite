@@ -41,6 +41,9 @@ interface StudioState {
 
   init: () => Promise<void>;
   setTab: (t: TabId) => void;
+  /** Switch the Color Studio target to another engine input (a real
+   * production source). Reloads grade/stack/scopes/preview for it. */
+  setInputId: (inputId: string, inputName: string) => Promise<void>;
   setLookIntensity: (v: number) => void;
   setParam: (param: string, value: number) => void;
   resetParam: (param: string) => Promise<void>;
@@ -151,6 +154,38 @@ export const useStudio = create<StudioState>()((set, get) => {
 
     setTab: (t) => set({ activeTab: t }),
     setLookIntensity: (v) => set({ lookIntensity: v }),
+
+    setInputId: async (inputId, inputName) => {
+      const prev = get();
+      if (prev.inputId === inputId || !isTauri) {
+        set({ inputId, inputName });
+        return;
+      }
+      // Unsubscribe scopes for the old input so its frames stop arriving.
+      for (const kind of ["waveform", "vectorscope", "histogram"] as const) {
+        await api.scopesUnsubscribe(prev.inputId, kind).catch(() => {});
+      }
+      set({
+        inputId,
+        inputName,
+        grade: null,
+        stack: [],
+        scopes: {},
+        previewUrl: null,
+      });
+      try {
+        const [grade, stack] = await Promise.all([
+          api.gradeSnapshot(inputId),
+          api.stackSnapshot(targetOf(inputId)),
+        ]);
+        set({ grade, stack });
+        for (const kind of ["waveform", "vectorscope", "histogram"] as const) {
+          await api.scopesSubscribe(inputId, kind).catch(() => {});
+        }
+      } catch (e) {
+        get().pushToast(`input switch failed: ${String(e)}`);
+      }
+    },
 
     setParam: (param, value) => {
       const { grade } = get();

@@ -401,6 +401,15 @@ fn stream_encoder_name(state: State<'_, AppState>) -> String {
     lock(&state).map(|s| s.stream_encoder_name()).unwrap_or_default()
 }
 
+/// Stage timings of the last media tick in ms:
+/// `[render, audio, record, stream]` — which stage eats the 33ms budget.
+#[tauri::command(rename_all = "snake_case")]
+fn perf_stages(state: State<'_, AppState>) -> Vec<f32> {
+    lock(&state)
+        .map(|s| s.perf_stages().to_vec())
+        .unwrap_or_default()
+}
+
 /// Performance stats: (fps, render_ms, cpu_percent_estimate, stream_kbps,
 /// skipped_render, dropped_network).
 #[tauri::command(rename_all = "snake_case")]
@@ -727,6 +736,7 @@ fn main() {
             camera_format,
             list_audio_devices,
             perf_stats,
+            perf_stages,
             stream_encoder_name,
             source_remove,
             source_reorder,

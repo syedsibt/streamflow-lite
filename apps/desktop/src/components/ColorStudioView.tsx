@@ -10,6 +10,7 @@
  */
 import { useEffect } from "react";
 import { useStudio, type TabId } from "../lib/store";
+import { useProduction } from "../lib/productionStore";
 import Header from "./Header";
 import PreviewPane from "./PreviewPane";
 import ScopesRow from "./ScopesRow";
@@ -35,7 +36,22 @@ export default function ColorStudioView() {
   const pollPreview = useStudio((s) => s.pollPreview);
 
   useEffect(() => {
-    void init();
+    void (async () => {
+      await init();
+      // Ensure production state is loaded so the source selector knows
+      // the real inputs.
+      await useProduction.getState().init();
+      // Auto-target the first real production source: filters and grades
+      // must affect the live video, not the disconnected default input.
+      const st = useStudio.getState();
+      if (st.inputId === "cam1") {
+        const scenes = useProduction.getState().state?.scenes ?? [];
+        const first = scenes
+          .flatMap((sc) => sc.sources)
+          .find((s) => s.input_id);
+        if (first?.input_id) await st.setInputId(first.input_id, first.name);
+      }
+    })();
     // Preview poll: the backend throttles rendering to ~10 Hz itself.
     const t = setInterval(() => void pollPreview(), 500);
     return () => clearInterval(t);

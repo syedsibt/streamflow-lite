@@ -12,6 +12,7 @@ export default function PerfPanel() {
   const [kbps, setKbps] = useState(0);
   const [skipped, setSkipped] = useState(0);
   const [dropped, setDropped] = useState(0);
+  const [stages, setStages] = useState<[number, number, number, number]>([0, 0, 0, 0]);
   const [encoder, setEncoder] = useState("");
 
   useEffect(() => {
@@ -19,6 +20,7 @@ export default function PerfPanel() {
     const poll = async () => {
       try {
         const [f, r, c, k, sk, dr] = await api.perfStats();
+        const sg = await api.perfStages().catch(() => [0, 0, 0, 0]);
         const enc = await api.streamEncoderName();
         if (!cancelled) {
           setFps(Math.round(f));
@@ -27,6 +29,12 @@ export default function PerfPanel() {
           setKbps(Math.round(k));
           setSkipped(Math.round(sk ?? 0));
           setDropped(Math.round(dr ?? 0));
+          setStages([
+            Math.round((sg[0] ?? 0) * 10) / 10,
+            Math.round((sg[1] ?? 0) * 10) / 10,
+            Math.round((sg[2] ?? 0) * 10) / 10,
+            Math.round((sg[3] ?? 0) * 10) / 10,
+          ]);
           setEncoder(enc);
         }
       } catch {
@@ -63,6 +71,9 @@ export default function PerfPanel() {
         Skip: {skipped}
       </span>
       <span title="Packets dropped: network couldn't keep up">Drop: {dropped}</span>
+      <span title="Last tick stage times in ms: render (capture+grade+composite) / audio / record / stream (encode+send)">
+        Stages: {stages[0]}/{stages[1]}/{stages[2]}/{stages[3]} ms
+      </span>
       {encoder && <span>Enc: {encoder}</span>}
     </div>
   );

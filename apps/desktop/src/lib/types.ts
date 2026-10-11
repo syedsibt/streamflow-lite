@@ -245,6 +245,8 @@ export interface SourceView {
   visible: boolean;
   order: number;
   status: string;
+  /** Engine input id for real kinds (`src-<uuid>`); null for pending kinds. */
+  input_id: string | null;
 }
 
 export interface SceneView {

@@ -1,5 +1,6 @@
 import { useRef, useState } from "react";
 import { useStudio } from "../lib/store";
+import { useProduction } from "../lib/productionStore";
 import type { ColorGrade } from "../lib/types";
 
 /** Neutral (identity) grade for Before/After comparison. */
@@ -34,10 +35,19 @@ const NEUTRAL_GRADE: ColorGrade = {
 };
 
 export default function Header() {
-  const inputName = useStudio((s) => s.inputName);
+  const inputId = useStudio((s) => s.inputId);
+  const setInputId = useStudio((s) => s.setInputId);
   const grade = useStudio((s) => s.grade);
   const applyGradeSnapshot = useStudio((s) => s.applyGradeSnapshot);
   const resetSection = useStudio((s) => s.resetSection);
+  // Real production sources (camera/media) with engine input ids — the
+  // Color Studio target list. Filters/grades apply to the selected input.
+  const scenes = useProduction((s) => s.state?.scenes ?? []);
+  const realSources = scenes.flatMap((sc) =>
+    sc.sources
+      .filter((src) => src.input_id)
+      .map((src) => ({ input_id: src.input_id as string, name: src.name })),
+  );
 
   // A/B comparison slots: full-grade snapshots.
   const [snapA, setSnapA] = useState<ColorGrade | null>(null);
@@ -76,8 +86,22 @@ export default function Header() {
   return (
     <div className="header">
       <div className="title">Color Studio</div>
-      <select value={inputName} disabled onChange={() => undefined}>
-        <option value={inputName}>{inputName}</option>
+      <select
+        value={inputId}
+        onChange={(e) => {
+          const opt = e.target.selectedOptions[0];
+          void setInputId(e.target.value, opt?.dataset.name ?? e.target.value);
+        }}
+        title="Color Studio target: which source the filters and grades apply to"
+      >
+        <option value="cam1" data-name="Camera 1">
+          Camera 1 (default)
+        </option>
+        {realSources.map((src) => (
+          <option key={src.input_id} value={src.input_id} data-name={src.name}>
+            {src.name}
+          </option>
+        ))}
       </select>
       <div className="spacer" />
       <button

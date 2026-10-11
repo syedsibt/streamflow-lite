@@ -20,6 +20,36 @@ const KIND_OPTIONS = [
 type KindKey = (typeof KIND_OPTIONS)[number];
 
 /**
+ * Shows the camera's actually-negotiated format (codec/resolution/fps) under
+ * a camera source row. Fetched once per source; hidden when unavailable
+ * (non-Windows or no negotiated format yet).
+ */
+function CameraFormatBadge({ sourceId }: { sourceId: string }) {
+  const [fmt, setFmt] = useState<string | null>(null);
+  useEffect(() => {
+    let cancelled = false;
+    void api
+      .cameraFormat(sourceId)
+      .then((f) => {
+        if (!cancelled) setFmt(f);
+      })
+      .catch(() => {});
+    return () => {
+      cancelled = true;
+    };
+  }, [sourceId]);
+  if (!fmt) return null;
+  return (
+    <span
+      className="camera-format"
+      title="Negotiated camera format — what the camera actually gave, not just what was requested"
+    >
+      {fmt}
+    </span>
+  );
+}
+
+/**
  * Sources of the preview scene: visibility eye toggle, reorder up/down,
  * add (TestPattern/Color/Camera/Screen/Media/Text), remove.
  */
@@ -139,6 +169,7 @@ export default function SourcesPanel() {
                 {src.visible ? "👁" : "🚫"}
               </button>
               <span className="source-name">{src.name}</span>
+              {src.kind === "camera" && <CameraFormatBadge sourceId={src.id} />}
               {isPendingCaptureSource(src) && (
                 <span className="pending-badge" title="This source kind has no capture backend yet">
                   pending capture backend

@@ -178,6 +178,7 @@ function normalizeProductionState(raw: unknown): ProductionStateData {
         visible: !!s.visible,
         order: typeof s.order === "number" ? s.order : 0,
         status: String(s.status ?? ""),
+        input_id: typeof s.input_id === "string" ? s.input_id : null,
       };
     }),
   }));

@@ -427,6 +427,10 @@ pub struct Shell {
     /// Packets dropped because the network couldn't keep up (blueprint
     /// `dropped_network`: internet too slow — audio is never dropped).
     perf_dropped_network: u64,
+    /// Last tick's stage timings in microseconds:
+    /// [render (capture+grade+composite), audio pump, record encode/write,
+    /// stream encode/send] — blueprint "measure before claiming".
+    perf_stages_us: [u64; 4],
 }
 
 impl Shell {
@@ -469,6 +473,7 @@ impl Shell {
             perf_last_br_time: Instant::now(),
             perf_skipped_render: 0,
             perf_dropped_network: 0,
+            perf_stages_us: [0; 4],
         };
         shell.init_production();
         // A default input so the UI is usable immediately (the engine
@@ -516,6 +521,7 @@ impl Shell {
             perf_last_br_time: Instant::now(),
             perf_skipped_render: 0,
             perf_dropped_network: 0,
+            perf_stages_us: [0; 4],
         };
         shell.init_production();
         if let Ok(reg) = LookRegistry::load_dir(looks_dir) {
@@ -1156,7 +1162,7 @@ impl Shell {
         // Prefer a real camera/media frame when a production source exists;
         // fall back to the synthetic test chart otherwise.
         let pixels = self
-            .real_preview_frame(width, height)
+            .real_preview_frame(input_id, width, height)
             .unwrap_or_else(|| synthetic_frame(width, height));
         self.ingest_frame(input_id, width, height, pixels.clone());
         let frame = self
@@ -1245,22 +1251,51 @@ impl Shell {
         )
     }
 
+    /// Last tick's stage timings in milliseconds:
+    /// `[render, audio, record, stream]` — render covers capture/decode +
+    /// grade/filter + composite; stream covers encode + network send.
+    pub fn perf_stages(&self) -> [f32; 4] {
+        [
+            self.perf_stages_us[0] as f32 / 1000.0,
+            self.perf_stages_us[1] as f32 / 1000.0,
+            self.perf_stages_us[2] as f32 / 1000.0,
+            self.perf_stages_us[3] as f32 / 1000.0,
+        ]
+    }
+
     /// Pulls a real video frame from the first available camera/media
     /// production source, resized to `width`x`height`. Returns `None` when
     /// no real source exists or no frame is ready.
-    fn real_preview_frame(&mut self, width: u32, height: u32) -> Option<Vec<u8>> {
-        // Find the first camera/media source with a live producer.
+    fn real_preview_frame(
+        &mut self,
+        input_id: &str,
+        width: u32,
+        height: u32,
+    ) -> Option<Vec<u8>> {
+        // Prefer the producer behind the requested Color Studio input;
+        // fall back to the first camera/media source with a live producer.
         let source_id = self
             .scenes
             .iter()
             .flat_map(|s| s.sources.iter())
             .find(|src| {
-                matches!(
-                    src.kind,
-                    production::SourceKind::Camera { .. } | production::SourceKind::Media { .. }
-                ) && self.media_producers.contains_key(&src.id)
+                src.input_id.as_deref() == Some(input_id)
+                    && self.media_producers.contains_key(&src.id)
             })
-            .map(|src| src.id.clone())?;
+            .map(|src| src.id.clone())
+            .or_else(|| {
+                self.scenes
+                    .iter()
+                    .flat_map(|s| s.sources.iter())
+                    .find(|src| {
+                        matches!(
+                            src.kind,
+                            production::SourceKind::Camera { .. }
+                                | production::SourceKind::Media { .. }
+                        ) && self.media_producers.contains_key(&src.id)
+                    })
+                    .map(|src| src.id.clone())
+            })?;
         // When the program feed is live (recording/streaming), the media
         // tick already caches each program frame in `media_last_frame`.
         // Serve the preview from that cache (downscaled) so the preview

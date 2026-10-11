@@ -297,6 +297,10 @@ pub struct Engine {
     /// (C8): two linear ping-pong textures + the final RGBA8 target,
     /// recreated only when the frame size changes.
     work: Option<WorkTargets>,
+    /// Pooled output texture for [`gpu_composite_over`](Engine::gpu_composite_over):
+    /// `(width, height, texture)`, recreated only when the frame size changes,
+    /// so the hot path never allocates a texture per composite.
+    composite_out: Option<(u32, u32, wgpu::Texture)>,
 }
 
 impl Engine {
@@ -311,14 +315,19 @@ impl Engine {
         let pass = GradePass::new(&ctx)?;
         // GPU hybrid passes are optional: if the GPU doesn't support the
         // required features, fall back to CPU.
-        // Note: CompositePass disabled for now (ReadWrite storage needs
-        // wider GPU support); ScalePass is the priority for the hybrid.
+        // CompositePass uses the 4-binding API (sampled dst/src + write-only
+        // out texture, no read-write storage), so it runs on the same GPUs
+        // as ScalePass.
         let scale_pass = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             ScalePass::new(&ctx)
         }))
         .ok()
         .and_then(|r| r.ok());
-        let composite_pass: Option<CompositePass> = None;
+        let composite_pass = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            CompositePass::new(&ctx)
+        }))
+        .ok()
+        .and_then(|r| r.ok());
         let scope_pass = ScopePass::new(&ctx)?;
         let fx = EffectPass::new(&ctx)?;
         Ok(Self {
@@ -339,6 +348,7 @@ impl Engine {
             mask_cache: HashMap::new(),
             mask_uploads: 0,
             work: None,
+            composite_out: None,
         })
     }
 
@@ -556,6 +566,76 @@ impl Engine {
             .map_err(EngineError::Render)?;
         // Download result.
         self.ctx.download_rgba8(&dst_tex).map_err(EngineError::Render)
+    }
+
+    /// Alpha "over" composite of `src` onto `canvas` (both RGBA8, `w`x`h`)
+    /// on the GPU, returning the composited frame.
+    ///
+    /// This is the GPU twin of the shell's CPU `composite_over`, used for
+    /// the program-bus composite. The output texture is pooled (recreated
+    /// only when the frame size changes); uploads still happen per call
+    /// until the pipeline keeps frames on the GPU end to end.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`EngineError::UnknownInput`] when the GPU composite pass is
+    /// unavailable (caller falls back to the CPU path), or
+    /// [`EngineError::Render`] on GPU failure.
+    pub fn gpu_composite_over(
+        &mut self,
+        canvas: &[u8],
+        src: &[u8],
+        w: u32,
+        h: u32,
+    ) -> Result<Vec<u8>, EngineError> {
+        let expected = w as usize * h as usize * 4;
+        if canvas.len() != expected || src.len() != expected {
+            return Err(EngineError::UnknownInput(
+                "gpu_composite_over: buffer size mismatch".into(),
+            ));
+        }
+        let pass = self.composite_pass.as_ref().ok_or(EngineError::UnknownInput(
+            "GPU composite not available".into(),
+        ))?;
+        // Upload both inputs.
+        let dst_tex = self.ctx.upload_rgba8(w, h, canvas).map_err(EngineError::Render)?;
+        let src_tex = self.ctx.upload_rgba8(w, h, src).map_err(EngineError::Render)?;
+        let dst_view = dst_tex.create_view(&wgpu::TextureViewDescriptor::default());
+        let src_view = src_tex.create_view(&wgpu::TextureViewDescriptor::default());
+        // Pooled output texture: reuse across frames, recreate on resize.
+        // (Disjoint field borrows: ctx immutably, composite_out mutably.)
+        let recreate = match &self.composite_out {
+            Some((pw, ph, _)) => *pw != w || *ph != h,
+            None => true,
+        };
+        if recreate {
+            let tex = self.ctx.create_rgba8_target(w, h);
+            self.composite_out = Some((w, h, tex));
+        }
+        let out_tex = match self.composite_out.as_ref() {
+            Some((_, _, tex)) => tex,
+            None => {
+                return Err(EngineError::UnknownInput(
+                    "GPU composite: pooled target missing".into(),
+                ))
+            }
+        };
+        let out_view = out_tex.create_view(&wgpu::TextureViewDescriptor::default());
+        // Full-frame src over canvas at offset (0,0), full opacity.
+        pass.composite(
+            &self.ctx,
+            &dst_view,
+            &src_view,
+            &out_view,
+            w,
+            h,
+            (0, 0, w, h),
+            (0, 0),
+            1.0,
+        )
+        .map_err(EngineError::Render)?;
+        // Single download per composite (until GPU->encoder interop lands).
+        self.ctx.download_rgba8(&out_tex).map_err(EngineError::Render)
     }
 
     pub fn scopes_subscribe(&mut self, input_id: &str, kind: ScopeKind) -> Result<(), EngineError> {

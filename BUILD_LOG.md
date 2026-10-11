@@ -599,3 +599,23 @@ crate-private `ActiveRecording`/`ActiveStream` session structs in
 contexts carry no thread affinity, and every session is only ever touched
 through the shell's `Mutex` (commands + poll loop lock it exclusively), so
 serialized cross-thread use is sound. `src-tauri` check is clean again.
+
+### Realtime blueprint batch (2026-10-11, commit f503302)
+
+Per `stucture_for_smooth_video.md` v1.0 (never accumulate frames):
+
+- Media tick split: `av_tick` on dedicated fixed 33.3ms thread (30fps master
+  tick); UI events/transitions on the 66ms poll loop. `AV_FRAME_US` 66_667
+  -> 33_333.
+- dshow: MJPEG-first negotiation (`vcodec=mjpeg` -> yuv420p -> size+fps ->
+  negotiated); read timeout 100ms -> 25ms; negotiated codec/res/fps recorded
+  and exposed via new `camera_format` Tauri command.
+- Preview independence: live program feed serves preview from the tick's
+  cached frame (downscaled); idle preview still pulls directly.
+- Drop counters: `skipped_render` vs `dropped_network` in perf stats + panel.
+- composite.wgsl 4-binding shader reconciled with composite_pass.rs;
+  `tests/composite_gpu.rs` validates blend math on lavapipe (2/2 pass).
+
+Tests: 279/279 workspace pass. dshow path is Windows-only: compiles
+untouched on Linux CI; API use verified against ffmpeg-next 6.1.1 sources.
+Hardware verification (AMD PC) still pending — no installer cut from this.
