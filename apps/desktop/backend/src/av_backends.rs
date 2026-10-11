@@ -88,6 +88,12 @@ pub(crate) struct ActiveStream {
     reconnect_at: Option<Instant>,
 }
 
+impl ActiveStream {
+    pub(crate) fn bytes_sent(&self) -> u64 {
+        self.streamer.bytes_sent()
+    }
+}
+
 // SAFETY: same argument as `ActiveRecording` — FFmpeg contexts with no
 // thread affinity, all access serialized by the shell's `Mutex`.
 unsafe impl Send for ActiveStream {}

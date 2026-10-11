@@ -384,13 +384,13 @@ fn list_audio_devices(state: State<'_, AppState>) -> Vec<String> {
     lock(&state).map(|s| s.list_audio_devices()).unwrap_or_default()
 }
 
-/// Performance stats: (fps, render_ms, cpu_percent_estimate).
+/// Performance stats: (fps, render_ms, cpu_percent_estimate, stream_kbps).
 #[tauri::command(rename_all = "snake_case")]
 fn perf_stats(state: State<'_, AppState>) -> Vec<f32> {
     lock(&state)
         .map(|mut s| {
-            let (fps, render_ms, cpu) = s.perf_stats();
-            vec![fps, render_ms, cpu]
+            let (fps, render_ms, cpu, kbps) = s.perf_stats();
+            vec![fps, render_ms, cpu, kbps]
         })
         .unwrap_or_default()
 }

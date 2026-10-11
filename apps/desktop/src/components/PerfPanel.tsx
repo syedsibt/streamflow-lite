@@ -9,16 +9,18 @@ export default function PerfPanel() {
   const [fps, setFps] = useState(0);
   const [renderMs, setRenderMs] = useState(0);
   const [cpu, setCpu] = useState(0);
+  const [kbps, setKbps] = useState(0);
 
   useEffect(() => {
     let cancelled = false;
     const poll = async () => {
       try {
-        const [f, r, c] = await api.perfStats();
+        const [f, r, c, k] = await api.perfStats();
         if (!cancelled) {
           setFps(Math.round(f));
           setRenderMs(Math.round(r * 10) / 10);
           setCpu(Math.round(c));
+          setKbps(Math.round(k));
         }
       } catch {
         /* backend may not support it yet */
@@ -49,6 +51,7 @@ export default function PerfPanel() {
       <span>FPS: {fps}</span>
       <span>Render: {renderMs} ms</span>
       <span>CPU: {cpu}%</span>
+      <span>↑ {kbps} kbps</span>
     </div>
   );
 }

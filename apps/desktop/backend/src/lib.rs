@@ -413,6 +413,10 @@ pub struct Shell {
     perf_tick_accum_us: u64,
     /// Window start for CPU% calculation.
     perf_window_start: Instant,
+    /// Last bytes_sent for bitrate calc.
+    perf_last_bytes: u64,
+    /// Last bitrate sample time.
+    perf_last_br_time: Instant,
 }
 
 impl Shell {
@@ -450,6 +454,8 @@ impl Shell {
             perf_last_tick_us: 0,
             perf_tick_accum_us: 0,
             perf_window_start: Instant::now(),
+            perf_last_bytes: 0,
+            perf_last_br_time: Instant::now(),
         };
         shell.init_production();
         // A default input so the UI is usable immediately (the engine
@@ -492,6 +498,8 @@ impl Shell {
             perf_last_tick_us: 0,
             perf_tick_accum_us: 0,
             perf_window_start: Instant::now(),
+            perf_last_bytes: 0,
+            perf_last_br_time: Instant::now(),
         };
         shell.init_production();
         if let Ok(reg) = LookRegistry::load_dir(looks_dir) {
@@ -1161,9 +1169,10 @@ impl Shell {
         self.perf_tick_accum_us += duration_us;
     }
 
-    /// Returns (fps, render_ms, cpu_percent_estimate).
+    /// Returns (fps, render_ms, cpu_percent_estimate, stream_kbps).
     /// CPU% is estimated as (tick time / wall time) over the last second.
-    pub fn perf_stats(&mut self) -> (f32, f32, f32) {
+    /// stream_kbps is the RTMP upload bitrate (0 when not streaming).
+    pub fn perf_stats(&mut self) -> (f32, f32, f32, f32) {
         let now = Instant::now();
         // FPS from frame timestamps in the last second.
         let cutoff = now - std::time::Duration::from_secs(1);
@@ -1183,7 +1192,23 @@ impl Shell {
             self.perf_window_start = now;
             self.perf_tick_accum_us = 0;
         }
-        (fps, render_ms, cpu_pct)
+        // Stream bitrate: bytes sent since last call.
+        let kbps = if let Some(a) = self.active_stream.as_ref() {
+            let bytes = a.bytes_sent();
+            let dt = now.duration_since(self.perf_last_br_time).as_secs_f32();
+            let br = if dt > 0.1 {
+                (bytes - self.perf_last_bytes) as f32 * 8.0 / dt / 1000.0
+            } else {
+                0.0
+            };
+            self.perf_last_bytes = bytes;
+            self.perf_last_br_time = now;
+            br.max(0.0)
+        } else {
+            self.perf_last_bytes = 0;
+            0.0
+        };
+        (fps, render_ms, cpu_pct, kbps)
     }
 
     /// Pulls a real video frame from the first available camera/media

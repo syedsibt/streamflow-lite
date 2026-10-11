@@ -324,6 +324,8 @@ pub struct Streamer<T: Transport> {
     failures: u32,
     total_attempts: u32,
     next_delay_ms: u64,
+    /// Total bytes sent (for bandwidth monitoring).
+    total_bytes_sent: u64,
 }
 
 impl<T: Transport> Streamer<T> {
@@ -334,6 +336,7 @@ impl<T: Transport> Streamer<T> {
             policy,
             state: StreamState::Idle,
             failures: 0,
+            total_bytes_sent: 0,
             total_attempts: 0,
             next_delay_ms: 0,
         }
@@ -413,8 +416,12 @@ impl<T: Transport> Streamer<T> {
         if self.state != StreamState::Live {
             return Err(TransportError::NotConnected);
         }
+        let bytes = packet.data.len() as u64;
         match self.transport.send(packet) {
-            Ok(()) => Ok(()),
+            Ok(()) => {
+                self.total_bytes_sent += bytes;
+                Ok(())
+            }
             Err(e) => {
                 let _ = self.transport.close();
                 self.failures = 1;
@@ -423,6 +430,11 @@ impl<T: Transport> Streamer<T> {
                 Err(e)
             }
         }
+    }
+
+    /// Total bytes sent in this session.
+    pub fn bytes_sent(&self) -> u64 {
+        self.total_bytes_sent
     }
 
     /// Stop streaming and close the transport.
