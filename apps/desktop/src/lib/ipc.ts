@@ -112,6 +112,8 @@ export const api = {
     let text: string | null = null;
     let path: string | null = null;
     let device: string | null = null;
+    let width = 0;
+    let height = 0;
     if ("color" in kind) {
       kindStr = "color";
       color_r = kind.color.r;
@@ -120,6 +122,8 @@ export const api = {
     } else if ("camera" in kind) {
       kindStr = "camera";
       device = kind.camera.device ?? null;
+      width = kind.camera.width ?? 0;
+      height = kind.camera.height ?? 0;
     } else if ("screen" in kind) {
       kindStr = "screen";
     } else if ("media" in kind) {
@@ -139,6 +143,8 @@ export const api = {
       text,
       path,
       device,
+      width,
+      height,
     });
   },
   listCameras: () => cmd<string[]>("list_cameras", {}),

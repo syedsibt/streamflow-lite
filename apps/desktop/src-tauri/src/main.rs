@@ -354,6 +354,8 @@ fn source_add(
     text: Option<String>,
     path: Option<String>,
     device: Option<String>,
+    width: u32,
+    height: u32,
 ) -> CmdResult<SourceState> {
     lock(&state)?
         .source_add(
@@ -364,6 +366,8 @@ fn source_add(
             text.as_deref(),
             path.as_deref(),
             device.as_deref(),
+            width,
+            height,
         )
         .map_err(ue)
 }

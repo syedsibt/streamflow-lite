@@ -68,6 +68,10 @@ pub enum SourceKind {
     Camera {
         /// DirectShow device name, e.g. from `list_cameras`.
         device: Option<String>,
+        /// Capture width (0 = default 1280).
+        width: u32,
+        /// Capture height (0 = default 720).
+        height: u32,
     },
     /// Screen share (pending: `sf-capture` stub).
     Screen,
@@ -506,6 +510,8 @@ impl Shell {
             None,
             None,
             None,
+            0,
+            0,
         );
     }
 
@@ -714,6 +720,8 @@ fn parse_source_kind(
     text: Option<&str>,
     path: Option<&str>,
     device: Option<&str>,
+    width: u32,
+    height: u32,
 ) -> Result<SourceKind, ShellError> {
     match kind {
         "test_pattern" => Ok(SourceKind::TestPattern),
@@ -724,6 +732,8 @@ fn parse_source_kind(
         }),
         "camera" => Ok(SourceKind::Camera {
             device: device.map(|d| d.to_string()),
+            width,
+            height,
         }),
         "screen" => Ok(SourceKind::Screen),
         "media" => Ok(SourceKind::Media {
@@ -762,8 +772,10 @@ impl Shell {
         text: Option<&str>,
         path: Option<&str>,
         device: Option<&str>,
+        width: u32,
+        height: u32,
     ) -> Result<SourceState, ShellError> {
-        let kind = parse_source_kind(kind, color, text, path, device)?;
+        let kind = parse_source_kind(kind, color, text, path, device, width, height)?;
         let id = Uuid::new_v4().to_string();
         // Open producers BEFORE the source is pushed, so a bad file or
         // missing camera fails cleanly without leaving a half-added source.
@@ -771,8 +783,18 @@ impl Shell {
             self.open_media_producer(&id, path)?;
         }
         #[cfg(windows)]
-        if let SourceKind::Camera { device } = &kind {
-            self.open_camera_producer(&id, device.as_deref())?;
+        if let SourceKind::Camera {
+            device,
+            width,
+            height,
+        } = &kind
+        {
+            let (w, h) = if *width > 0 && *height > 0 {
+                (*width, *height)
+            } else {
+                (1280, 720)
+            };
+            self.open_camera_producer(&id, device.as_deref(), w, h)?;
         }
         let input_id = kind.is_real().then(|| source_input_id(&id));
         let order = self

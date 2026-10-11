@@ -3,6 +3,12 @@ import { useProduction } from "../../lib/productionStore";
 import { api } from "../../lib/ipc";
 import { isPendingCaptureSource, type SourceKind } from "../../lib/types";
 
+const CAMERA_RESOLUTIONS = [
+  { id: "480p", label: "480p (854×480)", width: 854, height: 480 },
+  { id: "720p", label: "720p (1280×720)", width: 1280, height: 720 },
+  { id: "1080p", label: "1080p (1920×1080)", width: 1920, height: 1080 },
+] as const;
+
 const KIND_OPTIONS = [
   "test_pattern",
   "color",
@@ -31,6 +37,7 @@ export default function SourcesPanel() {
   const [mediaPath, setMediaPath] = useState("");
   const [cameras, setCameras] = useState<string[]>([]);
   const [cameraDevice, setCameraDevice] = useState<string>("");
+  const [cameraRes, setCameraRes] = useState<string>("720p");
 
   // Load camera devices when the camera kind is selected.
   useEffect(() => {
@@ -70,8 +77,18 @@ export default function SourcesPanel() {
         return { media: { path: mediaPath } };
       case "text":
         return { text: { text } };
-      case "camera":
-        return { camera: { device: cameraDevice || null } };
+      case "camera": {
+        const res =
+          CAMERA_RESOLUTIONS.find((r) => r.id === cameraRes) ??
+          CAMERA_RESOLUTIONS[1];
+        return {
+          camera: {
+            device: cameraDevice || null,
+            width: res.width,
+            height: res.height,
+          },
+        };
+      }
       case "screen":
         return { screen: {} };
       default:
@@ -196,20 +213,33 @@ export default function SourcesPanel() {
             />
           )}
           {kind === "camera" && (
-            <select
-              value={cameraDevice}
-              onChange={(e) => setCameraDevice(e.target.value)}
-              title="Camera device"
-            >
-              {cameras.length === 0 && (
-                <option value="">No cameras found</option>
-              )}
-              {cameras.map((c) => (
-                <option key={c} value={c}>
-                  {c}
-                </option>
-              ))}
-            </select>
+            <>
+              <select
+                value={cameraDevice}
+                onChange={(e) => setCameraDevice(e.target.value)}
+                title="Camera device"
+              >
+                {cameras.length === 0 && (
+                  <option value="">No cameras found</option>
+                )}
+                {cameras.map((c) => (
+                  <option key={c} value={c}>
+                    {c}
+                  </option>
+                ))}
+              </select>
+              <select
+                value={cameraRes}
+                onChange={(e) => setCameraRes(e.target.value)}
+                title="Capture resolution (lower = less lag)"
+              >
+                {CAMERA_RESOLUTIONS.map((r) => (
+                  <option key={r.id} value={r.id}>
+                    {r.label}
+                  </option>
+                ))}
+              </select>
+            </>
           )}
           <button className="btn ghost" onClick={add}>
             Add

@@ -233,7 +233,7 @@ export const WHEELS = [
 export type SourceKind =
   | { test_pattern: Record<string, never> }
   | { color: { r: number; g: number; b: number } }
-  | { camera: { device?: string | null } }
+  | { camera: { device?: string | null; width?: number; height?: number } }
   | { screen: Record<string, never> }
   | { media: { path: string } }
   | { text: { text: string } };

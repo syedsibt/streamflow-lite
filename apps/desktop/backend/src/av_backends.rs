@@ -209,14 +209,16 @@ impl Shell {
         &mut self,
         source_id: &str,
         device: Option<&str>,
+        width: u32,
+        height: u32,
     ) -> Result<(), ShellError> {
         // Guard against a panic in the FFmpeg/dshow open path taking down
         // the whole app: convert it into a clean capture error instead.
         let device_owned = device.map(|d| d.to_string());
         let opened = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             match device_owned.as_deref() {
-                Some(d) => sf_capture::dshow::DshowProducer::open(d, 1280, 720, 30),
-                None => sf_capture::dshow::DshowProducer::open_default(1280, 720, 30),
+                Some(d) => sf_capture::dshow::DshowProducer::open(d, width, height, 30),
+                None => sf_capture::dshow::DshowProducer::open_default(width, height, 30),
             }
         }));
         let prod = match opened {

@@ -621,6 +621,10 @@ export const useProduction = create<ProductionStore>()((set, get) => ({
   recordStart: async () => {
     set({ recordError: null });
     try {
+      // Auto-save the current UI settings so Start works even if the user
+      // never pressed Save (backend defaults to an empty path).
+      const { recordPath, recordFormat, recordQuality } = get();
+      await api.recordSetSettings(recordPath, recordFormat, recordQuality);
       await api.recordStart();
       await get().refresh();
     } catch (e) {
