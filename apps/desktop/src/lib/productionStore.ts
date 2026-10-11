@@ -577,6 +577,11 @@ export const useProduction = create<ProductionStore>()((set, get) => ({
   streamStart: async () => {
     set({ streamError: null });
     try {
+      // Auto-save the current UI settings so Start works even if the user
+      // never pressed Save (backend defaults to empty URL/key).
+      const { streamUrl, streamPlatform, streamKey } = get();
+      const platform = streamPlatform.toLowerCase().replace(/ /g, "_");
+      await api.streamSetSettings(streamUrl, streamKey, platform);
       await api.streamStart();
       await get().refresh();
     } catch (e) {
