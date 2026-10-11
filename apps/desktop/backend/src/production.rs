@@ -351,7 +351,7 @@ pub const VIDEO_ENCODER_OPTIONS: [&str; 5] =
     ["auto", "h264_amf", "h264_nvenc", "h264_qsv", "libx264"];
 
 /// Stream output lifecycle.
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "state", rename_all = "snake_case")]
 pub enum StreamLifecycle {
     Idle,

@@ -237,6 +237,11 @@ pub struct DshowProducer {
     min_frame_interval_us: u64,
     /// Timestamp of the last delivered frame (for decimation).
     last_delivered_us: u64,
+    /// Source timestamp (`pts_us`) of the last delivered frame. OBS's
+    /// `ready_async_frame` applies a 2ms hysteresis against the source
+    /// clock so (near-)duplicate source instants are never emitted twice
+    /// (frame-boundary judder); the consumer repeats the last frame.
+    last_delivered_pts_us: Option<i64>,
 }
 
 /// Max time to wait for a frame from a dshow device before giving up
@@ -450,6 +455,7 @@ impl DshowProducer {
             negotiated_format,
             min_frame_interval_us,
             last_delivered_us: 0,
+            last_delivered_pts_us: None,
         })
     }
 
@@ -513,6 +519,14 @@ impl FrameProducer for DshowProducer {
         let Some(frame) = newest else {
             return Ok(None);
         };
+        // OBS `ready_async_frame` hysteresis (2ms): never emit a frame from
+        // a (near-)duplicate source instant — the consumer repeats the last
+        // frame instead of juddering at frame boundaries.
+        if let Some(last_pts) = self.last_delivered_pts_us {
+            if frame.pts_us <= last_pts.saturating_add(2_000) {
+                return Ok(None);
+            }
+        }
         // Decimate to the target fps: drop the frame when we delivered one
         // too recently; the consumer repeats the last frame (no stutter,
         // no accumulation).
@@ -521,6 +535,7 @@ impl FrameProducer for DshowProducer {
             return Ok(None);
         }
         self.last_delivered_us = now;
+        self.last_delivered_pts_us = Some(frame.pts_us);
         Ok(Some(frame))
     }
 

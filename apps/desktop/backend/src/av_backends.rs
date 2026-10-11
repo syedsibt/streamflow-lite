@@ -29,6 +29,7 @@
 //! [`sanitize_stream_error`], which redacts the key even if the underlying
 //! FFmpeg error echoes the URL.
 
+use std::collections::VecDeque;
 use std::time::{Duration, Instant};
 
 use sf_audio::AudioFrame;
@@ -50,8 +51,7 @@ fn encoder_id_from_name(name: &str) -> Option<EncoderId> {
 }
 use sf_engine::Frame;
 use sf_output::{
-    redact_url, ContainerFormat, RealTransport, ReconnectPolicy, Recorder,
-    StreamState as OutputStreamState, StreamTarget, Streamer,
+    redact_url, ContainerFormat, RealTransport, ReconnectPolicy, Recorder, StreamTarget, Streamer,
 };
 
 use super::production::{transition_progress, RecordFormat, RecordRuntime, StreamLifecycle};
@@ -86,24 +86,74 @@ pub(crate) struct ActiveRecording {
 // FFmpeg contexts across threads is safe.
 unsafe impl Send for ActiveRecording {}
 
-/// An active streaming session: streamer + encoders + clocks.
+/// An active streaming session: async RTMP send worker + encoders + clocks.
+///
+/// The [`SendWorker`](crate::send_worker::SendWorker) owns the RTMP
+/// [`Streamer`] on its own thread (OBS's dedicated send thread): the media
+/// tick encodes and hands packets over with non-blocking `try_send`, so a
+/// stalled network can never stall rendering. The worker owns the
+/// connect/reconnect backoff; the tick mirrors its status into
+/// [`StreamLifecycle`] and applies the OBS time-based drop policy.
 pub(crate) struct ActiveStream {
-    streamer: Streamer<RealTransport>,
+    send: crate::send_worker::SendWorker,
     video_enc: VideoEncoder,
     audio_enc: Option<AudioEncoder>,
     video_pts_us: i64,
     audio_pts_us: i64,
-    /// When the next reconnect attempt is due (`None` while live).
-    reconnect_at: Option<Instant>,
+    /// `(dts_us, kind)` of packets handed to the send thread but not yet
+    /// acked — drives the exact buffered-span computation for the drop
+    /// policy. FIFO: the worker acks in send order.
+    pending: VecDeque<(i64, PacketKind)>,
+    /// Last acked byte total (drives the kbps meter).
+    bytes_sent: u64,
+    /// Worker's last reported status.
+    worker_status: crate::send_worker::WorkerStatus,
+}
+
+/// Packet class for the drop policy: video delta frames may be shed under
+/// congestion; audio and keyframes never are (OBS `drop_frames`).
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PacketKind {
+    VideoKey,
+    VideoDelta,
+    Audio,
 }
 
 impl ActiveStream {
     pub(crate) fn bytes_sent(&self) -> u64 {
-        self.streamer.bytes_sent()
+        self.bytes_sent
     }
     pub(crate) fn encoder_name(&self) -> &'static str {
         self.video_enc.encoder_name()
     }
+
+    /// Buffered video span in microseconds: newest dts handed to the worker
+    /// minus the oldest unacked video dts. Mirrors OBS's
+    /// `last_dts_usec - first_video.dts_usec` buffer-duration metric.
+    fn buffered_video_us(&self, newest_dts: i64) -> i64 {
+        buffered_video_us(&self.pending, newest_dts)
+    }
+}
+
+/// Buffered video span over a pending-packet deque: newest dts minus the
+/// oldest unacked *video* dts (audio doesn't count toward the video buffer
+/// metric, mirroring OBS's `first_video` tracking).
+pub(crate) fn buffered_video_us(
+    pending: &VecDeque<(i64, PacketKind)>,
+    newest_dts: i64,
+) -> i64 {
+    let oldest = pending
+        .iter()
+        .filter(|(_, k)| matches!(k, PacketKind::VideoKey | PacketKind::VideoDelta))
+        .map(|(d, _)| *d)
+        .next();
+    oldest.map(|o| (newest_dts - o).max(0)).unwrap_or(0)
+}
+
+/// OBS `check_to_drop_frames` decision: shed this packet when congested?
+/// Only non-keyframe video is ever shed — audio and keyframes always pass.
+pub(crate) fn drop_decision(kind: PacketKind, buffered_us: i64) -> bool {
+    kind == PacketKind::VideoDelta && buffered_us > crate::send_worker::DROP_VIDEO_BUFFER_US
 }
 
 // SAFETY: same argument as `ActiveRecording` — FFmpeg contexts with no
@@ -676,10 +726,21 @@ impl Shell {
     // Streaming
     // ------------------------------------------------------------------
 
-    /// Starts streaming: builds encoders, opens a real RTMP connection
-    /// through `sf-output`'s `Streamer`. Unreachable servers fail cleanly
-    /// into `Error` with a redacted message; the key never appears.
+    /// Starts streaming: builds encoders and spawns the async RTMP send
+    /// worker, which connects on its own thread (the media tick never blocks
+    /// on TCP connect). Lifecycle goes `Connecting` → `Live`, or → `Error`
+    /// with a redacted message if the server is unreachable; the key never
+    /// appears in any message.
     pub fn stream_start(&mut self) -> Result<(), ShellError> {
+        self.stream_start_with_policy(ReconnectPolicy::default())
+    }
+
+    /// [`stream_start`](Self::stream_start) with an explicit reconnect policy.
+    /// Public so embedders (and tests) can tune or fast-fail the backoff.
+    pub fn stream_start_with_policy(
+        &mut self,
+        policy: ReconnectPolicy,
+    ) -> Result<(), ShellError> {
         match self.stream_lifecycle {
             StreamLifecycle::Idle | StreamLifecycle::Error { .. } => {}
             _ => {
@@ -714,35 +775,30 @@ impl Shell {
             let target = StreamTarget::Rtmp(full_url.clone());
             let transport =
                 RealTransport::new(target.clone(), video_enc.parameters(), audio_params);
+            let streamer = Streamer::new(target, transport, policy);
+            // The worker connects asynchronously; the tick never stalls on
+            // the network from here on.
+            let send = crate::send_worker::SendWorker::spawn(full_url.clone(), key.clone(), streamer);
             Ok(ActiveStream {
-                streamer: Streamer::new(target, transport, ReconnectPolicy::default()),
+                send,
                 video_enc,
                 audio_enc,
                 video_pts_us: 0,
                 audio_pts_us: 0,
-                reconnect_at: None,
+                pending: VecDeque::new(),
+                bytes_sent: 0,
+                worker_status: crate::send_worker::WorkerStatus::Connecting,
             })
         };
-        let mut active = match build() {
-            Ok(a) => a,
-            Err(m) => {
-                let msg = sanitize_stream_error(&full_url, &key, "stream setup failed", &m);
-                self.stream_lifecycle = StreamLifecycle::Error {
-                    message: msg.clone(),
-                };
-                self.emit_stream_state();
-                return Err(ShellError::Stream(msg));
-            }
-        };
-        match active.streamer.start() {
-            Ok(()) => {
-                self.stream_lifecycle = StreamLifecycle::Live;
+        match build() {
+            Ok(active) => {
+                self.stream_lifecycle = StreamLifecycle::Connecting;
                 self.active_stream = Some(active);
                 self.emit_stream_state();
                 Ok(())
             }
-            Err(e) => {
-                let msg = sanitize_stream_error(&full_url, &key, "RTMP connect failed", &e);
+            Err(m) => {
+                let msg = sanitize_stream_error(&full_url, &key, "stream setup failed", &m);
                 self.stream_lifecycle = StreamLifecycle::Error {
                     message: msg.clone(),
                 };
@@ -752,141 +808,191 @@ impl Shell {
         }
     }
 
-    /// Stops streaming (any state → `Idle`), closing the transport.
+    /// Stops streaming (any state → `Idle`), asking the send worker to shut
+    /// down and close the transport.
     pub fn stream_stop(&mut self) -> Result<(), ShellError> {
-        if let Some(mut active) = self.active_stream.take() {
-            active.streamer.stop();
+        if let Some(active) = self.active_stream.take() {
+            // Bounded wait: the worker exits promptly on Shutdown.
+            let _bytes = active.send.shutdown();
         }
         self.stream_lifecycle = StreamLifecycle::Idle;
         self.emit_stream_state();
         Ok(())
     }
 
-    /// One streaming step, called from [`Shell::av_tick`]: encodes the
-    /// given program frame and mixed audio, and sends; drives the
-    /// reconnect state machine.
-    pub(crate) fn stream_tick(&mut self, frame: &Frame, audio: &[f32]) {
+    /// Drains the RTMP send worker's events without encoding a frame.
+    /// Keeps the stream lifecycle truthful even when the render stage has
+    /// nothing to send. Public so hosts can poll it from their own loop.
+    pub fn stream_drain_worker(&mut self) {
         if self.active_stream.is_none() {
             return;
         }
-        // Reconnect timer path.
-        let due = self
-            .active_stream
-            .as_ref()
-            .and_then(|a| a.reconnect_at)
-            .map(|t| Instant::now() >= t)
-            .unwrap_or(false);
-        if due {
-            let (result, state, delay) = {
-                let a = match self.active_stream.as_mut() {
-                    Some(a) => a,
-                    None => return,
-                };
-                a.reconnect_at = None;
-                let r = a.streamer.on_reconnect_timer();
-                (r, a.streamer.state(), a.streamer.reconnect_delay_ms())
-            };
-            match (result, state) {
-                (Ok(()), OutputStreamState::Live) => {
-                    self.stream_lifecycle = StreamLifecycle::Live;
-                    self.emit_stream_state();
-                }
-                (Ok(()), OutputStreamState::Failed) => {
-                    let m = "reconnect attempts exhausted".to_string();
-                    self.stream_lifecycle = StreamLifecycle::Error { message: m };
-                    self.active_stream = None;
-                    self.emit_stream_state();
-                }
-                (Ok(()), _) => {
-                    // Still reconnecting: schedule the next attempt.
-                    if let Some(a) = self.active_stream.as_mut() {
-                        a.reconnect_at =
-                            Some(Instant::now() + Duration::from_millis(delay.unwrap_or(1000)));
-                    }
-                    self.stream_lifecycle = StreamLifecycle::Reconnecting;
-                    self.emit_stream_state();
-                }
-                (Err(e), _) => {
-                    let url = self.stream_settings.url.clone();
-                    let key = self.stream_settings.key.clone();
-                    let m = sanitize_stream_error(&url, &key, "reconnect failed", &e);
-                    self.stream_lifecycle = StreamLifecycle::Error { message: m };
-                    self.active_stream = None;
-                    self.emit_stream_state();
-                }
-            }
-            return;
-        }
-        // If the streamer is mid-reconnect (timer not yet due), hold.
-        let reconnecting = matches!(
-            self.active_stream.as_ref().map(|a| a.streamer.state()),
-            Some(OutputStreamState::Reconnecting { .. })
-        );
-        if reconnecting {
-            return;
-        }
-        // Live path: encode the rendered frame, send.
-        let url = self.stream_settings.url.clone();
-        let key = self.stream_settings.key.clone();
-        let frame_us = self.frame_interval_us();
-        let a = match self.active_stream.as_mut() {
-            Some(a) => a,
-            None => return,
-        };
-        let vpts = a.video_pts_us;
-        a.video_pts_us += frame_us as i64;
-        let mut send_failed: Option<String> = None;
-        // (No helper closure: `a` is already mutably borrowed, so the
-        // send is inlined to keep borrowck happy.)
-        match a.video_enc.encode_rgba(&frame.pixels, vpts) {
-            Ok(pkts) => {
-                for p in &pkts {
-                    if let Err(e) = a.streamer.send_packet(p) {
-                        // Network couldn't take the packet: count it as a
-                        // network drop (distinct from render-side skips).
-                        self.perf_dropped_network += 1;
-                        send_failed =
-                            Some(sanitize_stream_error(&url, &key, "RTMP send failed", &e));
-                        break;
-                    }
-                }
-            }
-            Err(e) => {
-                // Encode itself failed: render-side skip, not a network drop.
-                self.perf_skipped_render += 1;
-                send_failed = Some(format!("encode video: {e}"));
-            }
-        }
-        if send_failed.is_none() && !audio.is_empty() {
-            if let Some(aenc) = a.audio_enc.as_mut() {
-                let apts = a.audio_pts_us;
-                a.audio_pts_us += audio.len() as i64 / 2 * 1_000_000 / 48_000;
-                match aenc.encode_pcm(&audio, apts) {
-                    Ok(pkts) => {
-                        for p in &pkts {
-                            if let Err(e) = a.streamer.send_packet(p) {
-                                self.perf_dropped_network += 1;
-                                send_failed =
-                                    Some(sanitize_stream_error(&url, &key, "RTMP send failed", &e));
+        let mut rekey = false;
+        let mut lifecycle_changed = false;
+        {
+            let a = self.active_stream.as_mut().expect("checked above");
+            let lifecycle = &mut self.stream_lifecycle;
+            for ev in a.send.drain_events() {
+                match ev {
+                    crate::send_worker::SendEvent::Ack { dts_us, bytes_sent } => {
+                        a.bytes_sent = bytes_sent;
+                        // FIFO: the worker acks in send order.
+                        while let Some(&(d, _)) = a.pending.front() {
+                            if d <= dts_us {
+                                a.pending.pop_front();
+                            } else {
                                 break;
                             }
                         }
                     }
-                    Err(e) => {
-                        self.perf_skipped_render += 1;
-                        send_failed = Some(format!("encode audio: {e}"));
+                    crate::send_worker::SendEvent::Status(s) => {
+                        let became_live = s == crate::send_worker::WorkerStatus::Live
+                            && a.worker_status != crate::send_worker::WorkerStatus::Live;
+                        a.worker_status = s.clone();
+                        let next = match &s {
+                            crate::send_worker::WorkerStatus::Connecting => {
+                                StreamLifecycle::Connecting
+                            }
+                            crate::send_worker::WorkerStatus::Live => StreamLifecycle::Live,
+                            crate::send_worker::WorkerStatus::Reconnecting => {
+                                StreamLifecycle::Reconnecting
+                            }
+                            crate::send_worker::WorkerStatus::Failed(m) => {
+                                StreamLifecycle::Error {
+                                    message: m.clone(),
+                                }
+                            }
+                        };
+                        if *lifecycle != next {
+                            *lifecycle = next;
+                            lifecycle_changed = true;
+                        }
+                        if became_live {
+                            rekey = true;
+                        }
+                    }
+                    crate::send_worker::SendEvent::Resync => {
+                        // Worker dropped stale packets on (re)connect.
+                        a.pending.clear();
+                        rekey = true;
+                    }
+                    crate::send_worker::SendEvent::Stopped { bytes_sent } => {
+                        a.bytes_sent = bytes_sent;
                     }
                 }
             }
         }
-        if send_failed.is_some() {
-            // Drop to the reconnect path (or error if the streamer gave up).
-            let delay = a.streamer.reconnect_delay_ms().unwrap_or(1000);
-            a.reconnect_at = Some(Instant::now() + Duration::from_millis(delay));
-            // Nudge the streamer into its reconnect state machine.
-            let _ = a.streamer.on_reconnect_timer();
-            self.stream_lifecycle = StreamLifecycle::Reconnecting;
+        if rekey {
+            // Fresh connection: restart the video encoder so the first
+            // packet is a keyframe and decoders resync immediately. PTS
+            // stays continuous via the running `video_pts_us` clock.
+            if let Ok(enc) = self.open_video_encoder(self.video_encoder_opts()) {
+                if let Some(a) = self.active_stream.as_mut() {
+                    a.video_enc = enc;
+                }
+            }
+        }
+        if lifecycle_changed {
             self.emit_stream_state();
+        }
+    }
+
+    /// Hands one encoded packet to the send worker, applying the OBS
+    /// time-based drop policy: when the worker's buffered video span exceeds
+    /// 900 ms, non-keyframe video is shed (counted as a network drop). Audio
+    /// and keyframes are never dropped.
+    fn stream_enqueue(a: &mut ActiveStream, packet: EncodedPacket, dropped: &mut u64) {
+        let kind = if packet.stream_index == 0 {
+            if packet.is_keyframe {
+                PacketKind::VideoKey
+            } else {
+                PacketKind::VideoDelta
+            }
+        } else {
+            PacketKind::Audio
+        };
+        if kind == PacketKind::VideoDelta
+            && drop_decision(kind, a.buffered_video_us(packet.dts_us))
+        {
+            *dropped += 1;
+            return;
+        }
+        a.pending.push_back((packet.dts_us, kind));
+        if let Err(e) = a.send.try_send(packet) {
+            // Backstop: the worker is wedged (the drop policy above should
+            // have shed load long before the 256-packet queue fills).
+            a.pending.pop_back();
+            *dropped += 1;
+            let _ = e;
+        }
+    }
+
+    /// One streaming step, called from [`Shell::av_tick`]: drains worker
+    /// events, encodes the given program frame and mixed audio, and hands
+    /// the packets to the send thread with a non-blocking `try_send`.
+    /// The network can never stall this tick.
+    pub(crate) fn stream_tick(&mut self, frame: &Frame, audio: &[f32]) {
+        if self.active_stream.is_none() {
+            return;
+        }
+        self.stream_drain_worker();
+        // Only encode when the worker is actually live: packets handed over
+        // while connecting/reconnecting/failed would be dropped by the
+        // worker (and never acked, which would poison the pending-packet
+        // accounting). Skipping encode here also saves CPU during outages.
+        let live = self
+            .active_stream
+            .as_ref()
+            .map(|a| a.worker_status == crate::send_worker::WorkerStatus::Live)
+            .unwrap_or(false);
+        if !live {
+            return;
+        }
+        let frame_us = self.frame_interval_us();
+        // Encode video (stays on the tick, like OBS's video-io thread —
+        // only the network send moved off-thread).
+        let vpackets: Vec<EncodedPacket>;
+        {
+            let a = self.active_stream.as_mut().expect("checked above");
+            let vpts = a.video_pts_us;
+            a.video_pts_us += frame_us as i64;
+            match a.video_enc.encode_rgba(&frame.pixels, vpts) {
+                Ok(pkts) => vpackets = pkts,
+                Err(e) => {
+                    self.perf_skipped_render += 1;
+                    let _ = e;
+                    vpackets = Vec::new();
+                }
+            }
+        }
+        for p in vpackets {
+            let a = self.active_stream.as_mut().expect("checked above");
+            Self::stream_enqueue(a, p, &mut self.perf_dropped_network);
+        }
+        // Encode audio.
+        if !audio.is_empty() {
+            let apackets: Vec<EncodedPacket>;
+            {
+                let a = self.active_stream.as_mut().expect("checked above");
+                if let Some(aenc) = a.audio_enc.as_mut() {
+                    let apts = a.audio_pts_us;
+                    a.audio_pts_us += audio.len() as i64 / 2 * 1_000_000 / 48_000;
+                    match aenc.encode_pcm(&audio, apts) {
+                        Ok(pkts) => apackets = pkts,
+                        Err(e) => {
+                            self.perf_skipped_render += 1;
+                            let _ = e;
+                            apackets = Vec::new();
+                        }
+                    }
+                } else {
+                    apackets = Vec::new();
+                }
+            }
+            for p in apackets {
+                let a = self.active_stream.as_mut().expect("checked above");
+                Self::stream_enqueue(a, p, &mut self.perf_dropped_network);
+            }
         }
     }
 
@@ -948,5 +1054,45 @@ impl Shell {
         let tick_us = tick_start.elapsed().as_micros() as u64;
         self.perf_mark_tick(tick_us);
         self.perf_mark_frame();
+    }
+}
+
+#[cfg(test)]
+mod drop_policy_tests {
+    use super::{buffered_video_us, drop_decision, PacketKind};
+    use std::collections::VecDeque;
+
+    #[test]
+    fn buffered_span_ignores_audio() {
+        let pending: VecDeque<(i64, PacketKind)> = vec![
+            (1_000_000, PacketKind::Audio),
+            (1_010_000, PacketKind::VideoKey),
+            (1_020_000, PacketKind::Audio),
+            (1_040_000, PacketKind::VideoDelta),
+        ]
+        .into_iter()
+        .collect();
+        // Newest video dts 1_100_000, oldest unacked video 1_010_000.
+        assert_eq!(buffered_video_us(&pending, 1_100_000), 90_000);
+    }
+
+    #[test]
+    fn buffered_span_empty_is_zero() {
+        let pending: VecDeque<(i64, PacketKind)> = VecDeque::new();
+        assert_eq!(buffered_video_us(&pending, 5_000_000), 0);
+        let audio_only: VecDeque<(i64, PacketKind)> =
+            vec![(1_000_000, PacketKind::Audio)].into_iter().collect();
+        assert_eq!(buffered_video_us(&audio_only, 2_000_000), 0);
+    }
+
+    #[test]
+    fn only_delta_video_is_shed() {
+        // Under the 900ms threshold: nothing drops.
+        assert!(!drop_decision(PacketKind::VideoDelta, 899_999));
+        // Past it: delta video sheds...
+        assert!(drop_decision(PacketKind::VideoDelta, 900_001));
+        // ...but keyframes and audio never do.
+        assert!(!drop_decision(PacketKind::VideoKey, 5_000_000));
+        assert!(!drop_decision(PacketKind::Audio, 5_000_000));
     }
 }

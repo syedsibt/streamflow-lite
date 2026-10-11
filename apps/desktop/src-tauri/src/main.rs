@@ -449,13 +449,13 @@ fn perf_stages(state: State<'_, AppState>) -> Vec<f32> {
 }
 
 /// Performance stats: (fps, render_ms, cpu_percent_estimate, stream_kbps,
-/// skipped_render, dropped_network).
+/// skipped_render, dropped_network, lagged_ticks).
 #[tauri::command(rename_all = "snake_case")]
 fn perf_stats(state: State<'_, AppState>) -> Vec<f32> {
     lock(&state)
         .map(|mut s| {
-            let (fps, render_ms, cpu, kbps, skipped, dropped) = s.perf_stats();
-            vec![fps, render_ms, cpu, kbps, skipped, dropped]
+            let (fps, render_ms, cpu, kbps, skipped, dropped, lagged) = s.perf_stats();
+            vec![fps, render_ms, cpu, kbps, skipped, dropped, lagged]
         })
         .unwrap_or_default()
 }
@@ -706,22 +706,43 @@ fn main() {
             // polling, PNG previews, and transitions can never stall the
             // program feed. If the camera is late, the last frame is
             // repeated (tick never waits).
+            //
+            // OBS-style absolute-deadline clock (`video_sleep`): the tick
+            // sleeps until the next whole-interval deadline instead of
+            // sleeping a relative remainder, so the clock can never drift.
+            // On overrun the clock jumps forward in whole intervals and the
+            // missed ticks are counted as lagged (never burst-catch-up).
             let media_handle = app.handle().clone();
-            std::thread::spawn(move || loop {
-                let tick = std::time::Instant::now();
-                let interval_us =
-                    if let Ok(mut s) = media_handle.state::<AppState>().0.lock() {
-                        // Never panics; backend failures degrade to Error states.
-                        s.av_tick();
-                        s.frame_interval_us()
+            std::thread::spawn(move || {
+                let mut next_deadline = std::time::Instant::now();
+                loop {
+                    let interval_us =
+                        if let Ok(mut s) = media_handle.state::<AppState>().0.lock() {
+                            // Never panics; backend failures degrade to Error states.
+                            s.av_tick();
+                            s.frame_interval_us()
+                        } else {
+                            33_333
+                        };
+                    let interval_us = interval_us.max(1);
+                    let interval = Duration::from_micros(interval_us);
+                    next_deadline += interval;
+                    let now = std::time::Instant::now();
+                    if next_deadline > now {
+                        std::thread::sleep(next_deadline - now);
                     } else {
-                        33_333
-                    };
-                // Monotonic fixed cadence: sleep the remainder of the frame.
-                let elapsed = tick.elapsed();
-                let target = Duration::from_micros(interval_us);
-                if elapsed < target {
-                    std::thread::sleep(target - elapsed);
+                        // Missed the deadline: advance in whole intervals and
+                        // count the lagged ticks (clamped so a long stall
+                        // can't spiral the clock).
+                        let over_us = now.duration_since(next_deadline).as_micros();
+                        let missed = sf_ui_backend::missed_intervals(over_us, interval_us);
+                        next_deadline += interval * missed as u32;
+                        if missed > 0 {
+                            if let Ok(mut s) = media_handle.state::<AppState>().0.lock() {
+                                s.perf_mark_lagged(missed);
+                            }
+                        }
+                    }
                 }
             });
             // Engine → UI event pump: advance auto-transitions, then poll

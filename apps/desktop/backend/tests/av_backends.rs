@@ -109,6 +109,7 @@ fn record_requires_output_path() {
 
 #[test]
 fn stream_start_unreachable_fails_cleanly_without_key_leak() {
+    use sf_output::ReconnectPolicy;
     let mut s = shell();
     s.stream_set_settings(
         "rtmp://127.0.0.1:1935/live",
@@ -116,13 +117,24 @@ fn stream_start_unreachable_fails_cleanly_without_key_leak() {
         "custom_rtmp",
     )
     .unwrap();
-    let err = s.stream_start().expect_err("no RTMP server here");
-    let msg = err.to_string();
-    assert!(
-        !msg.contains("secret-key-xyz"),
-        "stream key leaked in error: {msg}"
-    );
-    match s.production_state().stream_lifecycle {
+    // Connect now happens on the async send worker: start returns Ok and
+    // the failure surfaces through the lifecycle.
+    s.stream_start_with_policy(ReconnectPolicy {
+        max_attempts: 0,
+        ..ReconnectPolicy::default()
+    })
+    .expect("async start must not fail synchronously");
+    // Poll the worker until it reports the (fast-failing) result.
+    let mut lifecycle = s.production_state().stream_lifecycle;
+    for _ in 0..200 {
+        s.stream_drain_worker();
+        lifecycle = s.production_state().stream_lifecycle;
+        if matches!(lifecycle, StreamLifecycle::Error { .. }) {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(25));
+    }
+    match &lifecycle {
         StreamLifecycle::Error { message } => assert!(
             !message.contains("secret-key-xyz"),
             "stream key leaked in lifecycle: {message}"

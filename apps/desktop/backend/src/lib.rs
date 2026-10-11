@@ -46,6 +46,7 @@ pub use sf_color::{LutPosition, LutRef};
 /// media sources). Keeps `production.rs` focused on the state machines.
 mod av_backends;
 mod production;
+mod send_worker;
 /// Production state machine (scenes, sources, transitions, mixer, stream,
 /// record, macros) — all headless-testable, no tauri dependency.
 pub use production::{
@@ -433,6 +434,11 @@ pub struct Shell {
     /// Packets dropped because the network couldn't keep up (blueprint
     /// `dropped_network`: internet too slow — audio is never dropped).
     perf_dropped_network: u64,
+    /// Ticks missed against the absolute-deadline media clock (OBS
+    /// `video_sleep` semantics: the clock advances in whole frame
+    /// intervals and counts `lagged_frames += count - 1` instead of
+    /// drifting — the tick never burst-catches-up).
+    perf_lagged_ticks: u64,
     /// Last tick's stage timings in microseconds:
     /// [render (capture+grade+composite), audio pump, record encode/write,
     /// stream encode/send] — blueprint "measure before claiming".
@@ -480,6 +486,7 @@ impl Shell {
             perf_last_br_time: Instant::now(),
             perf_skipped_render: 0,
             perf_dropped_network: 0,
+            perf_lagged_ticks: 0,
             perf_stages_us: [0; 4],
         };
         shell.init_production();
@@ -529,6 +536,7 @@ impl Shell {
             perf_last_br_time: Instant::now(),
             perf_skipped_render: 0,
             perf_dropped_network: 0,
+            perf_lagged_ticks: 0,
             perf_stages_us: [0; 4],
         };
         shell.init_production();
@@ -1199,6 +1207,11 @@ impl Shell {
         self.perf_tick_accum_us += duration_us;
     }
 
+    /// Records missed media-clock deadlines (OBS `lagged_frames`): the
+    /// deadline clock jumped `n` whole frame intervals instead of drifting.
+    pub fn perf_mark_lagged(&mut self, n: u64) {
+        self.perf_lagged_ticks += n;
+    }
     /// Active stream encoder name (e.g. "h264_nvenc"), or empty when idle.
     pub fn stream_encoder_name(&self) -> String {
         self.active_stream
@@ -1208,12 +1221,14 @@ impl Shell {
     }
 
     /// Returns (fps, render_ms, cpu_percent_estimate, stream_kbps,
-    /// skipped_render, dropped_network).
+    /// skipped_render, dropped_network, lagged_ticks).
     /// CPU% is estimated as (tick time / wall time) over the last second.
     /// stream_kbps is the RTMP upload bitrate (0 when not streaming).
     /// skipped_render counts frames the render/encode stage couldn't keep up
-    /// with; dropped_network counts packets the network couldn't take.
-    pub fn perf_stats(&mut self) -> (f32, f32, f32, f32, f32, f32) {
+    /// with; dropped_network counts packets the network couldn't take;
+    /// lagged_ticks counts missed absolute-deadline media ticks (OBS
+    /// `lagged_frames` semantics).
+    pub fn perf_stats(&mut self) -> (f32, f32, f32, f32, f32, f32, f32) {
         let now = Instant::now();
         // FPS from frame timestamps in the last second.
         let cutoff = now - std::time::Duration::from_secs(1);
@@ -1256,6 +1271,7 @@ impl Shell {
             kbps,
             self.perf_skipped_render as f32,
             self.perf_dropped_network as f32,
+            self.perf_lagged_ticks as f32,
         )
     }
 
@@ -1477,5 +1493,45 @@ impl Shell {
             input_id: input_id.to_string(),
         });
         Ok(snapshot)
+    }
+}
+
+/// OBS `video_sleep` deadline math, extracted for the media tick (see
+/// `apps/desktop/src-tauri/src/main.rs`).
+///
+/// Given how far past the deadline we are (`overdue_us`) and the frame
+/// interval, returns how many whole intervals the clock must jump forward.
+/// The caller always advances one interval for the current tick; this counts
+/// the *additional* missed intervals (OBS's `lagged_frames += count - 1`).
+/// Clamped so a long stall can't spiral the clock.
+pub fn missed_intervals(overdue_us: u128, interval_us: u64) -> u64 {
+    if interval_us == 0 {
+        return 0;
+    }
+    (overdue_us / interval_us as u128).min(240) as u64
+}
+
+#[cfg(test)]
+mod deadline_tests {
+    use super::missed_intervals;
+
+    #[test]
+    fn no_overdue_no_missed() {
+        assert_eq!(missed_intervals(0, 33_333), 0);
+        assert_eq!(missed_intervals(10_000, 33_333), 0);
+    }
+
+    #[test]
+    fn counts_whole_intervals() {
+        // 100ms overdue at 33.3ms → 3 whole intervals missed.
+        assert_eq!(missed_intervals(100_000, 33_333), 3);
+        // 16.7ms overdue at 33.3ms → 0 (partial interval doesn't count).
+        assert_eq!(missed_intervals(16_700, 33_333), 0);
+    }
+
+    #[test]
+    fn clamped_and_zero_safe() {
+        assert_eq!(missed_intervals(10_000_000_000, 33_333), 240);
+        assert_eq!(missed_intervals(100_000, 0), 0);
     }
 }
