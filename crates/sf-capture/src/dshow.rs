@@ -172,8 +172,9 @@ pub struct DshowProducer {
 }
 
 /// Max time to wait for a frame from a dshow device before giving up
-/// on that poll (2 seconds). The next poll tries again.
-const READ_TIMEOUT_US: u64 = 2_000_000;
+/// on that poll (100ms). The poll loop runs every 66ms; a longer timeout
+/// would stall it. The next poll tries again.
+const READ_TIMEOUT_US: u64 = 100_000;
 
 /// Max time to wait for a dshow device to open (15 seconds per attempt).
 const OPEN_TIMEOUT_US: u64 = 15_000_000;
@@ -291,8 +292,11 @@ impl DshowProducer {
         // SAFETY: `ctx` is a valid open input context owned by us now;
         // `Input::wrap` takes ownership and closes it on drop.
         let ictx = unsafe { ff::format::context::Input::wrap(ctx) };
-        let demux = DemuxDecoder::from_input(ictx, 33_333)
+        let mut demux = DemuxDecoder::from_input(ictx, 33_333)
             .map_err(|e| format!("demuxer: {e}"))?;
+        // Live capture: never accumulate a frame backlog (prevents
+        // unbounded memory growth when the device outpaces the poll loop).
+        demux.set_live(true);
         let info = demux.stream_info(false);
         Ok(Self {
             demux,

@@ -65,6 +65,10 @@ pub(crate) struct DemuxDecoder {
     nominal_frame_us: u64,
     packets_exhausted: bool,
     eof_sent: bool,
+    /// Live sources (e.g. dshow capture) drop backlog: the queue never
+    /// holds more than one frame, so a slow consumer can't accumulate
+    /// unbounded memory. File sources keep every frame.
+    live: bool,
 }
 
 impl DemuxDecoder {
@@ -164,6 +168,7 @@ impl DemuxDecoder {
             nominal_frame_us,
             packets_exhausted: false,
             eof_sent: false,
+            live: false,
         })
     }
 
@@ -205,6 +210,12 @@ impl DemuxDecoder {
                 return Ok(self.video_queue.pop_front());
             }
             let Some((stream, packet)) = self.ictx.packets().next() else {
+                // Live sources: a `None` here is a transient read timeout,
+                // NOT end-of-stream. Return "no frame yet" without marking
+                // the stream exhausted, so the next poll tries again.
+                if self.live {
+                    return Ok(None);
+                }
                 self.packets_exhausted = true;
                 continue;
             };
@@ -213,6 +224,10 @@ impl DemuxDecoder {
                     .send_packet(&packet)
                     .map_err(|e| CaptureError::ReadFailed(format!("video send_packet: {e}")))?;
                 while let Some(f) = self.decode_one_video()? {
+                    if self.live {
+                        // Live: keep only the newest frame.
+                        self.video_queue.clear();
+                    }
                     self.video_queue.push_back(f);
                 }
                 if let Some(f) = self.video_queue.pop_front() {
@@ -250,6 +265,10 @@ impl DemuxDecoder {
                 return Ok(self.audio_queue.pop_front());
             }
             let Some((stream, packet)) = self.ictx.packets().next() else {
+                // Live sources: transient timeout, not EOF (see next_video).
+                if self.live {
+                    return Ok(None);
+                }
                 self.packets_exhausted = true;
                 continue;
             };
@@ -267,6 +286,10 @@ impl DemuxDecoder {
                     .send_packet(&packet)
                     .map_err(|e| CaptureError::ReadFailed(format!("video send_packet: {e}")))?;
                 while let Some(f) = self.decode_one_video()? {
+                    if self.live {
+                        // Live: keep only the newest frame.
+                        self.video_queue.clear();
+                    }
                     self.video_queue.push_back(f);
                 }
             }

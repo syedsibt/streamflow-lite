@@ -1113,9 +1113,11 @@ impl Shell {
                 return Ok(png.clone());
             }
         }
-        // Stand-in for capture until `sf-capture` lands: a deterministic
-        // test-chart frame through the REAL grade/filter pipeline.
-        let pixels = synthetic_frame(width, height);
+        // Prefer a real camera/media frame when a production source exists;
+        // fall back to the synthetic test chart otherwise.
+        let pixels = self
+            .real_preview_frame(width, height)
+            .unwrap_or_else(|| synthetic_frame(width, height));
         self.ingest_frame(input_id, width, height, pixels.clone());
         let frame = self
             .engine
@@ -1124,6 +1126,25 @@ impl Shell {
         self.preview_cache
             .insert(input_id.to_string(), (Instant::now(), png.clone()));
         Ok(png)
+    }
+
+    /// Pulls a real video frame from the first available camera/media
+    /// production source, resized to `width`x`height`. Returns `None` when
+    /// no real source exists or no frame is ready.
+    fn real_preview_frame(&mut self, width: u32, height: u32) -> Option<Vec<u8>> {
+        // Find the first camera/media source with a live producer.
+        let source_id = self
+            .scenes
+            .iter()
+            .flat_map(|s| s.sources.iter())
+            .find(|src| {
+                matches!(
+                    src.kind,
+                    production::SourceKind::Camera { .. } | production::SourceKind::Media { .. }
+                ) && self.media_producers.contains_key(&src.id)
+            })
+            .map(|src| src.id.clone())?;
+        self.pull_media_frame(&source_id, width, height)
     }
 }
 

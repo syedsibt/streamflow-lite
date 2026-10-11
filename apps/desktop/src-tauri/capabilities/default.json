@@ -1,0 +1,10 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "default",
+  "description": "Default capabilities for StreamFlow Lite",
+  "windows": ["main"],
+  "permissions": [
+    "core:default",
+    "event:default"
+  ]
+}
