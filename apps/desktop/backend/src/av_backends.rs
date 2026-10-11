@@ -798,6 +798,7 @@ impl Shell {
     /// feed), and advances recording and streaming. Never panics;
     /// backend failures degrade to lifecycle `Error` states.
     pub fn av_tick(&mut self) {
+        let tick_start = std::time::Instant::now();
         let recording = self.active_recording.is_some();
         let streaming = self.active_stream.is_some();
         if !recording && !streaming {
@@ -818,5 +819,8 @@ impl Shell {
         if streaming {
             self.stream_tick(&frame, &audio);
         }
+        let tick_us = tick_start.elapsed().as_micros() as u64;
+        self.perf_mark_tick(tick_us);
+        self.perf_mark_frame();
     }
 }

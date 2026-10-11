@@ -405,6 +405,14 @@ pub struct Shell {
     active_recording: Option<av_backends::ActiveRecording>,
     /// Active streaming session (`None` when idle).
     active_stream: Option<av_backends::ActiveStream>,
+    /// Performance monitoring: frame timestamps for FPS calc.
+    perf_frame_times: VecDeque<Instant>,
+    /// Last av_tick duration (render time).
+    perf_last_tick_us: u64,
+    /// Total av_tick time in current second (for CPU% estimate).
+    perf_tick_accum_us: u64,
+    /// Window start for CPU% calculation.
+    perf_window_start: Instant,
 }
 
 impl Shell {
@@ -438,6 +446,10 @@ impl Shell {
             meters_live: false,
             active_recording: None,
             active_stream: None,
+            perf_frame_times: VecDeque::new(),
+            perf_last_tick_us: 0,
+            perf_tick_accum_us: 0,
+            perf_window_start: Instant::now(),
         };
         shell.init_production();
         // A default input so the UI is usable immediately (the engine
@@ -476,6 +488,10 @@ impl Shell {
             meters_live: false,
             active_recording: None,
             active_stream: None,
+            perf_frame_times: VecDeque::new(),
+            perf_last_tick_us: 0,
+            perf_tick_accum_us: 0,
+            perf_window_start: Instant::now(),
         };
         shell.init_production();
         if let Ok(reg) = LookRegistry::load_dir(looks_dir) {
@@ -1126,6 +1142,48 @@ impl Shell {
         self.preview_cache
             .insert(input_id.to_string(), (Instant::now(), png.clone()));
         Ok(png)
+    }
+
+    /// Records a completed frame for FPS calculation. Call once per
+    /// rendered frame (from the poll loop).
+    pub fn perf_mark_frame(&mut self) {
+        let now = Instant::now();
+        self.perf_frame_times.push_back(now);
+        // Keep only the last 120 frame times (2 seconds at 60fps).
+        while self.perf_frame_times.len() > 120 {
+            self.perf_frame_times.pop_front();
+        }
+    }
+
+    /// Records av_tick duration for render-time tracking.
+    pub fn perf_mark_tick(&mut self, duration_us: u64) {
+        self.perf_last_tick_us = duration_us;
+        self.perf_tick_accum_us += duration_us;
+    }
+
+    /// Returns (fps, render_ms, cpu_percent_estimate).
+    /// CPU% is estimated as (tick time / wall time) over the last second.
+    pub fn perf_stats(&mut self) -> (f32, f32, f32) {
+        let now = Instant::now();
+        // FPS from frame timestamps in the last second.
+        let cutoff = now - std::time::Duration::from_secs(1);
+        while self.perf_frame_times.front().map(|t| *t < cutoff).unwrap_or(false) {
+            self.perf_frame_times.pop_front();
+        }
+        let fps = self.perf_frame_times.len() as f32;
+        let render_ms = self.perf_last_tick_us as f32 / 1000.0;
+        // CPU% estimate: reset window every second.
+        let elapsed = now.duration_since(self.perf_window_start).as_micros() as f32;
+        let cpu_pct = if elapsed > 0.0 {
+            (self.perf_tick_accum_us as f32 / elapsed * 100.0).min(100.0)
+        } else {
+            0.0
+        };
+        if elapsed >= 1_000_000.0 {
+            self.perf_window_start = now;
+            self.perf_tick_accum_us = 0;
+        }
+        (fps, render_ms, cpu_pct)
     }
 
     /// Pulls a real video frame from the first available camera/media

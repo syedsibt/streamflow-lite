@@ -384,6 +384,17 @@ fn list_audio_devices(state: State<'_, AppState>) -> Vec<String> {
     lock(&state).map(|s| s.list_audio_devices()).unwrap_or_default()
 }
 
+/// Performance stats: (fps, render_ms, cpu_percent_estimate).
+#[tauri::command(rename_all = "snake_case")]
+fn perf_stats(state: State<'_, AppState>) -> Vec<f32> {
+    lock(&state)
+        .map(|mut s| {
+            let (fps, render_ms, cpu) = s.perf_stats();
+            vec![fps, render_ms, cpu]
+        })
+        .unwrap_or_default()
+}
+
 /// Removes a source from a scene.
 #[tauri::command(rename_all = "snake_case")]
 fn source_remove(state: State<'_, AppState>, scene_id: String, source_id: String) -> CmdResult<()> {
@@ -679,6 +690,7 @@ fn main() {
             source_add,
             list_cameras,
             list_audio_devices,
+            perf_stats,
             source_remove,
             source_reorder,
             source_set_visible,

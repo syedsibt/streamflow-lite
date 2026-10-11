@@ -16,6 +16,7 @@ import MixerPanel from "./production/MixerPanel";
 import MacrosPanel from "./production/MacrosPanel";
 import StreamPanel from "./production/StreamPanel";
 import RecordPanel from "./production/RecordPanel";
+import PerfPanel from "./PerfPanel";
 
 export default function ProductionView() {
   const init = useProduction((s) => s.init);
@@ -61,6 +62,9 @@ export default function ProductionView() {
         <SourcesPanel />
       </div>
       <div className="prod-center">
+        <div style={{ display: "flex", justifyContent: "flex-end", marginBottom: 8 }}>
+          <PerfPanel />
+        </div>
         <Monitors />
         <TransitionBar />
         <MultiviewGrid />
