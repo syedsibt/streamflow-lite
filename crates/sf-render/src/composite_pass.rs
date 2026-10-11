@@ -2,8 +2,9 @@
 //!
 //! [`CompositePass`] owns one small compute pipeline that replaces the CPU
 //! `composite_over`: it blends a rectangular region of `src` over `dst` at
-//! a destination offset with a global opacity (src-over-dst). `dst` is
-//! updated in place. The pipeline and bind-group layout are created once in
+//! a destination offset with a global opacity (src-over-dst), writing the
+//! result to a separate `out` texture (no read-write storage, for maximum
+//! GPU compatibility). The pipeline and bind-group layout are created once in
 //! [`CompositePass::new`]; the bind group and the small params uniform are
 //! built per call.
 
@@ -69,13 +70,13 @@ impl CompositePass {
         let bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("sf-render composite bgl"),
             entries: &[
-                // binding 0: dst texture, read-write storage (updated in place).
+                // binding 0: dst texture, sampled read-only.
                 bgl_entry(
                     0,
-                    wgpu::BindingType::StorageTexture {
-                        access: wgpu::StorageTextureAccess::ReadWrite,
-                        format: wgpu::TextureFormat::Rgba8Unorm,
+                    wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Float { filterable: false },
                         view_dimension: wgpu::TextureViewDimension::D2,
+                        multisampled: false,
                     },
                 ),
                 // binding 1: src texture, sampled (shader uses textureLoad,
@@ -88,9 +89,18 @@ impl CompositePass {
                         multisampled: false,
                     },
                 ),
-                // binding 2: params uniform.
+                // binding 2: out texture, write-only storage.
                 bgl_entry(
                     2,
+                    wgpu::BindingType::StorageTexture {
+                        access: wgpu::StorageTextureAccess::WriteOnly,
+                        format: wgpu::TextureFormat::Rgba8Unorm,
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                    },
+                ),
+                // binding 3: params uniform.
+                bgl_entry(
+                    3,
                     wgpu::BindingType::Buffer {
                         ty: wgpu::BufferBindingType::Uniform,
                         has_dynamic_offset: false,
@@ -112,7 +122,10 @@ impl CompositePass {
 
     /// Blends the rectangle `(src_x, src_y, src_w, src_h)` of `src` over
     /// `dst` at destination offset `(dst_x, dst_y)` with global `opacity`,
-    /// updating `dst` in place (src-over-dst).
+    /// writing the composited result to `out` (src-over-dst).
+    ///
+    /// `out_w`/`out_h` are the output texture dimensions, used for the
+    /// compute dispatch size.
     ///
     /// # Errors
     ///
@@ -123,6 +136,9 @@ impl CompositePass {
         ctx: &RenderContext,
         dst: &wgpu::TextureView,
         src: &wgpu::TextureView,
+        out: &wgpu::TextureView,
+        out_w: u32,
+        out_h: u32,
         src_rect: (u32, u32, u32, u32),
         dst_pos: (u32, u32),
         opacity: f32,
@@ -165,6 +181,10 @@ impl CompositePass {
                     },
                     wgpu::BindGroupEntry {
                         binding: 2,
+                        resource: wgpu::BindingResource::TextureView(out),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 3,
                         resource: params_buf.as_entire_binding(),
                     },
                 ],
@@ -183,8 +203,8 @@ impl CompositePass {
             pass.set_pipeline(&self.pipeline);
             pass.set_bind_group(0, &bg, &[]);
             // Shader uses `@workgroup_size(8, 8)` and guards against the
-            // source rect.
-            pass.dispatch_workgroups(src_w.div_ceil(8), src_h.div_ceil(8), 1);
+            // output texture dimensions.
+            pass.dispatch_workgroups(out_w.div_ceil(8), out_h.div_ceil(8), 1);
         }
         ctx.queue().submit(Some(encoder.finish()));
         Ok(())

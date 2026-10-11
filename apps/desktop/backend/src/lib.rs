@@ -395,6 +395,10 @@ pub struct Shell {
     media_producers: HashMap<String, av_backends::SendProducer>,
     /// Last decoded video frame per media source (freeze on end-of-stream).
     media_last_frame: HashMap<String, (u32, u32, Vec<u8>)>,
+    /// Negotiated camera format per camera source id, e.g.
+    /// `"mjpeg 1920x1080 @30fps (via mjpeg)"` — what the camera actually
+    /// gave, for diagnostics.
+    camera_formats: HashMap<String, String>,
     /// Real audio mixer (sf-audio); fed by media-source audio chunks.
     audio_mixer: sf_audio::Mixer,
     /// Per-source meter peaks from the last audio tick.
@@ -417,6 +421,12 @@ pub struct Shell {
     perf_last_bytes: u64,
     /// Last bitrate sample time.
     perf_last_br_time: Instant,
+    /// Frames skipped because render/encode couldn't keep up (blueprint
+    /// `skipped_render`: our PC too slow — distinct from network drops).
+    perf_skipped_render: u64,
+    /// Packets dropped because the network couldn't keep up (blueprint
+    /// `dropped_network`: internet too slow — audio is never dropped).
+    perf_dropped_network: u64,
 }
 
 impl Shell {
@@ -445,6 +455,7 @@ impl Shell {
             macros: Vec::new(),
             media_producers: HashMap::new(),
             media_last_frame: HashMap::new(),
+            camera_formats: HashMap::new(),
             audio_mixer: sf_audio::Mixer::new(),
             meter_values: HashMap::new(),
             meters_live: false,
@@ -456,6 +467,8 @@ impl Shell {
             perf_window_start: Instant::now(),
             perf_last_bytes: 0,
             perf_last_br_time: Instant::now(),
+            perf_skipped_render: 0,
+            perf_dropped_network: 0,
         };
         shell.init_production();
         // A default input so the UI is usable immediately (the engine
@@ -489,6 +502,7 @@ impl Shell {
             macros: Vec::new(),
             media_producers: HashMap::new(),
             media_last_frame: HashMap::new(),
+            camera_formats: HashMap::new(),
             audio_mixer: sf_audio::Mixer::new(),
             meter_values: HashMap::new(),
             meters_live: false,
@@ -500,6 +514,8 @@ impl Shell {
             perf_window_start: Instant::now(),
             perf_last_bytes: 0,
             perf_last_br_time: Instant::now(),
+            perf_skipped_render: 0,
+            perf_dropped_network: 0,
         };
         shell.init_production();
         if let Ok(reg) = LookRegistry::load_dir(looks_dir) {
@@ -1177,10 +1193,13 @@ impl Shell {
             .unwrap_or_default()
     }
 
-    /// Returns (fps, render_ms, cpu_percent_estimate, stream_kbps).
+    /// Returns (fps, render_ms, cpu_percent_estimate, stream_kbps,
+    /// skipped_render, dropped_network).
     /// CPU% is estimated as (tick time / wall time) over the last second.
     /// stream_kbps is the RTMP upload bitrate (0 when not streaming).
-    pub fn perf_stats(&mut self) -> (f32, f32, f32, f32) {
+    /// skipped_render counts frames the render/encode stage couldn't keep up
+    /// with; dropped_network counts packets the network couldn't take.
+    pub fn perf_stats(&mut self) -> (f32, f32, f32, f32, f32, f32) {
         let now = Instant::now();
         // FPS from frame timestamps in the last second.
         let cutoff = now - std::time::Duration::from_secs(1);
@@ -1216,7 +1235,14 @@ impl Shell {
             self.perf_last_bytes = 0;
             0.0
         };
-        (fps, render_ms, cpu_pct, kbps)
+        (
+            fps,
+            render_ms,
+            cpu_pct,
+            kbps,
+            self.perf_skipped_render as f32,
+            self.perf_dropped_network as f32,
+        )
     }
 
     /// Pulls a real video frame from the first available camera/media
@@ -1235,6 +1261,24 @@ impl Shell {
                 ) && self.media_producers.contains_key(&src.id)
             })
             .map(|src| src.id.clone())?;
+        // When the program feed is live (recording/streaming), the media
+        // tick already caches each program frame in `media_last_frame`.
+        // Serve the preview from that cache (downscaled) so the preview
+        // never consumes/steals live producer frames from the program feed:
+        // independent, lightweight preview per the realtime blueprint.
+        let program_live = self.active_recording.is_some() || self.active_stream.is_some();
+        if program_live {
+            if let Some((w, h, px)) = self.media_last_frame.get(&source_id).cloned() {
+                if w == width && h == height {
+                    return Some(px);
+                }
+                return Some(av_backends::resize_rgba_nearest(
+                    &px, w, h, width, height,
+                ));
+            }
+        }
+        // Idle (or no program frame yet): the preview is the only consumer,
+        // so pulling directly is safe.
         self.pull_media_frame(&source_id, width, height)
     }
 }

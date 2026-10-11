@@ -10,9 +10,8 @@
 //! - REAL: media-file sources (decode via `MediaFileProducer`, frames into
 //!   the composite, audio into the `sf-audio` mixer → live meters);
 //!   recording the program bus to MP4/MKV via `sf-encode` + `sf-output`
-//!   (driven by [`Shell::av_tick`], which the adapter calls on its 66 ms
-//!   poll loop — so the shell records at ~15 fps; production will move to
-//!   a dedicated thread at 1080p60);
+//!   (driven by [`Shell::av_tick`], which the adapter calls on its fixed
+//!   33.3 ms media tick — so the shell records at 30 fps);
 //!   RTMP streaming attempts via `sf-output`'s `Streamer` + `RealTransport`
 //!   (connects for real; fails cleanly with a redacted error when the
 //!   server is unreachable; exponential-backoff reconnect is live).
@@ -48,13 +47,13 @@ use super::{Shell, ShellError};
 use crate::production::crossfade;
 
 /// Program-bus capture size for recording/streaming in the shell.
-/// 640×360 keeps libx264 ultrafast inside the 66 ms poll budget on modest
-/// CPUs; production will capture at the full program size on a thread.
+/// 640×360 keeps libx264 ultrafast inside the 33.3 ms media-tick budget on
+/// modest CPUs; production will capture at the full program size on a thread.
 pub const AV_W: u32 = 640;
 /// See [`AV_W`].
 pub const AV_H: u32 = 360;
-/// Microseconds per output frame at the ~15 fps poll cadence.
-pub const AV_FRAME_US: i64 = 66_667;
+/// Microseconds per output frame at the 30 fps media-tick cadence.
+pub const AV_FRAME_US: i64 = 33_333;
 /// Recording bitrate (bits/s) for the shell.
 const RECORD_BITRATE_BPS: u32 = 4_000_000;
 
@@ -164,7 +163,7 @@ impl ProducerKind {
 }
 
 /// Nearest-neighbor RGBA resize (shell-grade; production will use the GPU).
-fn resize_rgba_nearest(src: &[u8], sw: u32, sh: u32, dw: u32, dh: u32) -> Vec<u8> {
+pub(crate) fn resize_rgba_nearest(src: &[u8], sw: u32, sh: u32, dw: u32, dh: u32) -> Vec<u8> {
     let (sw, sh, dw, dh) = (sw.max(1), sh.max(1), dw.max(1), dh.max(1));
     let mut out = vec![0u8; dw as usize * dh as usize * 4];
     for y in 0..dh {
@@ -242,11 +241,22 @@ impl Shell {
                 ))
             }
         };
+        // Remember what the camera actually negotiated (codec/res/fps) for
+        // diagnostics — shown in the UI, not just what was requested.
+        self.camera_formats
+            .insert(source_id.to_string(), prod.negotiated_format().to_string());
         self.media_producers.insert(
             source_id.to_string(),
             SendProducer(ProducerKind::Camera(prod)),
         );
         Ok(())
+    }
+
+    /// Negotiated camera format for a source, e.g.
+    /// `"mjpeg 1920x1080 @30fps (via mjpeg)"`. `None` for non-camera
+    /// sources or when the camera was never opened.
+    pub fn camera_format(&self, source_id: &str) -> Option<String> {
+        self.camera_formats.get(source_id).cloned()
     }
 
     /// Pulls the next decoded frame for a media source, resized to the
@@ -590,6 +600,9 @@ impl Shell {
         }
         if let Some(m) = failed {
             // Fail loudly: drop the session, surface the error.
+            // The frame never made it through encode/write: count it as
+            // skipped on the render side (not a network drop).
+            self.perf_skipped_render += 1;
             self.active_recording = None;
             self.record_runtime = None;
             self.record_error = Some(m);
@@ -765,13 +778,20 @@ impl Shell {
             Ok(pkts) => {
                 for p in &pkts {
                     if let Err(e) = a.streamer.send_packet(p) {
+                        // Network couldn't take the packet: count it as a
+                        // network drop (distinct from render-side skips).
+                        self.perf_dropped_network += 1;
                         send_failed =
                             Some(sanitize_stream_error(&url, &key, "RTMP send failed", &e));
                         break;
                     }
                 }
             }
-            Err(e) => send_failed = Some(format!("encode video: {e}")),
+            Err(e) => {
+                // Encode itself failed: render-side skip, not a network drop.
+                self.perf_skipped_render += 1;
+                send_failed = Some(format!("encode video: {e}"));
+            }
         }
         if send_failed.is_none() && !audio.is_empty() {
             if let Some(aenc) = a.audio_enc.as_mut() {
@@ -781,13 +801,17 @@ impl Shell {
                     Ok(pkts) => {
                         for p in &pkts {
                             if let Err(e) = a.streamer.send_packet(p) {
+                                self.perf_dropped_network += 1;
                                 send_failed =
                                     Some(sanitize_stream_error(&url, &key, "RTMP send failed", &e));
                                 break;
                             }
                         }
                     }
-                    Err(e) => send_failed = Some(format!("encode audio: {e}")),
+                    Err(e) => {
+                        self.perf_skipped_render += 1;
+                        send_failed = Some(format!("encode audio: {e}"));
+                    }
                 }
             }
         }
@@ -806,7 +830,8 @@ impl Shell {
     // Poll entry
     // ------------------------------------------------------------------
 
-    /// Called by the adapter's 66 ms poll loop (after `transition_tick`):
+    /// Called by the adapter's fixed 33.3 ms media tick (after `transition_tick` runs
+    /// on the separate 66 ms UI poll loop):
     /// renders one program frame, pumps audio (meters + record/stream
     /// feed), and advances recording and streaming. Never panics;
     /// backend failures degrade to lifecycle `Error` states.
@@ -825,7 +850,12 @@ impl Shell {
         }
         let frame = match self.program_frame_raw(AV_W, AV_H) {
             Ok(f) => f,
-            Err(_) => return,
+            Err(_) => {
+                // Render stage couldn't produce a frame this tick: count it
+                // as skipped (render-side, not network).
+                self.perf_skipped_render += 1;
+                return;
+            }
         };
         // Audio metering runs on every tick; the same mixed block feeds
         // the record/stream encoders below.

@@ -148,6 +148,8 @@ export const api = {
     });
   },
   listCameras: () => cmd<string[]>("list_cameras", {}),
+  cameraFormat: (source_id: string) =>
+    cmd<string | null>("camera_format", { source_id }),
   listAudioDevices: () => cmd<string[]>("list_audio_devices", {}),
   perfStats: () => cmd<number[]>("perf_stats", {}),
   streamEncoderName: () => cmd<string>("stream_encoder_name", {}),

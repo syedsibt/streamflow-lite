@@ -10,19 +10,23 @@ export default function PerfPanel() {
   const [renderMs, setRenderMs] = useState(0);
   const [cpu, setCpu] = useState(0);
   const [kbps, setKbps] = useState(0);
+  const [skipped, setSkipped] = useState(0);
+  const [dropped, setDropped] = useState(0);
   const [encoder, setEncoder] = useState("");
 
   useEffect(() => {
     let cancelled = false;
     const poll = async () => {
       try {
-        const [f, r, c, k] = await api.perfStats();
+        const [f, r, c, k, sk, dr] = await api.perfStats();
         const enc = await api.streamEncoderName();
         if (!cancelled) {
           setFps(Math.round(f));
           setRenderMs(Math.round(r * 10) / 10);
           setCpu(Math.round(c));
           setKbps(Math.round(k));
+          setSkipped(Math.round(sk ?? 0));
+          setDropped(Math.round(dr ?? 0));
           setEncoder(enc);
         }
       } catch {
@@ -49,12 +53,16 @@ export default function PerfPanel() {
         borderRadius: 6,
         alignItems: "center",
       }}
-      title="Performance: frames/sec, backend render ms, CPU% estimate"
+      title="Performance: frames/sec, backend render ms, CPU% estimate, skipped (render/encode) vs dropped (network) frames"
     >
       <span>FPS: {fps}</span>
       <span>Render: {renderMs} ms</span>
       <span>CPU: {cpu}%</span>
       <span>↑ {kbps} kbps</span>
+      <span title="Frames skipped: render/encode couldn't keep up (PC-side)">
+        Skip: {skipped}
+      </span>
+      <span title="Packets dropped: network couldn't keep up">Drop: {dropped}</span>
       {encoder && <span>Enc: {encoder}</span>}
     </div>
   );

@@ -11,6 +11,9 @@
 //! - Engine → UI events are polled from `Shell::drain_events()` on a 66 ms
 //!   background thread and re-emitted as Tauri `"sf-event"` payloads; the
 //!   frontend routes on the spec §9 `event` tag inside each payload.
+//! - The media pipeline (`Shell::av_tick`: render + encode) runs on its own
+//!   fixed 33.3 ms background thread (30 fps master tick), separate from the
+//!   66 ms UI event poll, so slow UI work can never stall the program feed.
 //! - `preview_get_frame` returns a PNG data URL throttled to ~10 Hz by the
 //!   backend. Production will replace this with a faster zero-copy path
 //!   (shared texture / WebView streaming) — the command shape stays.
@@ -378,6 +381,14 @@ fn list_cameras(state: State<'_, AppState>) -> Vec<String> {
     lock(&state).map(|s| s.list_cameras()).unwrap_or_default()
 }
 
+/// Negotiated camera format for a source, e.g.
+/// `"mjpeg 1920x1080 @30fps (via mjpeg)"` — what the camera actually gave,
+/// not just what was requested. `None` for non-camera sources.
+#[tauri::command(rename_all = "snake_case")]
+fn camera_format(state: State<'_, AppState>, source_id: String) -> Option<String> {
+    lock(&state).ok().and_then(|s| s.camera_format(&source_id))
+}
+
 /// Lists available audio input devices (Windows DirectShow; empty elsewhere).
 #[tauri::command(rename_all = "snake_case")]
 fn list_audio_devices(state: State<'_, AppState>) -> Vec<String> {
@@ -390,13 +401,14 @@ fn stream_encoder_name(state: State<'_, AppState>) -> String {
     lock(&state).map(|s| s.stream_encoder_name()).unwrap_or_default()
 }
 
-/// Performance stats: (fps, render_ms, cpu_percent_estimate, stream_kbps).
+/// Performance stats: (fps, render_ms, cpu_percent_estimate, stream_kbps,
+/// skipped_render, dropped_network).
 #[tauri::command(rename_all = "snake_case")]
 fn perf_stats(state: State<'_, AppState>) -> Vec<f32> {
     lock(&state)
         .map(|mut s| {
-            let (fps, render_ms, cpu, kbps) = s.perf_stats();
-            vec![fps, render_ms, cpu, kbps]
+            let (fps, render_ms, cpu, kbps, skipped, dropped) = s.perf_stats();
+            vec![fps, render_ms, cpu, kbps, skipped, dropped]
         })
         .unwrap_or_default()
 }
@@ -640,8 +652,27 @@ fn main() {
             Shell::new().expect("engine must open a GPU adapter (headless: lavapipe)"),
         )))
         .setup(|app| {
+            // Media pipeline: fixed 33.3 ms master tick (30 fps). Renders one
+            // program frame and advances record/stream encoders. Runs on its
+            // own thread so UI polling, PNG previews, and transitions can
+            // never stall the program feed. If the camera is late, the last
+            // frame is repeated (tick never waits).
+            let media_handle = app.handle().clone();
+            std::thread::spawn(move || loop {
+                let tick = std::time::Instant::now();
+                if let Ok(mut s) = media_handle.state::<AppState>().0.lock() {
+                    // Never panics; backend failures degrade to Error states.
+                    s.av_tick();
+                }
+                // Monotonic fixed cadence: sleep the remainder of 33.3 ms.
+                let elapsed = tick.elapsed();
+                if elapsed < Duration::from_micros(33_333) {
+                    std::thread::sleep(Duration::from_micros(33_333) - elapsed);
+                }
+            });
             // Engine → UI event pump: advance auto-transitions, then poll
-            // the shell and re-emit events.
+            // the shell and re-emit events. 66 ms is plenty for UI state;
+            // it is deliberately decoupled from the 33 ms media tick.
             let handle = app.handle().clone();
             std::thread::spawn(move || loop {
                 std::thread::sleep(Duration::from_millis(66));
@@ -652,11 +683,9 @@ fn main() {
                     .map(|mut s| {
                         // Wall-clock transition progress; emits
                         // `production.transition_progress` / `transition_done`.
-                        // Then the AV backends: audio metering, recording and
-                        // streaming ticks. Not exposed as commands — the loop
-                        // owns them.
+                        // AV work lives on the media thread above — this loop
+                        // only owns UI-facing state.
                         s.transition_tick();
-                        s.av_tick();
                         s.drain_events()
                     })
                     .unwrap_or_default();
@@ -695,6 +724,7 @@ fn main() {
             scene_list,
             source_add,
             list_cameras,
+            camera_format,
             list_audio_devices,
             perf_stats,
             stream_encoder_name,

@@ -857,6 +857,7 @@ impl Shell {
         self.mixer.channels.remove(source_id);
         self.media_producers.remove(source_id);
         self.media_last_frame.remove(source_id);
+        self.camera_formats.remove(source_id);
         self.meter_values.remove(source_id);
         if let Some(input_id) = removed.input_id {
             self.engine.state_mut().inputs.retain(|i| i.id != input_id);

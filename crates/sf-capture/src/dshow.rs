@@ -225,12 +225,18 @@ pub struct DshowProducer {
     demux: DemuxDecoder,
     info: StreamInfo,
     deadline: Arc<ReadDeadline>,
+    /// Human-readable description of what the camera actually negotiated
+    /// (codec, resolution, fps) — e.g. `"mjpeg 1920x1080 @30fps"`.
+    /// Shown in diagnostics so users see what the camera gave, not just
+    /// what was requested.
+    negotiated_format: String,
 }
 
 /// Max time to wait for a frame from a dshow device before giving up
-/// on that poll (100ms). The poll loop runs every 66ms; a longer timeout
-/// would stall it. The next poll tries again.
-const READ_TIMEOUT_US: u64 = 100_000;
+/// on that tick (25ms). The media tick runs every 33.3ms; a longer timeout
+/// would stall it. When no frame is ready the consumer repeats the last
+/// frame (latest-frame-wins) and the next tick tries again.
+const READ_TIMEOUT_US: u64 = 25_000;
 
 /// Max time to wait for a dshow device to open (15 seconds per attempt).
 const OPEN_TIMEOUT_US: u64 = 15_000_000;
@@ -242,6 +248,11 @@ impl DshowProducer {
     /// Tries the requested format first, then falls back to letting dshow
     /// negotiate (some virtual cameras reject explicit `video_size` /
     /// `pixel_format` options).
+    ///
+    /// Format preference (1080p smoothness): **MJPEG first** — raw YUY2 at
+    /// 1080p saturates USB bandwidth and drops fps; MJPEG/NV12 keep the
+    /// camera at full rate. Falls back through raw formats to fully
+    /// negotiated.
     pub fn open(
         device: &str,
         width: u32,
@@ -250,26 +261,44 @@ impl DshowProducer {
     ) -> Result<Self, CaptureError> {
         ensure_init();
         // Try strict format first, then progressively looser.
-        let attempts: Vec<Vec<(String, String)>> = vec![
-            vec![
-                ("video_size".into(), format!("{width}x{height}")),
-                ("framerate".into(), fps.to_string()),
-                ("pixel_format".into(), "yuv420p".into()),
-                // Critical for live: disable FFmpeg's internal buffering,
-                // otherwise frames queue up and the preview lags by seconds
-                // or even minutes behind real time.
-                ("fflags".into(), "nobuffer".into()),
-            ],
-            vec![
-                ("video_size".into(), format!("{width}x{height}")),
-                ("framerate".into(), fps.to_string()),
-                ("fflags".into(), "nobuffer".into()),
-            ],
-            vec![("fflags".into(), "nobuffer".into())], // Let dshow negotiate everything.
+        // Each entry is (label, dshow options). The label is recorded in
+        // `negotiated_format` for diagnostics.
+        let attempts: Vec<(&str, Vec<(String, String)>)> = vec![
+            (
+                "mjpeg",
+                vec![
+                    ("vcodec".into(), "mjpeg".into()),
+                    ("video_size".into(), format!("{width}x{height}")),
+                    ("framerate".into(), fps.to_string()),
+                    // Critical for live: disable FFmpeg's internal buffering,
+                    // otherwise frames queue up and the preview lags by seconds
+                    // or even minutes behind real time.
+                    ("fflags".into(), "nobuffer".into()),
+                ],
+            ),
+            (
+                "yuv420p",
+                vec![
+                    ("video_size".into(), format!("{width}x{height}")),
+                    ("framerate".into(), fps.to_string()),
+                    ("pixel_format".into(), "yuv420p".into()),
+                    ("fflags".into(), "nobuffer".into()),
+                ],
+            ),
+            (
+                "size+fps",
+                vec![
+                    ("video_size".into(), format!("{width}x{height}")),
+                    ("framerate".into(), fps.to_string()),
+                    ("fflags".into(), "nobuffer".into()),
+                ],
+            ),
+            // Let dshow negotiate everything.
+            ("negotiated", vec![("fflags".into(), "nobuffer".into())]),
         ];
         let mut last_err = String::new();
-        for opts in &attempts {
-            match Self::open_with_opts(device, opts) {
+        for (label, opts) in &attempts {
+            match Self::open_with_opts(device, label, opts) {
                 Ok(p) => return Ok(p),
                 Err(e) => last_err = e,
             }
@@ -281,6 +310,7 @@ impl DshowProducer {
 
     fn open_with_opts(
         device: &str,
+        label: &str,
         opts: &[(String, String)],
     ) -> Result<Self, String> {
         let fmt_name = CString::new("dshow").unwrap();
@@ -358,17 +388,47 @@ impl DshowProducer {
         // SAFETY: `ctx` is a valid open input context owned by us now;
         // `Input::wrap` takes ownership and closes it on drop.
         let ictx = unsafe { ff::format::context::Input::wrap(ctx) };
+        // Record what the camera actually negotiated (codec of the best
+        // video stream), before the context moves into the demuxer.
+        let negotiated_codec: String = ictx
+            .streams()
+            .best(ff::media::Type::Video)
+            .and_then(|s| {
+                ff::codec::context::Context::from_parameters(s.parameters())
+                    .ok()?
+                    .decoder()
+                    .video()
+                    .ok()?
+                    .codec()
+                    .map(|c| c.name().to_string())
+            })
+            .unwrap_or_else(|| "unknown".to_string());
         let mut demux = DemuxDecoder::from_input(ictx, 33_333)
             .map_err(|e| format!("demuxer: {e}"))?;
         // Live capture: never accumulate a frame backlog (prevents
         // unbounded memory growth when the device outpaces the poll loop).
         demux.set_live(true);
         let info = demux.stream_info(false);
+        let negotiated_format = format!(
+            "{} {}x{} @{:.0}fps (via {})",
+            negotiated_codec,
+            info.width,
+            info.height,
+            info.fps(),
+            label,
+        );
         Ok(Self {
             demux,
             info,
             deadline,
+            negotiated_format,
         })
+    }
+
+    /// Human-readable description of what the camera actually negotiated,
+    /// e.g. `"mjpeg 1920x1080 @30fps (via mjpeg)"`.
+    pub fn negotiated_format(&self) -> &str {
+        &self.negotiated_format
     }
 
     /// Open the first available DirectShow camera.
