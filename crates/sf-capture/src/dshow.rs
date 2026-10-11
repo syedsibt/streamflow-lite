@@ -141,6 +141,10 @@ pub struct DshowProducer {
 impl DshowProducer {
     /// Open `device` (a name from [`list_devices`]) at `width`×`height`,
     /// `fps`. Frames are converted to RGBA8 by the shared demuxer.
+    ///
+    /// Tries the requested format first, then falls back to letting dshow
+    /// negotiate (some virtual cameras reject explicit `video_size` /
+    /// `pixel_format` options).
     pub fn open(
         device: &str,
         width: u32,
@@ -148,17 +152,44 @@ impl DshowProducer {
         fps: u32,
     ) -> Result<Self, CaptureError> {
         ensure_init();
+        // Try strict format first, then progressively looser.
+        let attempts: Vec<Vec<(String, String)>> = vec![
+            vec![
+                ("video_size".into(), format!("{width}x{height}")),
+                ("framerate".into(), fps.to_string()),
+                ("pixel_format".into(), "yuv420p".into()),
+            ],
+            vec![
+                ("video_size".into(), format!("{width}x{height}")),
+                ("framerate".into(), fps.to_string()),
+            ],
+            vec![], // Let dshow negotiate everything.
+        ];
+        let mut last_err = String::new();
+        for opts in &attempts {
+            match Self::open_with_opts(device, opts) {
+                Ok(p) => return Ok(p),
+                Err(e) => last_err = e,
+            }
+        }
+        Err(CaptureError::OpenFailed(format!(
+            "dshow: cannot open camera '{device}' (no such device or it is in use): {last_err}"
+        )))
+    }
+
+    fn open_with_opts(
+        device: &str,
+        opts: &[(String, String)],
+    ) -> Result<Self, String> {
         let fmt_name = CString::new("dshow").unwrap();
         let fmt = unsafe { ff::ffi::av_find_input_format(fmt_name.as_ptr()) };
         if fmt.is_null() {
-            return Err(CaptureError::OpenFailed(
-                "FFmpeg was built without dshow support".into(),
-            ));
+            return Err("FFmpeg was built without dshow support".into());
         }
 
         // `video=Device Name` selects the capture device.
         let url = CString::new(format!("video={device}"))
-            .map_err(|_| CaptureError::OpenFailed("device name contains NUL".into()))?;
+            .map_err(|_| "device name contains NUL".to_string())?;
 
         let mut dict: *mut ff::ffi::AVDictionary = ptr::null_mut();
         let mut set_opt = |k: &str, v: &str| unsafe {
@@ -166,11 +197,9 @@ impl DshowProducer {
             let val = CString::new(v).unwrap();
             ff::ffi::av_dict_set(&mut dict, key.as_ptr(), val.as_ptr(), 0);
         };
-        set_opt("video_size", &format!("{width}x{height}"));
-        set_opt("framerate", &fps.to_string());
-        // Ask for a common raw format; the demuxer's swscale converts to
-        // RGBA regardless of what dshow negotiates.
-        set_opt("pixel_format", "yuv420p");
+        for (k, v) in opts {
+            set_opt(k, v);
+        }
 
         let mut ctx: *mut ff::ffi::AVFormatContext = ptr::null_mut();
         let ret = unsafe {
@@ -183,16 +212,14 @@ impl DshowProducer {
         };
         unsafe { ff::ffi::av_dict_free(&mut dict) };
         if ret < 0 || ctx.is_null() {
-            return Err(CaptureError::OpenFailed(format!(
-                "dshow: cannot open camera '{device}' (no such device or it is in use)"
-            )));
+            return Err("avformat_open_input failed".into());
         }
 
         // SAFETY: `ctx` is a valid open input context owned by us now;
         // `Input::wrap` takes ownership and closes it on drop.
         let ictx = unsafe { ff::format::context::Input::wrap(ctx) };
-        let nominal_frame_us = if fps > 0 { 1_000_000u64 / fps as u64 } else { 33_333 };
-        let demux = DemuxDecoder::from_input(ictx, nominal_frame_us)?;
+        let demux = DemuxDecoder::from_input(ictx, 33_333)
+            .map_err(|e| format!("demuxer: {e}"))?;
         let info = demux.stream_info(false);
         Ok(Self { demux, info })
     }

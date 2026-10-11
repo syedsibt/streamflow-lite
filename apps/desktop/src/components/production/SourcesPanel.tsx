@@ -176,9 +176,9 @@ export default function SourcesPanel() {
           <button className="btn ghost" onClick={add}>
             Add
           </button>
-          {(kind === "camera" || kind === "screen" || kind === "media" || kind === "text") && (
+          {(kind === "screen") && (
             <div className="note">
-              This source kind has no capture backend yet — it will show a
+              Screen capture has no backend yet — it will show a
               "pending capture backend" badge.
             </div>
           )}
