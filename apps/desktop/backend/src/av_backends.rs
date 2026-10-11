@@ -205,9 +205,16 @@ impl Shell {
     /// Called from `source_add` before the source is pushed, so a missing
     /// camera fails cleanly.
     #[cfg(windows)]
-    pub(crate) fn open_camera_producer(&mut self, source_id: &str) -> Result<(), ShellError> {
-        let prod = sf_capture::dshow::DshowProducer::open_default(1280, 720, 30)
-            .map_err(|e| ShellError::Capture(format!("cannot open camera: {e}")))?;
+    pub(crate) fn open_camera_producer(
+        &mut self,
+        source_id: &str,
+        device: Option<&str>,
+    ) -> Result<(), ShellError> {
+        let prod = match device {
+            Some(d) => sf_capture::dshow::DshowProducer::open(d, 1280, 720, 30),
+            None => sf_capture::dshow::DshowProducer::open_default(1280, 720, 30),
+        }
+        .map_err(|e| ShellError::Capture(format!("cannot open camera: {e}")))?;
         self.media_producers.insert(
             source_id.to_string(),
             SendProducer(ProducerKind::Camera(prod)),

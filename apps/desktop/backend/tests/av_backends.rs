@@ -43,7 +43,7 @@ fn make_test_media(path: &str) {
 
 fn scene_with_pattern(s: &mut Shell, name: &str) -> String {
     let sc = s.scene_create(name).id;
-    s.source_add(&sc, "test_pattern", "pat", [0, 0, 0], None, None)
+    s.source_add(&sc, "test_pattern", "pat", [0, 0, 0], None, None, None)
         .expect("add test pattern source");
     s.production_set_program(&sc).expect("set program");
     sc
@@ -144,7 +144,7 @@ fn media_source_renders_and_meters_go_live() {
     let mut s = shell();
     let sc = s.scene_create("Media").id;
     let src = s
-        .source_add(&sc, "media", "clip", [0, 0, 0], None, Some(media))
+        .source_add(&sc, "media", "clip", [0, 0, 0], None, Some(media), None)
         .expect("add media source");
     assert_eq!(src.status, "ready", "media source should be ready");
     s.production_set_program(&sc).unwrap();
@@ -176,6 +176,7 @@ fn media_source_bad_path_fails_cleanly() {
             [0, 0, 0],
             None,
             Some("/tmp/does-not-exist.mp4"),
+            None,
         )
         .expect_err("bad path must fail");
     assert!(err.to_string().contains("cannot open media"));

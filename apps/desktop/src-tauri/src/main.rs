@@ -353,6 +353,7 @@ fn source_add(
     color_b: u8,
     text: Option<String>,
     path: Option<String>,
+    device: Option<String>,
 ) -> CmdResult<SourceState> {
     lock(&state)?
         .source_add(
@@ -362,8 +363,22 @@ fn source_add(
             [color_r, color_g, color_b],
             text.as_deref(),
             path.as_deref(),
+            device.as_deref(),
         )
         .map_err(ue)
+}
+
+/// Lists available camera devices (Windows DirectShow; empty elsewhere).
+#[tauri::command(rename_all = "snake_case")]
+fn list_cameras() -> Vec<String> {
+    #[cfg(windows)]
+    {
+        sf_capture::dshow::list_devices().unwrap_or_default()
+    }
+    #[cfg(not(windows))]
+    {
+        Vec::new()
+    }
 }
 
 /// Removes a source from a scene.
@@ -659,6 +674,7 @@ fn main() {
             scene_duplicate,
             scene_list,
             source_add,
+            list_cameras,
             source_remove,
             source_reorder,
             source_set_visible,

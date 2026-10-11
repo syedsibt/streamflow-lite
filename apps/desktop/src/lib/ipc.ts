@@ -111,6 +111,7 @@ export const api = {
     let color_b = 0;
     let text: string | null = null;
     let path: string | null = null;
+    let device: string | null = null;
     if ("color" in kind) {
       kindStr = "color";
       color_r = kind.color.r;
@@ -118,6 +119,7 @@ export const api = {
       color_b = kind.color.b;
     } else if ("camera" in kind) {
       kindStr = "camera";
+      device = kind.camera.device ?? null;
     } else if ("screen" in kind) {
       kindStr = "screen";
     } else if ("media" in kind) {
@@ -136,8 +138,10 @@ export const api = {
       color_b,
       text,
       path,
+      device,
     });
   },
+  listCameras: () => cmd<string[]>("list_cameras", {}),
   sourceRemove: (scene_id: string, source_id: string) =>
     cmd<void>("source_remove", { scene_id, source_id }),
   sourceReorder: (scene_id: string, order: string[]) =>

@@ -1,5 +1,6 @@
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import { useProduction } from "../../lib/productionStore";
+import { api } from "../../lib/ipc";
 import { isPendingCaptureSource, type SourceKind } from "../../lib/types";
 
 const KIND_OPTIONS = [
@@ -28,6 +29,27 @@ export default function SourcesPanel() {
   const [color, setColor] = useState("#3366ff");
   const [text, setText] = useState("");
   const [mediaPath, setMediaPath] = useState("");
+  const [cameras, setCameras] = useState<string[]>([]);
+  const [cameraDevice, setCameraDevice] = useState<string>("");
+
+  // Load camera devices when the camera kind is selected.
+  useEffect(() => {
+    if (kind !== "camera") return;
+    let cancelled = false;
+    void api
+      .listCameras()
+      .then((list) => {
+        if (cancelled) return;
+        setCameras(list);
+        setCameraDevice((prev) => prev || list[0] || "");
+      })
+      .catch(() => {
+        if (!cancelled) setCameras([]);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [kind]);
 
   const scene = state?.scenes.find((s) => s.id === state.preview_scene_id) ?? null;
   const sources = [...(scene?.sources ?? [])].sort((a, b) => a.order - b.order);
@@ -49,7 +71,7 @@ export default function SourcesPanel() {
       case "text":
         return { text: { text } };
       case "camera":
-        return { camera: {} };
+        return { camera: { device: cameraDevice || null } };
       case "screen":
         return { screen: {} };
       default:
@@ -172,6 +194,22 @@ export default function SourcesPanel() {
               value={mediaPath}
               onChange={(e) => setMediaPath(e.target.value)}
             />
+          )}
+          {kind === "camera" && (
+            <select
+              value={cameraDevice}
+              onChange={(e) => setCameraDevice(e.target.value)}
+              title="Camera device"
+            >
+              {cameras.length === 0 && (
+                <option value="">No cameras found</option>
+              )}
+              {cameras.map((c) => (
+                <option key={c} value={c}>
+                  {c}
+                </option>
+              ))}
+            </select>
           )}
           <button className="btn ghost" onClick={add}>
             Add

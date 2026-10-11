@@ -63,8 +63,12 @@ pub enum SourceKind {
         /// Blue 0-255.
         b: u8,
     },
-    /// Real camera (pending: `sf-capture` stub).
-    Camera,
+    /// Real camera on Windows (DirectShow); `device` selects which
+    /// camera (None = first available).
+    Camera {
+        /// DirectShow device name, e.g. from `list_cameras`.
+        device: Option<String>,
+    },
     /// Screen share (pending: `sf-capture` stub).
     Screen,
     /// Media file (real: decoded via `sf-capture`'s `MediaFileProducer`).
@@ -88,9 +92,9 @@ impl SourceKind {
         match self {
             SourceKind::TestPattern | SourceKind::Color { .. } | SourceKind::Media { .. } => true,
             #[cfg(windows)]
-            SourceKind::Camera => true,
+            SourceKind::Camera { .. } => true,
             #[cfg(not(windows))]
-            SourceKind::Camera => false,
+            SourceKind::Camera { .. } => false,
             _ => false,
         }
     }
@@ -501,6 +505,7 @@ impl Shell {
             [0, 0, 0],
             None,
             None,
+            None,
         );
     }
 
@@ -708,6 +713,7 @@ fn parse_source_kind(
     color: [u8; 3],
     text: Option<&str>,
     path: Option<&str>,
+    device: Option<&str>,
 ) -> Result<SourceKind, ShellError> {
     match kind {
         "test_pattern" => Ok(SourceKind::TestPattern),
@@ -716,7 +722,9 @@ fn parse_source_kind(
             g: color[1],
             b: color[2],
         }),
-        "camera" => Ok(SourceKind::Camera),
+        "camera" => Ok(SourceKind::Camera {
+            device: device.map(|d| d.to_string()),
+        }),
         "screen" => Ok(SourceKind::Screen),
         "media" => Ok(SourceKind::Media {
             path: path.unwrap_or("").to_string(),
@@ -741,8 +749,9 @@ impl Shell {
         color: [u8; 3],
         text: Option<&str>,
         path: Option<&str>,
+        device: Option<&str>,
     ) -> Result<SourceState, ShellError> {
-        let kind = parse_source_kind(kind, color, text, path)?;
+        let kind = parse_source_kind(kind, color, text, path, device)?;
         let id = Uuid::new_v4().to_string();
         // Open producers BEFORE the source is pushed, so a bad file or
         // missing camera fails cleanly without leaving a half-added source.
@@ -750,8 +759,8 @@ impl Shell {
             self.open_media_producer(&id, path)?;
         }
         #[cfg(windows)]
-        if matches!(kind, SourceKind::Camera) {
-            self.open_camera_producer(&id)?;
+        if let SourceKind::Camera { device } = &kind {
+            self.open_camera_producer(&id, device.as_deref())?;
         }
         let input_id = kind.is_real().then(|| source_input_id(&id));
         let order = self
@@ -952,7 +961,7 @@ impl Shell {
                 .as_ref()
                 .ok_or_else(|| ShellError::UnknownSource(src.id.clone()))?;
             let pixels = match &src.kind {
-                SourceKind::Media { .. } | SourceKind::Camera => {
+                SourceKind::Media { .. } | SourceKind::Camera { .. } => {
                     // Pull the next decoded/live frame; skip the source for
                     // this frame when none is ready (producer handles pacing).
                     match self.pull_media_frame(&src.id, w, h) {
