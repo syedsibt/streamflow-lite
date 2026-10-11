@@ -199,12 +199,17 @@ impl DshowProducer {
                 ("video_size".into(), format!("{width}x{height}")),
                 ("framerate".into(), fps.to_string()),
                 ("pixel_format".into(), "yuv420p".into()),
+                // Critical for live: disable FFmpeg's internal buffering,
+                // otherwise frames queue up and the preview lags by seconds
+                // or even minutes behind real time.
+                ("fflags".into(), "nobuffer".into()),
             ],
             vec![
                 ("video_size".into(), format!("{width}x{height}")),
                 ("framerate".into(), fps.to_string()),
+                ("fflags".into(), "nobuffer".into()),
             ],
-            vec![], // Let dshow negotiate everything.
+            vec![("fflags".into(), "nobuffer".into())], // Let dshow negotiate everything.
         ];
         let mut last_err = String::new();
         for opts in &attempts {
