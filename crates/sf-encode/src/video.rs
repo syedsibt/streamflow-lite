@@ -169,6 +169,11 @@ impl VideoEncoder {
         self.id
     }
 
+    /// Human-readable encoder name (e.g. "h264_nvenc", "h264_qsv").
+    pub fn encoder_name(&self) -> &'static str {
+        self.id.ffmpeg_name()
+    }
+
     /// Codec parameters (including extradata with SPS/PPS) for muxer stream
     /// setup and for initializing a matching decoder.
     pub fn parameters(&self) -> ff::codec::parameters::Parameters {

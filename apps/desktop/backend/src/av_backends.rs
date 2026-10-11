@@ -92,6 +92,9 @@ impl ActiveStream {
     pub(crate) fn bytes_sent(&self) -> u64 {
         self.streamer.bytes_sent()
     }
+    pub(crate) fn encoder_name(&self) -> &'static str {
+        self.video_enc.encoder_name()
+    }
 }
 
 // SAFETY: same argument as `ActiveRecording` — FFmpeg contexts with no

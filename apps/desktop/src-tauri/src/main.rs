@@ -384,6 +384,12 @@ fn list_audio_devices(state: State<'_, AppState>) -> Vec<String> {
     lock(&state).map(|s| s.list_audio_devices()).unwrap_or_default()
 }
 
+/// Active stream encoder name.
+#[tauri::command(rename_all = "snake_case")]
+fn stream_encoder_name(state: State<'_, AppState>) -> String {
+    lock(&state).map(|s| s.stream_encoder_name()).unwrap_or_default()
+}
+
 /// Performance stats: (fps, render_ms, cpu_percent_estimate, stream_kbps).
 #[tauri::command(rename_all = "snake_case")]
 fn perf_stats(state: State<'_, AppState>) -> Vec<f32> {
@@ -691,6 +697,7 @@ fn main() {
             list_cameras,
             list_audio_devices,
             perf_stats,
+            stream_encoder_name,
             source_remove,
             source_reorder,
             source_set_visible,

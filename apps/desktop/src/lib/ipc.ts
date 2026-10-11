@@ -150,6 +150,7 @@ export const api = {
   listCameras: () => cmd<string[]>("list_cameras", {}),
   listAudioDevices: () => cmd<string[]>("list_audio_devices", {}),
   perfStats: () => cmd<number[]>("perf_stats", {}),
+  streamEncoderName: () => cmd<string>("stream_encoder_name", {}),
   sourceRemove: (scene_id: string, source_id: string) =>
     cmd<void>("source_remove", { scene_id, source_id }),
   sourceReorder: (scene_id: string, order: string[]) =>

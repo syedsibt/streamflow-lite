@@ -1169,6 +1169,14 @@ impl Shell {
         self.perf_tick_accum_us += duration_us;
     }
 
+    /// Active stream encoder name (e.g. "h264_nvenc"), or empty when idle.
+    pub fn stream_encoder_name(&self) -> String {
+        self.active_stream
+            .as_ref()
+            .map(|a| a.encoder_name().to_string())
+            .unwrap_or_default()
+    }
+
     /// Returns (fps, render_ms, cpu_percent_estimate, stream_kbps).
     /// CPU% is estimated as (tick time / wall time) over the last second.
     /// stream_kbps is the RTMP upload bitrate (0 when not streaming).
