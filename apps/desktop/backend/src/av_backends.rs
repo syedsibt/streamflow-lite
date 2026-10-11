@@ -813,6 +813,10 @@ impl Shell {
         if !recording && !streaming {
             // Audio metering runs even when idle so the UI meters stay live.
             self.pump_audio();
+            // Track perf even when idle so the panel shows live values.
+            let tick_us = tick_start.elapsed().as_micros() as u64;
+            self.perf_mark_tick(tick_us);
+            self.perf_mark_frame();
             return;
         }
         let frame = match self.program_frame_raw(AV_W, AV_H) {
