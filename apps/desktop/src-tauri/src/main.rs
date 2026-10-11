@@ -296,10 +296,10 @@ fn preview_get_frame(
     ))
 }
 
-fn png_data_url(png: &[u8]) -> String {
+fn jpg_data_url(jpg: &[u8]) -> String {
     format!(
-        "data:image/png;base64,{}",
-        base64::Engine::encode(&base64::engine::general_purpose::STANDARD, png)
+        "data:image/jpeg;base64,{}",
+        base64::Engine::encode(&base64::engine::general_purpose::STANDARD, jpg)
     )
 }
 
@@ -533,18 +533,15 @@ fn transition_auto(
         .map_err(ue)
 }
 
-/// Scene monitor frame as a PNG data URL (graded sources, CPU-composited).
+/// Scene monitor frame as a JPEG data URL. The program scene is served from
+/// the media tick's live monitor frame (10fps, no re-render); other scenes
+/// render on demand at monitor size.
 #[tauri::command(rename_all = "snake_case")]
-fn scene_preview_png(
-    state: State<'_, AppState>,
-    scene_id: String,
-    width: u32,
-    height: u32,
-) -> CmdResult<String> {
-    let png = lock(&state)?
-        .scene_render_png(&scene_id, width, height)
+fn scene_preview_jpg(state: State<'_, AppState>, scene_id: String) -> CmdResult<String> {
+    let jpg = lock(&state)?
+        .scene_monitor_jpg(&scene_id)
         .map_err(ue)?;
-    Ok(png_data_url(&png))
+    Ok(jpg_data_url(&jpg))
 }
 
 // ---------------------------------------------------------------------------
@@ -816,7 +813,7 @@ fn main() {
             production_set_program,
             transition_cut,
             transition_auto,
-            scene_preview_png,
+            scene_preview_jpg,
             mixer_set_gain,
             mixer_set_mute,
             mixer_set_master_gain,

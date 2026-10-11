@@ -28,9 +28,9 @@ export default function ProductionView() {
 
   useEffect(() => {
     void init();
-    // Monitors at ~2 Hz (the PNG renders are best-effort), multiview +
-    // full state refresh slower.
-    const t1 = setInterval(() => void pollMonitors(), 500);
+    // Monitors at ~10 Hz: the program monitor is served from the media
+    // tick's cached frame (no re-render), preview/multiview render on demand.
+    const t1 = setInterval(() => void pollMonitors(), 100);
     const t2 = setInterval(() => void pollMultiview(), 2000);
     const t3 = setInterval(() => void refresh(), 2000);
     return () => {

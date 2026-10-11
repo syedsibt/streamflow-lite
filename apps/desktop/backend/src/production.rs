@@ -1108,6 +1108,21 @@ impl Shell {
         encode_png(&frame)
     }
 
+    /// JPEG bytes for a scene monitor. The program scene is served from the
+    /// media tick's live monitor frame — no re-render, no camera re-pull,
+    /// no mutex stall of the tick (the old path re-rendered at 2 Hz and
+    /// jittered the pipeline on every poll). Other scenes render on demand
+    /// at monitor size.
+    pub fn scene_monitor_jpg(&mut self, scene_id: &str) -> Result<Vec<u8>, ShellError> {
+        if scene_id == self.program_scene_id {
+            if let Some(jpg) = self.monitor_jpeg() {
+                return Ok(jpg);
+            }
+        }
+        let frame = self.render_scene_frame(scene_id, crate::MONITOR_W, crate::MONITOR_H)?;
+        crate::encode_jpeg(&frame, 82)
+    }
+
     /// Program-monitor frame: during an auto transition this is the live
     /// crossfade of program→preview at the eased wall-clock progress;
     /// otherwise it is the program scene's composite.

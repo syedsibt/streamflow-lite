@@ -185,8 +185,8 @@ export const api = {
   transitionCut: () => cmd<void>("transition_cut"),
   transitionAuto: (duration_ms: number, kind: string) =>
     cmd<void>("transition_auto", { duration_ms, kind }),
-  scenePreviewPng: (scene_id: string, width: number, height: number) =>
-    cmd<string>("scene_preview_png", { scene_id, width, height }),
+  scenePreviewJpg: (scene_id: string) =>
+    cmd<string>("scene_preview_jpg", { scene_id }),
 
   mixerSetGain: (source_id: string, gain: number) =>
     cmd<void>("mixer_set_gain", { source_id, gain }),

@@ -204,3 +204,29 @@ fn media_source_bad_path_fails_cleanly() {
         .sources
         .is_empty());
 }
+
+#[test]
+fn program_monitor_serves_live_jpeg_from_tick_cache() {
+    let mut s = shell();
+    let sc = scene_with_pattern(&mut s, "Mon");
+    // Tick a few times: the idle tick renders the program monitor frame.
+    for _ in 0..4 {
+        s.av_tick();
+    }
+    // Program scene is served from the tick cache as JPEG (magic bytes
+    // FF D8 FF), without re-rendering.
+    let jpg = s.scene_monitor_jpg(&sc).expect("program monitor jpg");
+    assert!(
+        jpg.len() > 1_000 && jpg[0] == 0xFF && jpg[1] == 0xD8 && jpg[2] == 0xFF,
+        "expected JPEG bytes, got {} bytes starting {:02X?}",
+        jpg.len(),
+        &jpg[..3.min(jpg.len())]
+    );
+    // A second scene (not program) renders on demand and also yields JPEG.
+    let other = s.scene_create("Other").id;
+    let jpg2 = s.scene_monitor_jpg(&other).expect("other scene jpg");
+    assert!(
+        jpg2.len() > 100 && jpg2[0] == 0xFF && jpg2[1] == 0xD8,
+        "expected JPEG bytes for non-program scene"
+    );
+}

@@ -1013,6 +1013,16 @@ impl Shell {
             // Audio metering runs even when idle so the UI meters stay live.
             let t = std::time::Instant::now();
             self.pump_audio();
+            // The program monitor must stay live even when idle: render the
+            // program scene small directly on this tick. (When recording or
+            // streaming the full-res frame below is downscaled instead, so
+            // the camera is only ever pulled once per tick.)
+            if let Ok(f) = self.program_frame_raw(
+                crate::MONITOR_W,
+                crate::MONITOR_H,
+            ) {
+                self.set_monitor_frame(f);
+            }
             self.perf_stages_us = [0, t.elapsed().as_micros() as u64, 0, 0];
             // Track perf even when idle so the panel shows live values.
             let tick_us = tick_start.elapsed().as_micros() as u64;
@@ -1051,6 +1061,9 @@ impl Shell {
         }
         let stream_us = t3.elapsed().as_micros() as u64;
         self.perf_stages_us = [render_us, audio_us, record_us, stream_us];
+        // Refresh the live program monitor from the frame this tick already
+        // rendered (downscaled) — the UI serves this instead of re-rendering.
+        self.set_monitor_frame(frame);
         let tick_us = tick_start.elapsed().as_micros() as u64;
         self.perf_mark_tick(tick_us);
         self.perf_mark_frame();

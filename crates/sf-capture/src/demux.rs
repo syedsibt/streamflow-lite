@@ -71,6 +71,18 @@ pub(crate) struct DemuxDecoder {
     live: bool,
 }
 
+/// Bound on the decoded-video queue for file sources. The audio seek path
+/// used to decode-and-queue every video packet it skipped, growing this
+/// queue by ~3 frames/tick (~25 MB/tick at 1080p RGBA) until the process
+/// OOM-crashed. With the discard fix below the queue stays tiny; this cap
+/// is the backstop demanded by the realtime blueprint ("never let frames
+/// accumulate").
+const MAX_VIDEO_QUEUE: usize = 16;
+
+/// Max frames `drain_video` decodes per call. The old code decoded the
+/// entire remainder of the file at EOF into RAM in one call.
+const MAX_DRAIN_PER_CALL: usize = 8;
+
 impl DemuxDecoder {
     /// Build from an already-opened input context. `nominal_frame_us` is
     /// the expected per-frame duration (used for `duration_us` and as the
@@ -240,6 +252,12 @@ impl DemuxDecoder {
                     if self.live {
                         // Live: keep only the newest frame.
                         self.video_queue.clear();
+                    } else {
+                        // File: drop the oldest when at the cap — a slow
+                        // consumer must never accumulate unbounded memory.
+                        while self.video_queue.len() >= MAX_VIDEO_QUEUE {
+                            self.video_queue.pop_front();
+                        }
                     }
                     self.video_queue.push_back(f);
                 }
@@ -295,17 +313,33 @@ impl DemuxDecoder {
                     }
                 }
             } else if stream.index() == self.video_stream {
+                // Seeking audio past video packets: feed the video decoder
+                // (keeps its reference state correct) but DISCARD the decoded
+                // frames — no RGBA scale, no 8 MB allocation, no queue
+                // growth. The old code decoded+scaled+queued every skipped
+                // video frame here: ~25 MB/tick of queue growth at 1080p →
+                // 90% CPU, then OOM crash when adding a media file.
                 self.video_decoder
                     .send_packet(&packet)
                     .map_err(|e| CaptureError::ReadFailed(format!("video send_packet: {e}")))?;
-                while let Some(f) = self.decode_one_video()? {
-                    if self.live {
-                        // Live: keep only the newest frame.
-                        self.video_queue.clear();
-                    }
-                    self.video_queue.push_back(f);
-                }
+                while self.discard_one_video()? {}
             }
+        }
+    }
+
+    /// Decode one video frame and discard it (no RGBA scale, no queue).
+    /// Used when skipping over video packets while seeking audio.
+    /// Returns `true` when a frame was discarded.
+    fn discard_one_video(&mut self) -> Result<bool, CaptureError> {
+        let mut decoded = ff::util::frame::video::Video::empty();
+        match self.video_decoder.receive_frame(&mut decoded) {
+            Ok(()) => Ok(true),
+            // EAGAIN (errno 11): need more packets. EOF: decoder drained.
+            Err(ff::util::error::Error::Eof) => Ok(false),
+            Err(ff::util::error::Error::Other { errno: 11 }) => Ok(false),
+            Err(e) => Err(CaptureError::ReadFailed(format!(
+                "video receive_frame: {e}"
+            ))),
         }
     }
 
@@ -348,8 +382,20 @@ impl DemuxDecoder {
     }
 
     fn drain_video(&mut self) -> Result<Option<CapturedFrame>, CaptureError> {
-        while let Some(f) = self.decode_one_video()? {
-            self.video_queue.push_back(f);
+        // Bounded: at most a few frames per call, so reaching EOF can't
+        // burst-decode a whole file into RAM in one go.
+        for _ in 0..MAX_DRAIN_PER_CALL {
+            match self.decode_one_video()? {
+                Some(f) => {
+                    if !self.live {
+                        while self.video_queue.len() >= MAX_VIDEO_QUEUE {
+                            self.video_queue.pop_front();
+                        }
+                    }
+                    self.video_queue.push_back(f);
+                }
+                None => break,
+            }
         }
         Ok(self.video_queue.pop_front())
     }
@@ -406,5 +452,54 @@ impl DemuxDecoder {
 
     fn drain_audio(&mut self) -> Result<(), CaptureError> {
         self.pump_audio()
+    }
+}
+
+#[cfg(test)]
+mod queue_bounds_tests {
+    use super::*;
+    use std::process::Command;
+
+    fn make_av_file() -> String {
+        let path = std::env::temp_dir()
+            .join("sf-demux-queue-test.mp4")
+            .to_string_lossy()
+            .into_owned();
+        let _ = std::fs::remove_file(&path);
+        let st = Command::new("ffmpeg")
+            .args([
+                "-y", "-v", "error",
+                "-f", "lavfi", "-i", "testsrc=size=320x240:rate=30:duration=5",
+                "-f", "lavfi", "-i", "sine=frequency=440:duration=5",
+                "-pix_fmt", "yuv420p", "-c:a", "aac", "-shortest",
+                path.as_str(),
+            ])
+            .status()
+            .expect("ffmpeg CLI must be installed");
+        assert!(st.success());
+        path
+    }
+
+    #[test]
+    fn audio_seeking_never_accumulates_video_frames() {
+        ensure_init();
+        let path = make_av_file();
+        let ictx = ff::format::input(&std::path::PathBuf::from(&path)).expect("open");
+        let mut d = DemuxDecoder::from_input(ictx, 33_333).expect("demux");
+        // Simulate the media tick: one video pull + 4 audio drains per tick,
+        // like `Shell::av_tick` does. The old code decoded+queued every
+        // video packet skipped while seeking audio (~25 MB/tick at 1080p →
+        // 90% CPU then OOM crash).
+        for _ in 0..150 {
+            let _ = d.next_video();
+            for _ in 0..4 {
+                let _ = d.next_audio();
+            }
+            assert!(
+                d.video_queue.len() <= super::MAX_VIDEO_QUEUE,
+                "video queue grew to {} (unbounded accumulation)",
+                d.video_queue.len()
+            );
+        }
     }
 }

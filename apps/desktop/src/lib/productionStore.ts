@@ -473,10 +473,10 @@ export const useProduction = create<ProductionStore>()((set, get) => ({
     try {
       const [previewUrl, programUrl] = await Promise.all([
         state.preview_scene_id
-          ? api.scenePreviewPng(state.preview_scene_id, 480, 270)
+          ? api.scenePreviewJpg(state.preview_scene_id)
           : Promise.resolve(null),
         state.program_scene_id
-          ? api.scenePreviewPng(state.program_scene_id, 480, 270)
+          ? api.scenePreviewJpg(state.program_scene_id)
           : Promise.resolve(null),
       ]);
       set((s) => ({
@@ -493,7 +493,7 @@ export const useProduction = create<ProductionStore>()((set, get) => ({
     if (!isTauri || !state) return;
     for (const sc of state.scenes) {
       try {
-        const url = await api.scenePreviewPng(sc.id, 192, 108);
+        const url = await api.scenePreviewJpg(sc.id);
         set((s) => ({ thumbs: { ...s.thumbs, [sc.id]: url } }));
       } catch {
         /* skip this scene this round */

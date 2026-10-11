@@ -60,8 +60,74 @@ pub use production::{
 /// 10 Hz keeps the shell light — production will use a faster zero-copy path).
 const PREVIEW_THROTTLE: Duration = Duration::from_millis(100);
 
+/// Program/preview monitor size. The media tick refreshes the program monitor
+/// frame at this size every tick; the UI polls it at ~10fps. 480x270 keeps
+/// JPEG encode + IPC cheap while looking sharp in the monitor panes.
+pub const MONITOR_W: u32 = 480;
+pub const MONITOR_H: u32 = 270;
+
+/// A monitor frame is fresh enough to serve while under this age; older than
+/// this the command falls back to rendering on demand.
+const MONITOR_FRESH: Duration = Duration::from_millis(150);
+
 /// Stack length above which the UI gets a "GPU cost high" warning (spec §5.3).
 const STACK_WARN_LEN: usize = 6;
+
+/// Program monitor frame: small RGBA composite refreshed by the media tick.
+#[derive(Clone)]
+pub struct MonitorFrame {
+    pub width: u32,
+    pub height: u32,
+    pub pixels: Vec<u8>,
+    pub at: Instant,
+}
+
+impl Shell {
+    /// Stores a program frame as the live monitor frame, downscaling to
+    /// monitor size when needed.
+    pub(crate) fn set_monitor_frame(&mut self, frame: Frame) {
+        let (pixels, w, h) = if frame.width == MONITOR_W && frame.height == MONITOR_H {
+            (frame.pixels, frame.width, frame.height)
+        } else {
+            (
+                downscale_bilinear(
+                    &frame.pixels,
+                    frame.width,
+                    frame.height,
+                    MONITOR_W,
+                    MONITOR_H,
+                ),
+                MONITOR_W,
+                MONITOR_H,
+            )
+        };
+        self.monitor_frame = Some(MonitorFrame {
+            width: w,
+            height: h,
+            pixels,
+            at: Instant::now(),
+        });
+    }
+
+    /// JPEG bytes for the live program monitor, when the cached frame is
+    /// fresh. The monitor commands serve this instead of re-rendering the
+    /// scene (no mutex stall, no duplicate camera pull).
+    pub(crate) fn monitor_jpeg(&self) -> Option<Vec<u8>> {
+        let m = self.monitor_frame.as_ref()?;
+        if m.at.elapsed() > MONITOR_FRESH {
+            return None;
+        }
+        encode_jpeg(
+            &Frame {
+                width: m.width,
+                height: m.height,
+                pixels: m.pixels.clone(),
+            },
+            82,
+        )
+        .ok()
+    }
+}
 
 /// Errors from the shell binding layer.
 #[derive(Debug, Error)]
@@ -371,6 +437,11 @@ pub struct Shell {
     last_frame: HashMap<String, Frame>,
     /// Preview PNG cache per input: (rendered_at, png bytes).
     preview_cache: HashMap<String, (Instant, Vec<u8>)>,
+    /// Live program monitor frame (480x270 RGBA), refreshed by the media
+    /// tick every tick — even when idle. The UI monitors poll this instead
+    /// of re-rendering the scene from scratch (which used to run at 2 Hz
+    /// and stole the shell mutex from the media tick on every poll).
+    monitor_frame: Option<MonitorFrame>,
     // --- production state machine (see `production` module) ---
     /// Production scenes.
     scenes: Vec<production::ProdScene>,
@@ -458,6 +529,7 @@ impl Shell {
             events: VecDeque::new(),
             last_frame: HashMap::new(),
             preview_cache: HashMap::new(),
+            monitor_frame: None,
             scenes: Vec::new(),
             preview_scene_id: String::new(),
             program_scene_id: String::new(),
@@ -508,6 +580,7 @@ impl Shell {
             events: VecDeque::new(),
             last_frame: HashMap::new(),
             preview_cache: HashMap::new(),
+            monitor_frame: None,
             scenes: Vec::new(),
             preview_scene_id: String::new(),
             program_scene_id: String::new(),
@@ -1396,6 +1469,66 @@ fn encode_png(frame: &Frame) -> Result<Vec<u8>, ShellError> {
     Ok(buf)
 }
 
+/// Encodes an RGBA8 frame as JPEG bytes (drops alpha). Used for the live
+/// program/preview monitors: ~10x smaller than PNG for camera frames, so a
+/// 10fps monitor poll stays cheap over IPC.
+pub(crate) fn encode_jpeg(frame: &Frame, quality: u8) -> Result<Vec<u8>, ShellError> {
+    use image::codecs::jpeg::JpegEncoder;
+    use image::{ExtendedColorType, ImageEncoder};
+    // JPEG has no alpha: flatten onto black (monitors never need transparency).
+    let mut rgb = Vec::with_capacity(frame.width as usize * frame.height as usize * 3);
+    for px in frame.pixels.chunks_exact(4) {
+        rgb.extend_from_slice(&px[0..3]);
+    }
+    let mut buf = Vec::new();
+    JpegEncoder::new_with_quality(&mut buf, quality)
+        .write_image(
+            &rgb,
+            frame.width,
+            frame.height,
+            ExtendedColorType::Rgb8,
+        )
+        .map_err(|e| ShellError::Png(e.to_string()))?;
+    Ok(buf)
+}
+
+/// Bilinear downscale of an RGBA8 image. Used to derive the 480x270 monitor
+/// frame from the full-resolution program frame the tick already rendered.
+fn downscale_bilinear(src: &[u8], sw: u32, sh: u32, dw: u32, dh: u32) -> Vec<u8> {
+    let (sw, sh, dw, dh) = (sw as usize, sh as usize, dw as usize, dh as usize);
+    let mut out = vec![0u8; dw * dh * 4];
+    if sw == 0 || sh == 0 || dw == 0 || dh == 0 {
+        return out;
+    }
+    let x_ratio = sw as f32 / dw as f32;
+    let y_ratio = sh as f32 / dh as f32;
+    for y in 0..dh {
+        let sy = (y as f32 + 0.5) * y_ratio - 0.5;
+        let y0 = (sy.floor() as isize).clamp(0, sh as isize - 1) as usize;
+        let y1 = (y0 + 1).min(sh - 1);
+        let fy = (sy - y0 as f32).clamp(0.0, 1.0);
+        for x in 0..dw {
+            let sx = (x as f32 + 0.5) * x_ratio - 0.5;
+            let x0 = (sx.floor() as isize).clamp(0, sw as isize - 1) as usize;
+            let x1 = (x0 + 1).min(sw - 1);
+            let fx = (sx - x0 as f32).clamp(0.0, 1.0);
+            let o = (y * dw + x) * 4;
+            for c in 0..4 {
+                let p00 = src[(y0 * sw + x0) * 4 + c] as f32;
+                let p10 = src[(y0 * sw + x1) * 4 + c] as f32;
+                let p01 = src[(y1 * sw + x0) * 4 + c] as f32;
+                let p11 = src[(y1 * sw + x1) * 4 + c] as f32;
+                let v = p00 * (1.0 - fx) * (1.0 - fy)
+                    + p10 * fx * (1.0 - fy)
+                    + p01 * (1.0 - fx) * fy
+                    + p11 * fx * fy;
+                out[o + c] = v.round().clamp(0.0, 255.0) as u8;
+            }
+        }
+    }
+    out
+}
+
 /// UI-facing AI result: the suggested grade plus one explanation string per
 /// decision (spec §6: results land as editable parameters, never black-box).
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -1512,8 +1645,7 @@ pub fn missed_intervals(overdue_us: u128, interval_us: u64) -> u64 {
 }
 
 #[cfg(test)]
-mod deadline_tests {
-    use super::missed_intervals;
+mod deadline_tests {    use super::missed_intervals;
 
     #[test]
     fn no_overdue_no_missed() {
@@ -1533,5 +1665,31 @@ mod deadline_tests {
     fn clamped_and_zero_safe() {
         assert_eq!(missed_intervals(10_000_000_000, 33_333), 240);
         assert_eq!(missed_intervals(100_000, 0), 0);
+    }
+}
+
+#[cfg(test)]
+mod downscale_tests {
+    use super::downscale_bilinear;
+
+    #[test]
+    fn solid_color_stays_solid() {
+        let src = vec![200u8; 8 * 8 * 4];
+        let out = downscale_bilinear(&src, 8, 8, 4, 4);
+        assert_eq!(out.len(), 4 * 4 * 4);
+        assert!(out.iter().all(|&v| v == 200));
+    }
+
+    #[test]
+    fn output_dimensions_match() {
+        let src = vec![0u8; 1920 * 1080 * 4];
+        let out = downscale_bilinear(&src, 1920, 1080, super::MONITOR_W, super::MONITOR_H);
+        assert_eq!(out.len(), super::MONITOR_W as usize * super::MONITOR_H as usize * 4);
+    }
+
+    #[test]
+    fn empty_input_is_safe() {
+        let out = downscale_bilinear(&[], 0, 0, 480, 270);
+        assert_eq!(out.len(), 480 * 270 * 4);
     }
 }
