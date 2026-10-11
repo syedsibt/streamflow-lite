@@ -344,6 +344,8 @@ impl Default for VideoSettings {
 
 /// Allowed values for the Video panel dropdowns (also the validation set).
 pub const VIDEO_OUTPUT_SIZES: [(u32, u32); 2] = [(1280, 720), (1920, 1080)];
+pub const VIDEO_CAMERA_SIZES: [(u32, u32); 3] =
+    [(854, 480), (1280, 720), (1920, 1080)];
 pub const VIDEO_FPS_OPTIONS: [u32; 2] = [30, 60];
 pub const VIDEO_ENCODER_OPTIONS: [&str; 5] =
     ["auto", "h264_amf", "h264_nvenc", "h264_qsv", "libx264"];
@@ -1450,9 +1452,7 @@ impl Shell {
                 s.bitrate_kbps
             )));
         }
-        if !VIDEO_OUTPUT_SIZES.contains(&(s.camera_width, s.camera_height))
-            && (s.camera_width, s.camera_height) != (640, 480)
-        {
+        if !VIDEO_CAMERA_SIZES.contains(&(s.camera_width, s.camera_height)) {
             return Err(ShellError::InvalidSetting(format!(
                 "unsupported camera size {}x{}",
                 s.camera_width, s.camera_height
