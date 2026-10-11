@@ -172,6 +172,19 @@ impl DemuxDecoder {
         })
     }
 
+    /// Mark this demuxer as a live source: the video queue is capped at
+    /// one frame (newest wins), preventing unbounded memory growth when
+    /// the producer outpaces the consumer.
+    pub(crate) fn set_live(&mut self, live: bool) {
+        self.live = live;
+        if live {
+            // Drop any backlog accumulated before the flag was set.
+            while self.video_queue.len() > 1 {
+                self.video_queue.pop_front();
+            }
+        }
+    }
+
     pub(crate) fn stream_info(&self, has_audio: bool) -> StreamInfo {
         StreamInfo {
             width: self.width,
