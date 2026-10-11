@@ -741,6 +741,18 @@ impl Shell {
     /// `camera` | `screen` | `media` | `text`. Real kinds get an engine
     /// input and render through the real pipeline; pending kinds report
     /// `status: "pending"` and are skipped in the composite.
+    /// Lists available camera devices (Windows DirectShow; empty elsewhere).
+    pub fn list_cameras(&self) -> Vec<String> {
+        #[cfg(windows)]
+        {
+            sf_capture::dshow::list_devices().unwrap_or_default()
+        }
+        #[cfg(not(windows))]
+        {
+            Vec::new()
+        }
+    }
+
     pub fn source_add(
         &mut self,
         scene_id: &str,

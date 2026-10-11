@@ -370,15 +370,8 @@ fn source_add(
 
 /// Lists available camera devices (Windows DirectShow; empty elsewhere).
 #[tauri::command(rename_all = "snake_case")]
-fn list_cameras() -> Vec<String> {
-    #[cfg(windows)]
-    {
-        sf_capture::dshow::list_devices().unwrap_or_default()
-    }
-    #[cfg(not(windows))]
-    {
-        Vec::new()
-    }
+fn list_cameras(state: State<'_, AppState>) -> Vec<String> {
+    lock(&state).map(|s| s.list_cameras()).unwrap_or_default()
 }
 
 /// Removes a source from a scene.
