@@ -360,12 +360,6 @@ export interface SceneView {
   sources: SourceView[];
 }
 
-export interface TransitionView {
-  active: boolean;
-  kind: string;
-  progress: number; // 0..1
-}
-
 export interface MixerChannelView {
   source_id: string;
   name: string;
@@ -398,6 +392,17 @@ export interface VoiceStats {
   underruns: number;
   dropped_frames: number;
   device: string; // "starting" | "running" | "error: …" | "stopped"
+  /** Age of the audio as played (capture → mix), ms. */
+  audio_age_ms?: number | null;
+  /** Age the A/V aligner targets (picture age + offset), ms. */
+  target_age_ms?: number | null;
+  corrections?: number;
+}
+
+/** A/V sync settings: auto alignment + manual offset (−100…+100 ms). */
+export interface AvSync {
+  auto: boolean;
+  offset_ms: number;
 }
 
 export interface MixerView {
@@ -408,6 +413,7 @@ export interface MixerView {
   monitor_enabled: boolean;
   enhancer: EnhancerSettings;
   voice: Record<string, VoiceStats>;
+  av_sync: AvSync;
 }
 
 export interface StreamStateView {
@@ -422,35 +428,14 @@ export interface RecordStateView {
   message?: string | null; // set when state === "error"
 }
 
-/**
- * Macro action as the backend expects it: internally-tagged
- * (`#[serde(tag = "action")]`), e.g. `{ action: "cut" }` or
- * `{ action: "auto_transition", duration_ms: 500 }`.
- */
-export type MacroActionInput =
-  | { action: "cut" }
-  | { action: "auto_transition"; duration_ms: number }
-  | { action: "toggle_stream" }
-  | { action: "toggle_record" }
-  | { action: "apply_look"; look_id: string; intensity: number };
-
-export interface MacroView {
-  id: string;
-  name: string;
-  hotkey: string;
-  action: string;
-}
-
 /** Full `production_state()` response. */
 export interface ProductionStateData {
   scenes: SceneView[];
   preview_scene_id: string | null;
   program_scene_id: string | null;
-  transition: TransitionView;
   mixer: MixerView;
   stream: StreamStateView;
   record: RecordStateView;
-  macros: MacroView[];
   video_settings: VideoSettings;
 }
 
@@ -470,4 +455,87 @@ export function isPendingCaptureSource(s: SourceView): boolean {
     PENDING_CAPTURE_KINDS.some((k) => kind.includes(k)) ||
     status.includes("pending")
   );
+}
+
+// ---------------------------------------------------------------------------
+// Diagnostics (backend `DiagnosticsView`) — every value is measured.
+// ---------------------------------------------------------------------------
+
+export interface SourceDiag {
+  id: string;
+  name: string;
+  kind: string;
+  fps: number;
+  device_fps: number | null;
+  dropped: number;
+  age_ms: number;
+  width: number;
+  height: number;
+  format: string | null;
+  error: string | null;
+}
+
+export interface AudioDiag {
+  id: string;
+  name: string;
+  device: string;
+  buffered_ms: number;
+  audio_age_ms: number | null;
+  target_age_ms: number | null;
+  underruns: number;
+  dropped_frames: number;
+  corrections: number;
+}
+
+export interface EncoderDiag {
+  name: string;
+  hardware: boolean;
+  fps: number;
+  encode_ms: number;
+  skipped_slots: number;
+  note: string | null;
+}
+
+export interface LatencyDiag {
+  capture_ms: number | null;
+  processing_ms: number;
+  send_buffer_ms: number;
+  app_total_ms: number | null;
+  platform_note: string;
+}
+
+export interface Diagnostics {
+  render_fps: number;
+  target_fps: number;
+  tick_ms: number;
+  capture_ms: number;
+  render_ms: number;
+  gpu_ms: number;
+  audio_ms: number;
+  encode_ms: number;
+  lagged_ticks: number;
+  skipped_render: number;
+  dropped_network: number;
+  sources: SourceDiag[];
+  audio: AudioDiag[];
+  encoder: EncoderDiag | null;
+  stream_status: string;
+  stream_error: string | null;
+  stream_kbps: number;
+  stream_uptime_s: number;
+  recording: boolean;
+  latency: LatencyDiag;
+  color_active: boolean;
+  av_auto: boolean;
+  av_offset_ms: number;
+  system: { cpu_percent: number; ram_mb: number; cores: number };
+}
+
+/** Streaming platform adapter info (backend `PlatformInfo`). */
+export interface PlatformInfo {
+  id: string; // "youtube" | "facebook" | "tiktok" | "custom_rtmp"
+  name: string;
+  default_server: string | null;
+  key_help: string;
+  latency_note: string;
 }

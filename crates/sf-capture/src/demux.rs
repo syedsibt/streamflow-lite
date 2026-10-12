@@ -42,7 +42,31 @@ pub(crate) fn pts_to_us(pts: Option<i64>, tb_num: i32, tb_den: i32, fallback_us:
 pub(crate) struct RawAudio {
     pub samples: Vec<f32>,
     pub pts_us: i64,
+    /// Capture time of the first sample on [`crate::clock::now_us`].
+    pub captured_at_us: i64,
 }
+
+/// Result of one non-blocking [`DemuxDecoder::drain_live`] pass.
+#[derive(Debug, Default)]
+pub(crate) struct LiveDrain {
+    /// Newest decoded video frame (RGBA), if any arrived.
+    pub frame: Option<CapturedFrame>,
+    /// Packets read from the device in this pass.
+    pub packets: u32,
+    /// Video frames that arrived but were superseded by a newer one in the
+    /// same pass (stale frames dropped — the live-first policy).
+    pub dropped: u32,
+    /// The device reported end of stream (unplugged / graph stopped).
+    pub eof: bool,
+    /// Packets the decoder rejected (skipped, not fatal).
+    pub decode_errors: u32,
+}
+
+/// Upper bound on packets consumed per drain pass, so a device that is
+/// always "ready" can never trap the capture thread.
+const MAX_PACKETS_PER_DRAIN: u32 = 256;
+/// Wall-time budget of one drain pass (µs).
+const MAX_PASS_US: i64 = 10_000;
 
 // SAFETY: `DemuxDecoder` wraps FFmpeg contexts (raw pointers) which have
 // no thread affinity. It is only ever accessed from a single thread at a
@@ -74,6 +98,15 @@ pub(crate) struct DemuxDecoder {
     /// holds more than one frame, so a slow consumer can't accumulate
     /// unbounded memory. File sources keep every frame.
     live: bool,
+    /// Video codec is intra-only (MJPEG, raw, BMP…): stale packets can be
+    /// discarded without decoding. Inter-coded live video (H.264/HEVC
+    /// cameras) must decode every packet to keep reference frames valid.
+    intra_only: bool,
+    /// Device → [`crate::clock::now_us`] mapping for video / audio.
+    video_clock: crate::clock::ClockMapper,
+    audio_clock: crate::clock::ClockMapper,
+    /// Read time of the packets currently in the audio decoder (live).
+    audio_read_at_us: i64,
 }
 
 /// Bound on the decoded-video queue for file sources. The audio seek path
@@ -115,6 +148,10 @@ impl DemuxDecoder {
             .decoder()
             .video()
             .map_err(|e| CaptureError::OpenFailed(format!("video decoder open: {e}")))?;
+        let intra_only = unsafe {
+            let d = ff::ffi::avcodec_descriptor_get(video_decoder.id().into());
+            !d.is_null() && ((*d).props & ff::ffi::AV_CODEC_PROP_INTRA_ONLY) != 0
+        };
         let (w, h) = (video_decoder.width(), video_decoder.height());
         if w == 0 || h == 0 {
             return Err(CaptureError::OpenFailed(
@@ -186,6 +223,10 @@ impl DemuxDecoder {
             packets_exhausted: false,
             eof_sent: false,
             live: false,
+            intra_only,
+            video_clock: crate::clock::ClockMapper::new(),
+            audio_clock: crate::clock::ClockMapper::new(),
+            audio_read_at_us: 0,
         })
     }
 
@@ -279,53 +320,132 @@ impl DemuxDecoder {
         }
     }
 
-    /// Live-source newest-frame drain: reads packets until the caller's
-    /// interrupt deadline fires, **discarding video packets without
-    /// decoding**, then decodes only the newest video packet.
+    /// Switch the input to non-blocking reads (`AVFMT_FLAG_NONBLOCK`).
     ///
-    /// Decoding every queued frame just to throw all but one away is what
-    /// melts the media tick on 1080p60+ capture devices (each MJPEG decode
-    /// costs milliseconds; the old drain decoded up to 4 per tick while
-    /// delivering 1). Packet reads are cheap; a single decode bounds the
-    /// per-tick work no matter how far behind the queue got — the backlog
-    /// is dropped, never caught up frame-by-frame.
+    /// Required for live devices: dshow and gdigrab **ignore FFmpeg's
+    /// interrupt callback** (dshow blocks in `WaitForMultipleObjects(…,
+    /// INFINITE)`, gdigrab in `av_usleep`), and ffmpeg-next's
+    /// `Input::packets()` iterator retries every non-EOF error forever, so
+    /// the old "read until the interrupt deadline" loop never returned on
+    /// a live device. With NONBLOCK the device returns `EAGAIN` as soon as
+    /// its queue is empty.
+    pub(crate) fn set_nonblocking(&mut self) {
+        unsafe {
+            (*self.ictx.as_mut_ptr()).flags |= ff::ffi::AVFMT_FLAG_NONBLOCK;
+        }
+    }
+
+    /// Install an interrupt callback for the rest of the context's life.
     ///
-    /// Audio packets met along the way are fed to the audio decoder (via
-    /// [`Self::pump_audio`]) so A/V stays in sync; they are not dropped.
-    /// `Ok(None)` = no video packet arrived before the deadline.
-    /// The caller sets the interrupt deadline before calling; on a live
-    /// source `packets().next()` returns `None` at the deadline (transient,
-    /// not EOF).
-    pub(crate) fn next_video_newest(&mut self) -> Result<Option<CapturedFrame>, CaptureError> {
-        debug_assert!(self.live, "next_video_newest is for live sources");
-        let mut newest_packet: Option<ff::Packet> = None;
-        loop {
-            let Some((stream, packet)) = self.ictx.packets().next() else {
+    /// # Safety
+    /// `opaque` must stay valid until this demuxer is dropped.
+    pub(crate) unsafe fn set_interrupt(
+        &mut self,
+        cb: unsafe extern "C" fn(*mut std::os::raw::c_void) -> std::os::raw::c_int,
+        opaque: *mut std::os::raw::c_void,
+    ) {
+        let ctx = self.ictx.as_mut_ptr();
+        (*ctx).interrupt_callback.callback = Some(cb);
+        (*ctx).interrupt_callback.opaque = opaque;
+    }
+
+    /// True when the video codec is intra-only (see field docs).
+    #[cfg(test)]
+    pub(crate) fn intra_only(&self) -> bool {
+        self.intra_only
+    }
+
+    /// One non-blocking live pass: read **everything the device has queued
+    /// right now** (never waits), feed audio to the audio decoder, and
+    /// return only the newest video frame. Stale frames are dropped (and
+    /// counted) instead of being processed one by one — so a stall can
+    /// never turn into a backlog. Requires [`Self::set_nonblocking`].
+    ///
+    /// Intra-only codecs: stale packets are discarded without decoding.
+    /// Inter codecs: every packet is decoded (references stay valid) but
+    /// only the newest picture is converted to RGBA.
+    pub(crate) fn drain_live(&mut self) -> Result<LiveDrain, CaptureError> {
+        use ff::util::error::{Error, EAGAIN};
+        let mut out = LiveDrain::default();
+        let mut newest_pkt: Option<(ff::Packet, i64)> = None;
+        let mut newest_pic: Option<(ff::util::frame::video::Video, i64)> = None;
+        let pass_start = crate::clock::now_us();
+        while out.packets < MAX_PACKETS_PER_DRAIN {
+            // Time budget: inputs that ignore NONBLOCK (network demuxers)
+            // block until the next packet; never let one pass wait for
+            // more than ~one frame before publishing what it has.
+            if out.packets > 0 && crate::clock::now_us() - pass_start > MAX_PASS_US {
                 break;
-            };
-            if stream.index() == self.video_stream {
-                // Drop the previous video packet without decoding it:
-                // only the newest frame will ever be shown.
-                newest_packet = Some(packet);
-            } else if Some(stream.index()) == self.audio_stream {
+            }
+            let mut pkt = ff::Packet::empty();
+            match pkt.read(&mut self.ictx) {
+                Ok(()) => {}
+                Err(Error::Other { errno }) if errno == EAGAIN => break,
+                Err(Error::Eof) => {
+                    out.eof = true;
+                    break;
+                }
+                // Interrupt callback fired (protocols that honour it).
+                Err(Error::Exit) => break,
+                Err(e) => return Err(CaptureError::ReadFailed(format!("read: {e}"))),
+            }
+            out.packets += 1;
+            let read_at = crate::clock::now_us();
+            if pkt.stream() == self.video_stream {
+                if self.intra_only {
+                    if newest_pkt.replace((pkt, read_at)).is_some() {
+                        out.dropped += 1;
+                    }
+                } else {
+                    // A corrupt/undecodable packet (e.g. joining an H.264
+                    // stream mid-GOP: "non-existing PPS") is skipped, not
+                    // fatal — the decoder recovers at the next keyframe.
+                    if self.video_decoder.send_packet(&pkt).is_ok() {
+                        while let Ok(Some(pic)) = self.receive_raw_video() {
+                            if newest_pic.replace((pic, read_at)).is_some() {
+                                out.dropped += 1;
+                            }
+                        }
+                    } else {
+                        out.decode_errors += 1;
+                    }
+                }
+            } else if Some(pkt.stream()) == self.audio_stream {
                 if let Some(ref mut ad) = self.audio_decoder {
-                    ad.send_packet(&packet)
-                        .map_err(|e| CaptureError::ReadFailed(format!("audio send_packet: {e}")))?;
-                    self.pump_audio()?;
+                    if ad.send_packet(&pkt).is_ok() {
+                        self.audio_read_at_us = read_at;
+                        let _ = self.pump_audio();
+                    }
                 }
             }
         }
-        let Some(packet) = newest_packet else {
-            return Ok(None);
-        };
-        self.video_decoder
-            .send_packet(&packet)
-            .map_err(|e| CaptureError::ReadFailed(format!("video send_packet: {e}")))?;
-        // One packet yields one frame for MJPEG-like live formats; take
-        // the first decoded frame.
-        match self.decode_one_video()? {
-            Some(f) => Ok(Some(f)),
-            None => Ok(None),
+        if let Some((pkt, read_at)) = newest_pkt {
+            if self.video_decoder.send_packet(&pkt).is_ok() {
+                while let Ok(Some(pic)) = self.receive_raw_video() {
+                    if newest_pic.replace((pic, read_at)).is_some() {
+                        out.dropped += 1;
+                    }
+                }
+            } else {
+                out.decode_errors += 1;
+            }
+        }
+        if let Some((pic, read_at)) = newest_pic {
+            let mut f = self.scale_picture(&pic)?;
+            f.captured_at_us = self.video_clock.map(f.pts_us, read_at);
+            out.frame = Some(f);
+        }
+        Ok(out)
+    }
+
+    /// Receive one decoded picture without converting it.
+    fn receive_raw_video(&mut self) -> Result<Option<ff::util::frame::video::Video>, CaptureError> {
+        let mut decoded = ff::util::frame::video::Video::empty();
+        match self.video_decoder.receive_frame(&mut decoded) {
+            Ok(()) => Ok(Some(decoded)),
+            Err(ff::util::error::Error::Eof) => Ok(None),
+            Err(ff::util::error::Error::Other { errno: 11 }) => Ok(None),
+            Err(e) => Err(CaptureError::ReadFailed(format!("video receive_frame: {e}"))),
         }
     }
 
@@ -399,21 +519,24 @@ impl DemuxDecoder {
     }
 
     fn decode_one_video(&mut self) -> Result<Option<CapturedFrame>, CaptureError> {
-        let mut decoded = ff::util::frame::video::Video::empty();
-        match self.video_decoder.receive_frame(&mut decoded) {
-            Ok(()) => {}
-            // EAGAIN (errno 11): need more packets. EOF: decoder drained.
-            Err(ff::util::error::Error::Eof) => return Ok(None),
-            Err(ff::util::error::Error::Other { errno: 11 }) => return Ok(None),
-            Err(e) => {
-                return Err(CaptureError::ReadFailed(format!(
-                    "video receive_frame: {e}"
-                )))
+        match self.receive_raw_video()? {
+            Some(pic) => {
+                let mut f = self.scale_picture(&pic)?;
+                f.captured_at_us = crate::clock::now_us();
+                Ok(Some(f))
             }
+            None => Ok(None),
         }
+    }
+
+    /// Convert one decoded picture to a tightly packed RGBA frame.
+    fn scale_picture(
+        &mut self,
+        decoded: &ff::util::frame::video::Video,
+    ) -> Result<CapturedFrame, CaptureError> {
         let mut rgba = ff::util::frame::video::Video::empty();
         self.scaler
-            .run(&decoded, &mut rgba)
+            .run(decoded, &mut rgba)
             .map_err(|e| CaptureError::ReadFailed(format!("swscale run: {e}")))?;
         let fallback = self.video_frames_out as i64 * self.nominal_frame_us as i64;
         let pts_us = pts_to_us(decoded.pts(), self.video_tb.0, self.video_tb.1, fallback);
@@ -427,13 +550,14 @@ impl DemuxDecoder {
             let d = y * w4;
             data[d..d + w4].copy_from_slice(&src[s..s + w4]);
         }
-        Ok(Some(CapturedFrame {
+        Ok(CapturedFrame {
             data,
             width: self.width,
             height: self.height,
             pts_us,
             duration_us: self.nominal_frame_us,
-        }))
+            captured_at_us: 0,
+        })
     }
 
     fn drain_video(&mut self) -> Result<Option<CapturedFrame>, CaptureError> {
@@ -456,50 +580,67 @@ impl DemuxDecoder {
     }
 
     fn pump_audio(&mut self) -> Result<(), CaptureError> {
-        let ad = self.audio_decoder.as_mut().expect("audio decoder present");
-        let rs = self.resampler.as_mut().expect("resampler present");
-        loop {
-            let mut decoded = ff::util::frame::audio::Audio::empty();
-            match ad.receive_frame(&mut decoded) {
-                Ok(()) => {}
-                // EAGAIN (errno 11): need more packets. EOF: decoder drained.
-                Err(ff::util::error::Error::Eof) => break,
-                Err(ff::util::error::Error::Other { errno: 11 }) => break,
-                Err(e) => {
-                    return Err(CaptureError::ReadFailed(format!(
-                        "audio receive_frame: {e}"
-                    )))
+        let mut produced: Vec<(Vec<f32>, i64, u64)> = Vec::new();
+        {
+            let ad = self.audio_decoder.as_mut().expect("audio decoder present");
+            let rs = self.resampler.as_mut().expect("resampler present");
+            let mut samples_out = self.audio_samples_out;
+            loop {
+                let mut decoded = ff::util::frame::audio::Audio::empty();
+                match ad.receive_frame(&mut decoded) {
+                    Ok(()) => {}
+                    // EAGAIN (errno 11): need more packets. EOF: decoder drained.
+                    Err(ff::util::error::Error::Eof) => break,
+                    Err(ff::util::error::Error::Other { errno: 11 }) => break,
+                    Err(e) => {
+                        return Err(CaptureError::ReadFailed(format!(
+                            "audio receive_frame: {e}"
+                        )))
+                    }
                 }
+                // Upper bound on resampled output samples for this input frame.
+                let max_out = decoded.samples() as usize * 2 + 1024;
+                let mut out = ff::util::frame::audio::Audio::new(
+                    ff::util::format::sample::Sample::F32(ff::util::format::sample::Type::Packed),
+                    max_out,
+                    ff::channel_layout::ChannelLayout::STEREO,
+                );
+                rs.run(&decoded, &mut out)
+                    .map_err(|e| CaptureError::ReadFailed(format!("swresample run: {e}")))?;
+                let n = out.samples() as usize * super::media::AUDIO_CHANNELS as usize;
+                let bytes = out.data(0);
+                let floats: &[f32] = unsafe {
+                    std::slice::from_raw_parts(bytes.as_ptr() as *const f32, n.min(bytes.len() / 4))
+                };
+                // PTS fallback: running sample count → µs at the normalized rate.
+                let fallback_us = samples_out * 1_000_000 / super::media::AUDIO_SAMPLE_RATE as u64;
+                let pts_us = pts_to_us(
+                    decoded.pts(),
+                    self.audio_tb.0,
+                    self.audio_tb.1,
+                    fallback_us as i64,
+                );
+                samples_out += out.samples() as u64;
+                produced.push((floats.to_vec(), pts_us, out.samples() as u64));
             }
-            // Upper bound on resampled output samples for this input frame.
-            let max_out = decoded.samples() as usize * 2 + 1024;
-            let mut out = ff::util::frame::audio::Audio::new(
-                ff::util::format::sample::Sample::F32(ff::util::format::sample::Type::Packed),
-                max_out,
-                ff::channel_layout::ChannelLayout::STEREO,
-            );
-            let delay = rs
-                .run(&decoded, &mut out)
-                .map_err(|e| CaptureError::ReadFailed(format!("swresample run: {e}")))?;
-            let _ = delay;
-            let n = out.samples() as usize * super::media::AUDIO_CHANNELS as usize;
-            let bytes = out.data(0);
-            let floats: &[f32] = unsafe {
-                std::slice::from_raw_parts(bytes.as_ptr() as *const f32, n.min(bytes.len() / 4))
+        }
+        for (samples, pts_us, frames) in produced {
+            self.audio_samples_out += frames;
+            let captured_at_us = if self.live {
+                self.audio_clock.map(pts_us, self.audio_read_at_us.max(1))
+            } else {
+                crate::clock::now_us()
             };
-            // PTS fallback: running sample count → µs at the normalized rate.
-            let fallback_us =
-                self.audio_samples_out * 1_000_000 / super::media::AUDIO_SAMPLE_RATE as u64;
-            let pts_us = pts_to_us(
-                decoded.pts(),
-                self.audio_tb.0,
-                self.audio_tb.1,
-                fallback_us as i64,
-            );
-            self.audio_samples_out += out.samples() as u64;
+            // Live: bounded, newest-wins (a stalled consumer never builds
+            // an audio backlog inside the demuxer; the audio bus applies the
+            // precise live-latency policy).
+            if self.live && self.audio_queue.len() >= 32 {
+                self.audio_queue.pop_front();
+            }
             self.audio_queue.push_back(RawAudio {
-                samples: floats.to_vec(),
+                samples,
                 pts_us,
+                captured_at_us,
             });
         }
         Ok(())

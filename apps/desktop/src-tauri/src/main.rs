@@ -11,12 +11,12 @@
 //! - Engine → UI events are polled from `Shell::drain_events()` on a 66 ms
 //!   background thread and re-emitted as Tauri `"sf-event"` payloads; the
 //!   frontend routes on the spec §9 `event` tag inside each payload.
-//! - The media pipeline (`Shell::av_tick`: render + encode) runs on its own
-//!   fixed 33.3 ms background thread (30 fps master tick), separate from the
-//!   66 ms UI event poll, so slow UI work can never stall the program feed.
-//! - `preview_get_frame` returns a PNG data URL throttled to ~10 Hz by the
-//!   backend. Production will replace this with a faster zero-copy path
-//!   (shared texture / WebView streaming) — the command shape stays.
+//! - The media pipeline runs on its own thread with an absolute-deadline
+//!   clock and passes each tick's *scheduled* time to `Shell::av_tick_at`,
+//!   so stream timestamps follow the wall clock even when a tick runs late.
+//! - Every command is `async`: it runs off the WebView/main thread, so a
+//!   busy engine can never freeze the UI. Monitor frames are taken under the
+//!   lock in O(1) and JPEG-encoded after releasing it.
 
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
@@ -28,7 +28,7 @@ use sf_ipc::FilterTarget;
 use sf_ui_backend::{
     AiResultView, CameraSourceInfo, ChannelStrip, EffectKindInfo, EnhancerView, LookInfo, Macro,
     MacroAction, MacroDispatchResult, ProdScene, ProductionStateView, Shell, ShellError, SlotView,
-    SourceState, TransitionView, UiEvent, VideoSettings,
+    SourceState, TransitionView, UiEvent, VideoSettings, DiagnosticsView, PlatformInfo, AvSyncView,
 };
 use tauri::{AppHandle, Emitter, Manager, State};
 
@@ -52,7 +52,7 @@ fn ue(e: ShellError) -> String {
 // ---------------------------------------------------------------------------
 
 /// `color.set_param` — the frontend throttles slider drags to 60 Hz (spec §8).
-#[tauri::command(rename_all = "snake_case")]
+#[tauri::command(async, rename_all = "snake_case")]
 fn color_set_param(
     state: State<'_, AppState>,
     input_id: String,
@@ -65,7 +65,7 @@ fn color_set_param(
 }
 
 /// Shell extension for spec §8 "double-click a slider = reset".
-#[tauri::command(rename_all = "snake_case")]
+#[tauri::command(async, rename_all = "snake_case")]
 fn color_reset_param(
     state: State<'_, AppState>,
     input_id: String,
@@ -75,7 +75,7 @@ fn color_reset_param(
 }
 
 /// `color.set_curve`.
-#[tauri::command(rename_all = "snake_case")]
+#[tauri::command(async, rename_all = "snake_case")]
 fn color_set_curve(
     state: State<'_, AppState>,
     input_id: String,
@@ -88,7 +88,7 @@ fn color_set_curve(
 }
 
 /// `color.load_lut` — `position`: `"before"` | `"after"`.
-#[tauri::command(rename_all = "snake_case")]
+#[tauri::command(async, rename_all = "snake_case")]
 fn color_load_lut(
     state: State<'_, AppState>,
     input_id: String,
@@ -102,7 +102,7 @@ fn color_load_lut(
 }
 
 /// `color.reset` — `section`: `"basic"` | `"wheels"` | `"curves"` | `"lut"` | null.
-#[tauri::command(rename_all = "snake_case")]
+#[tauri::command(async, rename_all = "snake_case")]
 fn color_reset(
     state: State<'_, AppState>,
     input_id: String,
@@ -114,13 +114,13 @@ fn color_reset(
 }
 
 /// `color.auto` — one-click AI auto color (editable params + explanations).
-#[tauri::command(rename_all = "snake_case")]
+#[tauri::command(async, rename_all = "snake_case")]
 fn color_auto(state: State<'_, AppState>, input_id: String) -> CmdResult<AiResultView> {
     lock(&state)?.color_auto(&input_id).map_err(ue)
 }
 
 /// `color.match` — AI camera match.
-#[tauri::command(rename_all = "snake_case")]
+#[tauri::command(async, rename_all = "snake_case")]
 fn color_match(
     state: State<'_, AppState>,
     reference_id: String,
@@ -132,7 +132,7 @@ fn color_match(
 }
 
 /// Applies a full grade snapshot (A/B slots, before/after compare).
-#[tauri::command(rename_all = "snake_case")]
+#[tauri::command(async, rename_all = "snake_case")]
 fn apply_grade(
     state: State<'_, AppState>,
     input_id: String,
@@ -142,7 +142,7 @@ fn apply_grade(
 }
 
 /// Current grade snapshot (slider positions).
-#[tauri::command(rename_all = "snake_case")]
+#[tauri::command(async, rename_all = "snake_case")]
 fn grade_snapshot(state: State<'_, AppState>, input_id: String) -> CmdResult<sf_color::ColorGrade> {
     lock(&state)?.grade_snapshot(&input_id).map_err(ue)
 }
@@ -152,7 +152,7 @@ fn grade_snapshot(state: State<'_, AppState>, input_id: String) -> CmdResult<sf_
 // ---------------------------------------------------------------------------
 
 /// `filter.add`.
-#[tauri::command(rename_all = "snake_case")]
+#[tauri::command(async, rename_all = "snake_case")]
 fn filter_add(
     state: State<'_, AppState>,
     target: FilterTarget,
@@ -165,7 +165,7 @@ fn filter_add(
 }
 
 /// `filter.reorder` — `order`: slot ids in the new order.
-#[tauri::command(rename_all = "snake_case")]
+#[tauri::command(async, rename_all = "snake_case")]
 fn filter_reorder(
     state: State<'_, AppState>,
     target: FilterTarget,
@@ -182,7 +182,7 @@ fn filter_reorder(
 }
 
 /// `filter.set_intensity`.
-#[tauri::command(rename_all = "snake_case")]
+#[tauri::command(async, rename_all = "snake_case")]
 fn filter_set_intensity(
     state: State<'_, AppState>,
     target: FilterTarget,
@@ -198,7 +198,7 @@ fn filter_set_intensity(
 }
 
 /// `filter.toggle` — one-click bypass.
-#[tauri::command(rename_all = "snake_case")]
+#[tauri::command(async, rename_all = "snake_case")]
 fn filter_toggle(
     state: State<'_, AppState>,
     target: FilterTarget,
@@ -214,7 +214,7 @@ fn filter_toggle(
 }
 
 /// Removes a slot (UI affordance).
-#[tauri::command(rename_all = "snake_case")]
+#[tauri::command(async, rename_all = "snake_case")]
 fn filter_remove(
     state: State<'_, AppState>,
     target: FilterTarget,
@@ -227,7 +227,7 @@ fn filter_remove(
 }
 
 /// `look.apply` — one click + intensity.
-#[tauri::command(rename_all = "snake_case")]
+#[tauri::command(async, rename_all = "snake_case")]
 fn look_apply(
     state: State<'_, AppState>,
     target: FilterTarget,
@@ -241,23 +241,22 @@ fn look_apply(
 }
 
 /// Stack snapshot for the Filters tab.
-#[tauri::command(rename_all = "snake_case")]
+#[tauri::command(async, rename_all = "snake_case")]
 fn stack_snapshot(state: State<'_, AppState>, target: FilterTarget) -> CmdResult<Vec<SlotView>> {
     lock(&state)?.stack_snapshot(&target).map_err(ue)
 }
 
 /// Built-in looks for the looks strip.
-#[tauri::command(rename_all = "snake_case")]
-fn list_looks(state: State<'_, AppState>) -> Vec<LookInfo> {
-    lock(&state).map(|mut s| s.list_looks()).unwrap_or_default()
+#[tauri::command(async, rename_all = "snake_case")]
+fn list_looks(state: State<'_, AppState>) -> CmdResult<Vec<LookInfo>> {
+    lock(&state).map(|mut s| s.list_looks())
 }
 
 /// Effect-kind catalog for the Filters tab "add" menu.
-#[tauri::command(rename_all = "snake_case")]
-fn list_effect_kinds(state: State<'_, AppState>) -> Vec<EffectKindInfo> {
+#[tauri::command(async, rename_all = "snake_case")]
+fn list_effect_kinds(state: State<'_, AppState>) -> CmdResult<Vec<EffectKindInfo>> {
     lock(&state)
         .map(|s| s.list_effect_kinds())
-        .unwrap_or_default()
 }
 
 // ---------------------------------------------------------------------------
@@ -265,13 +264,13 @@ fn list_effect_kinds(state: State<'_, AppState>) -> Vec<EffectKindInfo> {
 // ---------------------------------------------------------------------------
 
 /// `scopes.subscribe` — `kind`: waveform|vectorscope|histogram|false_color|zebra.
-#[tauri::command(rename_all = "snake_case")]
+#[tauri::command(async, rename_all = "snake_case")]
 fn scopes_subscribe(state: State<'_, AppState>, input_id: String, kind: String) -> CmdResult<()> {
     lock(&state)?.scopes_subscribe(&input_id, &kind).map_err(ue)
 }
 
 /// `scopes.unsubscribe`.
-#[tauri::command(rename_all = "snake_case")]
+#[tauri::command(async, rename_all = "snake_case")]
 fn scopes_unsubscribe(state: State<'_, AppState>, input_id: String, kind: String) -> CmdResult<()> {
     lock(&state)?
         .scopes_unsubscribe(&input_id, &kind)
@@ -281,7 +280,7 @@ fn scopes_unsubscribe(state: State<'_, AppState>, input_id: String, kind: String
 /// `preview.get_frame` — JPEG data URL of the Color Studio preview. When the
 /// input is on air this is the exact graded frame the media tick sent to the
 /// program/encoder (live tap); `mode` = "after" (default) | "before" | "split".
-#[tauri::command(rename_all = "snake_case")]
+#[tauri::command(async, rename_all = "snake_case")]
 fn preview_get_frame(
     state: State<'_, AppState>,
     input_id: String,
@@ -300,13 +299,13 @@ fn preview_get_frame(
 }
 
 /// Removes the active look from a stack.
-#[tauri::command(rename_all = "snake_case")]
+#[tauri::command(async, rename_all = "snake_case")]
 fn look_clear(state: State<'_, AppState>, target: FilterTarget) -> CmdResult<()> {
     lock(&state)?.look_clear(target).map_err(ue)
 }
 
 /// Live effect parameters (Glow threshold/radius/softness, skin smoothing).
-#[tauri::command(rename_all = "snake_case")]
+#[tauri::command(async, rename_all = "snake_case")]
 fn filter_set_params(
     state: State<'_, AppState>,
     target: FilterTarget,
@@ -322,22 +321,22 @@ fn filter_set_params(
 }
 
 /// Imports a `.cube` into the LUT library (validated; clear error otherwise).
-#[tauri::command(rename_all = "snake_case")]
+#[tauri::command(async, rename_all = "snake_case")]
 fn lut_import(state: State<'_, AppState>, path: String) -> CmdResult<sf_ui_backend::LutInfo> {
     lock(&state)?.lut_import(&path).map_err(ue)
 }
 
-#[tauri::command(rename_all = "snake_case")]
+#[tauri::command(async, rename_all = "snake_case")]
 fn lut_library(state: State<'_, AppState>) -> CmdResult<Vec<sf_ui_backend::LutInfo>> {
     Ok(lock(&state)?.lut_library())
 }
 
-#[tauri::command(rename_all = "snake_case")]
+#[tauri::command(async, rename_all = "snake_case")]
 fn lut_remove(state: State<'_, AppState>, id: String) -> CmdResult<()> {
     lock(&state)?.lut_remove(&id).map_err(ue)
 }
 
-#[tauri::command(rename_all = "snake_case")]
+#[tauri::command(async, rename_all = "snake_case")]
 fn color_preset_save(
     state: State<'_, AppState>,
     input_id: String,
@@ -346,12 +345,12 @@ fn color_preset_save(
     lock(&state)?.color_preset_save(&input_id, &name).map_err(ue)
 }
 
-#[tauri::command(rename_all = "snake_case")]
+#[tauri::command(async, rename_all = "snake_case")]
 fn color_preset_list(state: State<'_, AppState>) -> CmdResult<Vec<sf_ui_backend::ColorPresetInfo>> {
     Ok(lock(&state)?.color_preset_list())
 }
 
-#[tauri::command(rename_all = "snake_case")]
+#[tauri::command(async, rename_all = "snake_case")]
 fn color_preset_apply(
     state: State<'_, AppState>,
     input_id: String,
@@ -360,7 +359,7 @@ fn color_preset_apply(
     lock(&state)?.color_preset_apply(&input_id, &id).map_err(ue)
 }
 
-#[tauri::command(rename_all = "snake_case")]
+#[tauri::command(async, rename_all = "snake_case")]
 fn color_preset_delete(state: State<'_, AppState>, id: String) -> CmdResult<()> {
     lock(&state)?.color_preset_delete(&id).map_err(ue)
 }
@@ -377,13 +376,13 @@ fn jpg_data_url(jpg: &[u8]) -> String {
 // ---------------------------------------------------------------------------
 
 /// Creates a production scene.
-#[tauri::command(rename_all = "snake_case")]
+#[tauri::command(async, rename_all = "snake_case")]
 fn scene_create(state: State<'_, AppState>, name: String) -> CmdResult<ProdScene> {
     Ok(lock(&state)?.scene_create(&name))
 }
 
 /// Renames a production scene.
-#[tauri::command(rename_all = "snake_case")]
+#[tauri::command(async, rename_all = "snake_case")]
 fn scene_rename(
     state: State<'_, AppState>,
     scene_id: String,
@@ -393,28 +392,28 @@ fn scene_rename(
 }
 
 /// Deletes a production scene (errors on the last scene).
-#[tauri::command(rename_all = "snake_case")]
+#[tauri::command(async, rename_all = "snake_case")]
 fn scene_delete(state: State<'_, AppState>, scene_id: String) -> CmdResult<()> {
     lock(&state)?.scene_delete(&scene_id).map_err(ue)
 }
 
 /// Duplicates a production scene (fresh source ids + engine inputs).
-#[tauri::command(rename_all = "snake_case")]
+#[tauri::command(async, rename_all = "snake_case")]
 fn scene_duplicate(state: State<'_, AppState>, scene_id: String) -> CmdResult<ProdScene> {
     lock(&state)?.scene_duplicate(&scene_id).map_err(ue)
 }
 
 /// Lists all production scenes.
-#[tauri::command(rename_all = "snake_case")]
-fn scene_list(state: State<'_, AppState>) -> Vec<ProdScene> {
-    lock(&state).map(|s| s.scene_list()).unwrap_or_default()
+#[tauri::command(async, rename_all = "snake_case")]
+fn scene_list(state: State<'_, AppState>) -> CmdResult<Vec<ProdScene>> {
+    lock(&state).map(|s| s.scene_list())
 }
 
 /// Adds a source to a scene. `kind`: `test_pattern` | `color` | `camera` |
 /// `screen` | `media` | `text`. `color_*` apply to the `color` kind;
 /// `text`/`path` to the `text`/`media` kinds. Pending kinds report
 /// `status: "pending"` and are skipped in the composite.
-#[tauri::command(rename_all = "snake_case")]
+#[tauri::command(async, rename_all = "snake_case")]
 fn source_add(
     state: State<'_, AppState>,
     scene_id: String,
@@ -449,28 +448,28 @@ fn source_add(
 }
 
 /// Lists available camera devices (Windows DirectShow; empty elsewhere).
-#[tauri::command(rename_all = "snake_case")]
-fn list_cameras(state: State<'_, AppState>) -> Vec<String> {
-    lock(&state).map(|s| s.list_cameras()).unwrap_or_default()
+#[tauri::command(async, rename_all = "snake_case")]
+fn list_cameras(state: State<'_, AppState>) -> CmdResult<Vec<String>> {
+    lock(&state).map(|s| s.list_cameras())
 }
 
 /// Negotiated camera format for a source, e.g.
 /// `"mjpeg 1920x1080 @30fps (via mjpeg)"` — what the camera actually gave,
 /// not just what was requested. `None` for non-camera sources.
-#[tauri::command(rename_all = "snake_case")]
-fn camera_format(state: State<'_, AppState>, source_id: String) -> Option<String> {
-    lock(&state).ok().and_then(|s| s.camera_format(&source_id))
+#[tauri::command(async, rename_all = "snake_case")]
+fn camera_format(state: State<'_, AppState>, source_id: String) -> CmdResult<Option<String>> {
+    Ok(lock(&state)?.camera_format(&source_id))
 }
 
 /// Audio device label for a source (mic name for audio inputs / camera
 /// audio). None for sources without an audio device.
-#[tauri::command(rename_all = "snake_case")]
-fn source_audio_device(state: State<'_, AppState>, source_id: String) -> Option<String> {
-    lock(&state).ok().and_then(|s| s.source_audio_device(&source_id))
+#[tauri::command(async, rename_all = "snake_case")]
+fn source_audio_device(state: State<'_, AppState>, source_id: String) -> CmdResult<Option<String>> {
+    Ok(lock(&state)?.source_audio_device(&source_id))
 }
 
 /// Current video input/output settings for the Video menu panel.
-#[tauri::command(rename_all = "snake_case")]
+#[tauri::command(async, rename_all = "snake_case")]
 fn video_settings_get(state: State<'_, AppState>) -> CmdResult<VideoSettings> {
     lock(&state).map(|s| s.video_settings_get())
 }
@@ -478,13 +477,13 @@ fn video_settings_get(state: State<'_, AppState>) -> CmdResult<VideoSettings> {
 /// Validates and stores video settings. Output size/fps/encoder/bitrate
 /// apply the next time streaming/recording starts; the media-tick cadence
 /// follows `output_fps` immediately.
-#[tauri::command(rename_all = "snake_case")]
+#[tauri::command(async, rename_all = "snake_case")]
 fn video_settings_set(state: State<'_, AppState>, settings: VideoSettings) -> CmdResult<()> {
     lock(&state)?.video_settings_set(settings).map_err(ue)
 }
 
 /// Pauses/resumes a media source's playback; returns the new paused state.
-#[tauri::command(rename_all = "snake_case")]
+#[tauri::command(async, rename_all = "snake_case")]
 fn media_set_paused(
     state: State<'_, AppState>,
     source_id: String,
@@ -497,7 +496,7 @@ fn media_set_paused(
 
 /// Reconfigures a camera source live (device/resolution/fps) and returns
 /// what the camera actually negotiated.
-#[tauri::command(rename_all = "snake_case")]
+#[tauri::command(async, rename_all = "snake_case")]
 fn camera_reconfigure(
     state: State<'_, AppState>,
     source_id: String,
@@ -513,46 +512,44 @@ fn camera_reconfigure(
 }
 
 /// All camera sources with live config + negotiated format (Video panel).
-#[tauri::command(rename_all = "snake_case")]
-fn camera_sources(state: State<'_, AppState>) -> Vec<CameraSourceInfo> {
-    lock(&state).map(|s| s.camera_sources()).unwrap_or_default()
+#[tauri::command(async, rename_all = "snake_case")]
+fn camera_sources(state: State<'_, AppState>) -> CmdResult<Vec<CameraSourceInfo>> {
+    lock(&state).map(|s| s.camera_sources())
 }
 
 /// Lists available audio input devices (Windows DirectShow; empty elsewhere).
-#[tauri::command(rename_all = "snake_case")]
-fn list_audio_devices(state: State<'_, AppState>) -> Vec<String> {
-    lock(&state).map(|s| s.list_audio_devices()).unwrap_or_default()
+#[tauri::command(async, rename_all = "snake_case")]
+fn list_audio_devices(state: State<'_, AppState>) -> CmdResult<Vec<String>> {
+    lock(&state).map(|s| s.list_audio_devices())
 }
 
 /// Active stream encoder name.
-#[tauri::command(rename_all = "snake_case")]
-fn stream_encoder_name(state: State<'_, AppState>) -> String {
-    lock(&state).map(|s| s.stream_encoder_name()).unwrap_or_default()
+#[tauri::command(async, rename_all = "snake_case")]
+fn stream_encoder_name(state: State<'_, AppState>) -> CmdResult<String> {
+    lock(&state).map(|s| s.stream_encoder_name())
 }
 
 /// Stage timings of the last media tick in ms:
 /// `[render, audio, record, stream]` — which stage eats the 33ms budget.
-#[tauri::command(rename_all = "snake_case")]
-fn perf_stages(state: State<'_, AppState>) -> Vec<f32> {
+#[tauri::command(async, rename_all = "snake_case")]
+fn perf_stages(state: State<'_, AppState>) -> CmdResult<Vec<f32>> {
     lock(&state)
         .map(|s| s.perf_stages().to_vec())
-        .unwrap_or_default()
 }
 
 /// Performance stats: (fps, render_ms, cpu_percent_estimate, stream_kbps,
 /// skipped_render, dropped_network, lagged_ticks).
-#[tauri::command(rename_all = "snake_case")]
-fn perf_stats(state: State<'_, AppState>) -> Vec<f32> {
+#[tauri::command(async, rename_all = "snake_case")]
+fn perf_stats(state: State<'_, AppState>) -> CmdResult<Vec<f32>> {
     lock(&state)
         .map(|mut s| {
             let (fps, render_ms, cpu, kbps, skipped, dropped, lagged) = s.perf_stats();
             vec![fps, render_ms, cpu, kbps, skipped, dropped, lagged]
         })
-        .unwrap_or_default()
 }
 
 /// Removes a source from a scene.
-#[tauri::command(rename_all = "snake_case")]
+#[tauri::command(async, rename_all = "snake_case")]
 fn source_remove(state: State<'_, AppState>, scene_id: String, source_id: String) -> CmdResult<()> {
     lock(&state)?
         .source_remove(&scene_id, &source_id)
@@ -560,7 +557,7 @@ fn source_remove(state: State<'_, AppState>, scene_id: String, source_id: String
 }
 
 /// Drag-reorders a scene's sources: `order` holds source ids bottom to top.
-#[tauri::command(rename_all = "snake_case")]
+#[tauri::command(async, rename_all = "snake_case")]
 fn source_reorder(
     state: State<'_, AppState>,
     scene_id: String,
@@ -570,7 +567,7 @@ fn source_reorder(
 }
 
 /// Shows or hides a source.
-#[tauri::command(rename_all = "snake_case")]
+#[tauri::command(async, rename_all = "snake_case")]
 fn source_set_visible(
     state: State<'_, AppState>,
     scene_id: String,
@@ -588,32 +585,32 @@ fn source_set_visible(
 
 /// Full production snapshot (scenes, preview/program, transition, mixer,
 /// stream/record lifecycles, macros).
-#[tauri::command(rename_all = "snake_case")]
+#[tauri::command(async, rename_all = "snake_case")]
 fn production_state(state: State<'_, AppState>) -> CmdResult<ProductionStateView> {
     Ok(lock(&state)?.production_state())
 }
 
 /// Sets the preview (standby) scene. Retargets an in-flight transition.
-#[tauri::command(rename_all = "snake_case")]
+#[tauri::command(async, rename_all = "snake_case")]
 fn production_set_preview(state: State<'_, AppState>, scene_id: String) -> CmdResult<()> {
     lock(&state)?.production_set_preview(&scene_id).map_err(ue)
 }
 
 /// Sets the program scene directly (cancels any in-flight transition).
-#[tauri::command(rename_all = "snake_case")]
+#[tauri::command(async, rename_all = "snake_case")]
 fn production_set_program(state: State<'_, AppState>, scene_id: String) -> CmdResult<()> {
     lock(&state)?.production_set_program(&scene_id).map_err(ue)
 }
 
 /// Instant cut: program = preview.
-#[tauri::command(rename_all = "snake_case")]
+#[tauri::command(async, rename_all = "snake_case")]
 fn transition_cut(state: State<'_, AppState>) -> CmdResult<()> {
     lock(&state)?.transition_cut().map_err(ue)
 }
 
 /// Starts an auto transition. `kind`: `"mix"` (only kind today).
 /// The 66 ms poll loop advances it via `transition_tick()`.
-#[tauri::command(rename_all = "snake_case")]
+#[tauri::command(async, rename_all = "snake_case")]
 fn transition_auto(
     state: State<'_, AppState>,
     duration_ms: u64,
@@ -627,12 +624,50 @@ fn transition_auto(
 /// Scene monitor frame as a JPEG data URL. The program scene is served from
 /// the media tick's live monitor frame (10fps, no re-render); other scenes
 /// render on demand at monitor size.
-#[tauri::command(rename_all = "snake_case")]
+#[tauri::command(async, rename_all = "snake_case")]
 fn scene_preview_jpg(state: State<'_, AppState>, scene_id: String) -> CmdResult<String> {
-    let jpg = lock(&state)?
-        .scene_monitor_jpg(&scene_id)
-        .map_err(ue)?;
+    // O(1) under the lock (shared frame); JPEG encode after releasing it,
+    // so a monitor poll never holds up the media tick.
+    let frame = lock(&state)?.monitor_snapshot(&scene_id).map_err(ue)?;
+    let jpg = frame.to_jpeg().map_err(ue)?;
     Ok(jpg_data_url(&jpg))
+}
+
+/// Monitor frame only if it changed since `after_seq` (`None` otherwise):
+/// the UI polls this at display rate without re-transferring identical
+/// frames. Returns `(seq, data_url)`.
+#[tauri::command(async, rename_all = "snake_case")]
+fn monitor_frame_if_new(
+    state: State<'_, AppState>,
+    scene_id: String,
+    after_seq: u64,
+) -> CmdResult<Option<(u64, String)>> {
+    let frame = lock(&state)?.monitor_snapshot(&scene_id).map_err(ue)?;
+    if frame.seq <= after_seq {
+        return Ok(None);
+    }
+    let jpg = frame.to_jpeg().map_err(ue)?;
+    Ok(Some((frame.seq, jpg_data_url(&jpg))))
+}
+
+/// Live diagnostics: per-stage timings, fps, drops, buffers, latency
+/// split (app vs platform), encoder, stream, CPU/RAM.
+#[tauri::command(async, rename_all = "snake_case")]
+fn diagnostics(state: State<'_, AppState>) -> CmdResult<DiagnosticsView> {
+    Ok(lock(&state)?.diagnostics())
+}
+
+/// Streaming platforms (YouTube, Facebook, TikTok, custom RTMP) with
+/// default servers and help text.
+#[tauri::command(async, rename_all = "snake_case")]
+fn stream_platforms() -> CmdResult<Vec<PlatformInfo>> {
+    Ok(sf_ui_backend::platform_list())
+}
+
+/// A/V sync: automatic alignment on/off + manual offset (−100…+100 ms).
+#[tauri::command(async, rename_all = "snake_case")]
+fn av_sync_set(state: State<'_, AppState>, auto: bool, offset_ms: i32) -> CmdResult<AvSyncView> {
+    Ok(lock(&state)?.av_sync_set(auto, offset_ms))
 }
 
 // ---------------------------------------------------------------------------
@@ -640,7 +675,7 @@ fn scene_preview_jpg(state: State<'_, AppState>, scene_id: String) -> CmdResult<
 // ---------------------------------------------------------------------------
 
 /// Sets a source channel gain (`0.0..=2.0`, clamped).
-#[tauri::command(rename_all = "snake_case")]
+#[tauri::command(async, rename_all = "snake_case")]
 fn mixer_set_gain(
     state: State<'_, AppState>,
     source_id: String,
@@ -650,7 +685,7 @@ fn mixer_set_gain(
 }
 
 /// Mutes/unmutes a source channel.
-#[tauri::command(rename_all = "snake_case")]
+#[tauri::command(async, rename_all = "snake_case")]
 fn mixer_set_mute(
     state: State<'_, AppState>,
     source_id: String,
@@ -660,26 +695,26 @@ fn mixer_set_mute(
 }
 
 /// Sets the master gain (`0.0..=2.0`, clamped).
-#[tauri::command(rename_all = "snake_case")]
+#[tauri::command(async, rename_all = "snake_case")]
 fn mixer_set_master_gain(state: State<'_, AppState>, gain: f32) -> CmdResult<ChannelStrip> {
     Ok(lock(&state)?.mixer_set_master_gain(gain))
 }
 
 /// Mutes/unmutes the master.
-#[tauri::command(rename_all = "snake_case")]
+#[tauri::command(async, rename_all = "snake_case")]
 fn mixer_set_master_mute(state: State<'_, AppState>, mute: bool) -> CmdResult<ChannelStrip> {
     Ok(lock(&state)?.mixer_set_master_mute(mute))
 }
 
 /// Enables/disables local speaker monitoring of the master mix.
-#[tauri::command(rename_all = "snake_case")]
+#[tauri::command(async, rename_all = "snake_case")]
 fn set_monitor_enabled(state: State<'_, AppState>, enabled: bool) -> CmdResult<bool> {
     lock(&state)?.set_monitor_enabled(enabled).map_err(ue)?;
     Ok(lock(&state)?.monitor_enabled())
 }
 
 /// Applies audio-enhancer settings (free offline DSP: gate → EQ → compressor).
-#[tauri::command(rename_all = "snake_case")]
+#[tauri::command(async, rename_all = "snake_case")]
 fn set_enhancer_settings(state: State<'_, AppState>, settings: EnhancerView) -> CmdResult<EnhancerView> {
     let mut s = lock(&state)?;
     s.set_enhancer_settings(settings);
@@ -690,10 +725,10 @@ fn set_enhancer_settings(state: State<'_, AppState>, settings: EnhancerView) -> 
 // Production screens: streaming + recording (honest stubs)
 // ---------------------------------------------------------------------------
 
-/// Stores stream settings. `platform`: `youtube` | `twitch` | `facebook` |
+/// Stores stream settings. `platform`: `youtube` | `facebook` | `tiktok` |
 /// `custom_rtmp`. The key is kept in memory only — never logged, never
 /// serialized, never in error strings.
-#[tauri::command(rename_all = "snake_case")]
+#[tauri::command(async, rename_all = "snake_case")]
 fn stream_set_settings(
     state: State<'_, AppState>,
     url: String,
@@ -707,19 +742,19 @@ fn stream_set_settings(
 
 /// Starts streaming. Fails honestly: `sf-output` is a stub, so the
 /// lifecycle moves to `error` with a clear message.
-#[tauri::command(rename_all = "snake_case")]
+#[tauri::command(async, rename_all = "snake_case")]
 fn stream_start(state: State<'_, AppState>) -> CmdResult<()> {
     lock(&state)?.stream_start().map_err(ue)
 }
 
 /// Stops streaming (any state → idle).
-#[tauri::command(rename_all = "snake_case")]
+#[tauri::command(async, rename_all = "snake_case")]
 fn stream_stop(state: State<'_, AppState>) -> CmdResult<()> {
     lock(&state)?.stream_stop().map_err(ue)
 }
 
 /// Stores record settings. `format`: `mp4` | `mkv`.
-#[tauri::command(rename_all = "snake_case")]
+#[tauri::command(async, rename_all = "snake_case")]
 fn record_set_settings(
     state: State<'_, AppState>,
     path: String,
@@ -732,25 +767,25 @@ fn record_set_settings(
 }
 
 /// Starts recording. Fails honestly: `sf-encode` is a stub.
-#[tauri::command(rename_all = "snake_case")]
+#[tauri::command(async, rename_all = "snake_case")]
 fn record_start(state: State<'_, AppState>) -> CmdResult<()> {
     lock(&state)?.record_start().map_err(ue)
 }
 
 /// Stops recording (any state → idle).
-#[tauri::command(rename_all = "snake_case")]
+#[tauri::command(async, rename_all = "snake_case")]
 fn record_stop(state: State<'_, AppState>) -> CmdResult<()> {
     lock(&state)?.record_stop().map_err(ue)
 }
 
 /// Pauses an active recording (elapsed time excludes pauses).
-#[tauri::command(rename_all = "snake_case")]
+#[tauri::command(async, rename_all = "snake_case")]
 fn record_pause(state: State<'_, AppState>) -> CmdResult<()> {
     lock(&state)?.record_pause().map_err(ue)
 }
 
 /// Resumes a paused recording.
-#[tauri::command(rename_all = "snake_case")]
+#[tauri::command(async, rename_all = "snake_case")]
 fn record_resume(state: State<'_, AppState>) -> CmdResult<()> {
     lock(&state)?.record_resume().map_err(ue)
 }
@@ -763,7 +798,7 @@ fn record_resume(state: State<'_, AppState>) -> CmdResult<()> {
 /// `{"action":"cut"}`, `{"action":"auto_transition","duration_ms":500}`,
 /// `{"action":"toggle_stream"}`, `{"action":"toggle_record"}`,
 /// `{"action":"apply_look","look_id":"podcast-warm","intensity":0.8}`.
-#[tauri::command(rename_all = "snake_case")]
+#[tauri::command(async, rename_all = "snake_case")]
 fn macro_add(
     state: State<'_, AppState>,
     name: String,
@@ -774,19 +809,19 @@ fn macro_add(
 }
 
 /// Removes a macro by id.
-#[tauri::command(rename_all = "snake_case")]
+#[tauri::command(async, rename_all = "snake_case")]
 fn macro_remove(state: State<'_, AppState>, macro_id: String) -> CmdResult<()> {
     lock(&state)?.macro_remove(&macro_id).map_err(ue)
 }
 
 /// Lists all bound macros.
-#[tauri::command(rename_all = "snake_case")]
-fn macro_list(state: State<'_, AppState>) -> Vec<Macro> {
-    lock(&state).map(|s| s.macro_list()).unwrap_or_default()
+#[tauri::command(async, rename_all = "snake_case")]
+fn macro_list(state: State<'_, AppState>) -> CmdResult<Vec<Macro>> {
+    lock(&state).map(|s| s.macro_list())
 }
 
 /// Executes the macro bound to `hotkey`; reports what happened.
-#[tauri::command(rename_all = "snake_case")]
+#[tauri::command(async, rename_all = "snake_case")]
 fn macro_dispatch(state: State<'_, AppState>, hotkey: String) -> CmdResult<MacroDispatchResult> {
     lock(&state)?.macro_dispatch(&hotkey).map_err(ue)
 }
@@ -816,38 +851,46 @@ fn main() {
             // On overrun the clock jumps forward in whole intervals and the
             // missed ticks are counted as lagged (never burst-catch-up).
             let media_handle = app.handle().clone();
-            std::thread::spawn(move || {
-                let mut next_deadline = std::time::Instant::now();
-                loop {
-                    let interval_us =
-                        if let Ok(mut s) = media_handle.state::<AppState>().0.lock() {
-                            // Never panics; backend failures degrade to Error states.
-                            s.av_tick();
-                            s.frame_interval_us()
-                        } else {
-                            33_333
-                        };
-                    let interval_us = interval_us.max(1);
-                    let interval = Duration::from_micros(interval_us);
-                    next_deadline += interval;
-                    let now = std::time::Instant::now();
-                    if next_deadline > now {
-                        std::thread::sleep(next_deadline - now);
-                    } else {
-                        // Missed the deadline: advance in whole intervals and
-                        // count the lagged ticks (clamped so a long stall
-                        // can't spiral the clock).
-                        let over_us = now.duration_since(next_deadline).as_micros();
-                        let missed = sf_ui_backend::missed_intervals(over_us, interval_us);
-                        next_deadline += interval * missed as u32;
-                        if missed > 0 {
+            std::thread::Builder::new()
+                .name("sf-media-tick".into())
+                .spawn(move || {
+                    let mut next_deadline = std::time::Instant::now();
+                    let mut missed_pending = 0u64;
+                    loop {
+                        // The tick carries its *scheduled* time: video PTS
+                        // and the audio block length follow the wall clock
+                        // even when a tick runs late.
+                        let scheduled = sf_ui_backend::media_clock_us(next_deadline);
+                        let interval_us =
                             if let Ok(mut s) = media_handle.state::<AppState>().0.lock() {
-                                s.perf_mark_lagged(missed);
-                            }
+                                if missed_pending > 0 {
+                                    s.perf_mark_lagged(missed_pending);
+                                    missed_pending = 0;
+                                }
+                                // Never panics; failures degrade to Error states.
+                                s.av_tick_at(scheduled);
+                                s.frame_interval_us()
+                            } else {
+                                33_333
+                            };
+                        let interval_us = interval_us.max(1);
+                        let interval = Duration::from_micros(interval_us);
+                        next_deadline += interval;
+                        let now = std::time::Instant::now();
+                        if next_deadline > now {
+                            std::thread::sleep(next_deadline - now);
+                        } else {
+                            // Missed: jump forward in whole intervals (never
+                            // burst-catch-up; the skipped slots become a
+                            // timestamp gap, not a backlog).
+                            let over_us = now.duration_since(next_deadline).as_micros();
+                            let missed = sf_ui_backend::missed_intervals(over_us, interval_us);
+                            next_deadline += interval * missed as u32;
+                            missed_pending += missed;
                         }
                     }
-                }
-            });
+                })
+                .expect("media tick thread");
             // Engine → UI event pump: advance auto-transitions, then poll
             // the shell and re-emit events. 66 ms is plenty for UI state;
             // it is deliberately decoupled from the 33 ms media tick.
@@ -931,6 +974,10 @@ fn main() {
             transition_cut,
             transition_auto,
             scene_preview_jpg,
+            monitor_frame_if_new,
+            diagnostics,
+            stream_platforms,
+            av_sync_set,
             mixer_set_gain,
             mixer_set_mute,
             mixer_set_master_gain,

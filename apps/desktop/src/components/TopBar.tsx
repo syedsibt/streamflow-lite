@@ -1,76 +1,51 @@
 import { useProduction } from "../lib/productionStore";
-import { useStudio } from "../lib/store";
-import { api } from "../lib/ipc";
 
-export type ViewId = "production" | "studio" | "video" | "audio";
+export type StepId = "input" | "preview" | "color" | "audio" | "stream";
 
-interface TopBarProps {
-  view: ViewId;
-  setView: (v: ViewId) => void;
-}
+export const STEPS: { id: StepId; label: string }[] = [
+  { id: "input", label: "Input" },
+  { id: "preview", label: "Preview" },
+  { id: "color", label: "Color" },
+  { id: "audio", label: "Audio" },
+  { id: "stream", label: "Stream" },
+];
 
-/**
- * Slim top-level view switch: Production | Color Studio | Video,
- * plus an always-visible FPS control. FPS applies in real time:
- * the program tick follows immediately, and live stream/record
- * encoders are rebuilt on the fly (continuous timestamps).
- */
-export default function TopBar({ view, setView }: TopBarProps) {
-  const fps = useProduction((s) => s.state?.video_settings.output_fps ?? 30);
-  const refresh = useProduction((s) => s.refresh);
-
-  const setFps = async (next: number) => {
-    if (next === fps) return;
-    try {
-      const cur = await api.videoSettingsGet();
-      await api.videoSettingsSet({ ...cur, output_fps: next });
-      await refresh();
-    } catch (e) {
-      useStudio.getState().pushToast(`fps change failed: ${String(e)}`);
-    }
-  };
+/** Title, the five-step workflow switch, and the live state. */
+export default function TopBar({ step, setStep }: { step: StepId; setStep: (s: StepId) => void }) {
+  const stream = useProduction((s) => s.state?.stream.state ?? "idle");
+  const record = useProduction((s) => s.state?.record.state ?? "idle");
+  const live = stream === "live";
+  const busy = stream === "connecting" || stream === "reconnecting";
 
   return (
-    <div className="viewbar">
-      <div className="viewbar-title">StreamFlow Lite</div>
-      <div className="viewbar-tabs">
-        <button
-          className={view === "production" ? "active" : ""}
-          onClick={() => setView("production")}
-        >
-          Production
-        </button>
-        <button
-          className={view === "studio" ? "active" : ""}
-          onClick={() => setView("studio")}
-        >
-          Color Studio
-        </button>
-        <button
-          className={view === "video" ? "active" : ""}
-          onClick={() => setView("video")}
-        >
-          Video
-        </button>
-        <button
-          className={view === "audio" ? "active" : ""}
-          onClick={() => setView("audio")}
-        >
-          Audio
-        </button>
-      </div>
-      <div className="viewbar-fps" title="Output frame rate — applies in real time">
-        <span>FPS</span>
-        {[30, 60].map((f) => (
+    <header className="topbar">
+      <div className="brand">StreamFlow</div>
+      <nav className="steps" role="tablist" aria-label="Workflow">
+        {STEPS.map((s, i) => (
           <button
-            key={f}
-            className={fps === f ? "active" : ""}
-            onClick={() => void setFps(f)}
+            key={s.id}
+            type="button"
+            role="tab"
+            aria-selected={step === s.id}
+            className={step === s.id ? "active" : ""}
+            onClick={() => setStep(s.id)}
+            title={`${i + 1}. ${s.label}`}
           >
-            {f}
+            {s.label}
           </button>
         ))}
+      </nav>
+      <div className="topbar-right">
+        {record === "recording" && <span className="pill rec">REC</span>}
+        <button
+          type="button"
+          className={"pill" + (live ? " live" : busy ? " warn" : "")}
+          onClick={() => setStep("stream")}
+          title="Stream settings"
+        >
+          {live ? "LIVE" : busy ? (stream === "connecting" ? "Connecting…" : "Reconnecting…") : stream === "error" ? "Stream error" : "Offline"}
+        </button>
       </div>
-    </div>
+    </header>
   );
 }

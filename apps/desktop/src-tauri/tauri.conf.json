@@ -4,10 +4,11 @@
     "windows": [
       {
         "height": 900,
-        "minHeight": 640,
-        "minWidth": 1024,
+        "minHeight": 520,
+        "minWidth": 720,
         "title": "StreamFlow Lite",
-        "width": 1440
+        "width": 1440,
+        "theme": "Dark"
       }
     ]
   },

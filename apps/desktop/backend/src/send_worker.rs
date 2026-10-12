@@ -106,7 +106,20 @@ impl SendWorker {
         self.rx.try_iter().collect()
     }
 
+    /// Asks the worker to stop and returns immediately. The worker writes
+    /// the FLV trailer and closes the socket on its own thread (bounded by
+    /// the transport's I/O timeouts), so stopping a stream on a dead
+    /// network never freezes the UI.
+    pub fn shutdown_detached(mut self) {
+        // `send` (not try_send): the queue may be full of packets; a
+        // blocked send would stall, so fall back to dropping the sender —
+        // the worker treats a disconnected channel as shutdown.
+        let _ = self.tx.try_send(SendMsg::Shutdown);
+        drop(self.handle.take());
+    }
+
     /// Asks the worker to stop and waits (bounded) for its final byte count.
+    #[allow(dead_code)]
     pub fn shutdown(mut self) -> u64 {
         let _ = self.tx.send(SendMsg::Shutdown);
         let mut bytes = 0;

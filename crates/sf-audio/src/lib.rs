@@ -83,10 +83,10 @@ pub mod denoise;
 pub mod enhancer;
 pub mod live_input;
 pub mod rnnoise;
-pub use bus::{AudioBus, BusConfig, SampleClock, SourceBusStats};
+pub use bus::{AudioBus, AudioTimeline, BusConfig, SampleClock, SourceBusStats, ALIGN_TOLERANCE_US, MAX_ALIGN_DELAY_US};
 pub use denoise::NoiseSuppressor;
 pub use enhancer::{Enhancer, EnhancerSettings, EnhancerStats};
-pub use live_input::{LiveInput, LiveStatus};
+pub use live_input::{LiveInput, LiveStatus, TimedChunk};
 
 /// Sample rate (Hz) every input must carry. Anything else is skipped for the
 /// block and counted in [`Mixer::dropped_blocks`].

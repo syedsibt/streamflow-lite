@@ -32,6 +32,27 @@
 //!   is dropped back to `trim_to` (default 30 ms). Audio never builds a
 //!   backlog; it snaps back to live, like the video path's newest-wins rule.
 
+//!
+//! # A/V alignment (capture timestamps)
+//!
+//! Live sources push audio with the capture time of its first sample
+//! ([`AudioBus::push_timed`], pipeline clock µs). [`AudioBus::pull_aligned`]
+//! then plays each source with a requested *age*: the age of the video frame
+//! rendered in the same tick (+ the user's manual offset). Audio that is
+//! fresher than the picture is delayed by holding it in the FIFO; audio that
+//! is older is dropped. Corrections only happen outside a ±15 ms dead band,
+//! so a steady source is never touched. This is how the camera's own
+//! latency (often 60–200 ms more than a USB mic's) stops showing up as
+//! audio-ahead-of-lips.
+//!
+//! # Time-based block length
+//!
+//! [`AudioTimeline`] turns the media tick's *time* into a block length:
+//! samples since the session origin minus samples already produced. A tick
+//! that ran late (or several that were skipped) produces exactly the audio
+//! for the elapsed wall time, so the audio timeline never falls behind real
+//! time and live FIFOs never accumulate.
+
 use std::collections::{HashMap, VecDeque};
 
 use crate::{TARGET_CHANNELS, TARGET_SAMPLE_RATE};
@@ -82,6 +103,49 @@ impl SampleClock {
     }
 }
 
+/// Wall-clock audio timeline: how many sample frames a tick at time `t`
+/// must produce (see module docs).
+#[derive(Clone, Debug, Default)]
+pub struct AudioTimeline {
+    origin_us: Option<i64>,
+    done: u64,
+}
+
+impl AudioTimeline {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Frames to produce for a tick at `t_us` (µs, any monotonic clock).
+    /// The first call starts the timeline and returns one block of
+    /// `first_block` frames.
+    pub fn frames_until(&mut self, t_us: i64, first_block: usize) -> usize {
+        let origin = match self.origin_us {
+            Some(o) => o,
+            None => {
+                let rate = TARGET_SAMPLE_RATE as i64;
+                let o = t_us - first_block as i64 * 1_000_000 / rate;
+                self.origin_us = Some(o);
+                o
+            }
+        };
+        let elapsed = (t_us - origin).max(0) as u128;
+        let target = ((elapsed * TARGET_SAMPLE_RATE as u128 + 500_000) / 1_000_000) as u64;
+        let n = target.saturating_sub(self.done);
+        self.done = self.done.max(target);
+        n as usize
+    }
+
+    /// Sample frames produced so far.
+    pub fn produced(&self) -> u64 {
+        self.done
+    }
+
+    pub fn reset(&mut self) {
+        *self = Self::default();
+    }
+}
+
 /// Bus tuning (sample frames at 48 kHz).
 #[derive(Clone, Copy, Debug)]
 pub struct BusConfig {
@@ -114,21 +178,63 @@ pub struct SourceBusStats {
     pub dropped_frames: u64,
     /// True while the source is delivering (primed).
     pub active: bool,
+    /// Age of the audio played last tick (capture → now), ms. `None` for
+    /// sources without capture timestamps.
+    pub audio_age_ms: Option<f32>,
+    /// Requested age (video age + manual offset), ms, when aligning.
+    pub target_age_ms: Option<f32>,
+    /// Alignment corrections applied (drops + inserted delays).
+    pub corrections: u64,
 }
 
 #[derive(Default)]
 struct Fifo {
     buf: VecDeque<f32>,
+    /// `(absolute frame index, capture µs)` of pushed chunks, oldest first.
+    marks: VecDeque<(u64, i64)>,
+    /// Absolute frame index of `buf[0]`.
+    head_frame: u64,
     primed: bool,
     underruns: u64,
     dropped_frames: u64,
+    audio_age_us: Option<i64>,
+    target_age_us: Option<i64>,
+    corrections: u64,
 }
 
 impl Fifo {
     fn frames(&self) -> usize {
         self.buf.len() / CH
     }
+
+    /// Remove `n` frames from the head (they were played or dropped).
+    fn consume(&mut self, n: usize) -> std::collections::vec_deque::Drain<'_, f32> {
+        let n = n.min(self.frames());
+        self.head_frame += n as u64;
+        while self.marks.len() >= 2 && self.marks[1].0 <= self.head_frame {
+            self.marks.pop_front();
+        }
+        if n == self.frames() {
+            self.marks.clear();
+        }
+        self.buf.drain(..n * CH)
+    }
+
+    /// Capture time of the head sample, when known.
+    fn head_time(&self) -> Option<i64> {
+        if self.buf.is_empty() {
+            return None;
+        }
+        let (f, at) = *self.marks.front()?;
+        let off = self.head_frame.saturating_sub(f) as i64;
+        Some(at + off * 1_000_000 / TARGET_SAMPLE_RATE as i64)
+    }
 }
+
+/// Alignment dead band: corrections smaller than this are never applied.
+pub const ALIGN_TOLERANCE_US: i64 = 15_000;
+/// Longest delay the bus will add to align audio to video.
+pub const MAX_ALIGN_DELAY_US: i64 = 800_000;
 
 /// See the module docs.
 pub struct AudioBus {
@@ -171,12 +277,25 @@ impl AudioBus {
     /// Queue interleaved stereo 48 kHz samples for `id` (registers the
     /// source on first use). Odd trailing samples are ignored.
     pub fn push(&mut self, id: &str, samples: &[f32]) {
+        self.push_timed(id, samples, None);
+    }
+
+    /// [`Self::push`] with the capture time (pipeline clock, µs) of the
+    /// first sample — enables [`Self::pull_aligned`].
+    pub fn push_timed(&mut self, id: &str, samples: &[f32], captured_at_us: Option<i64>) {
         let fifo = self.fifos.entry(id.to_string()).or_default();
         let usable = samples.len() - samples.len() % CH;
+        if usable == 0 {
+            return;
+        }
+        if let Some(at) = captured_at_us {
+            let tail = fifo.head_frame + fifo.frames() as u64;
+            fifo.marks.push_back((tail, at));
+        }
         fifo.buf.extend(&samples[..usable]);
         let over = fifo.frames().saturating_sub(HARD_CAP_FRAMES);
         if over > 0 {
-            fifo.buf.drain(..over * CH);
+            fifo.consume(over);
             fifo.dropped_frames += over as u64;
         }
     }
@@ -209,7 +328,7 @@ impl AudioBus {
             }
         }
         let avail = fifo.frames().min(frames);
-        for (o, s) in out.iter_mut().zip(fifo.buf.drain(..avail * CH)) {
+        for (o, s) in out.iter_mut().zip(fifo.consume(avail)) {
             *o = s;
         }
         if avail < frames {
@@ -219,8 +338,70 @@ impl AudioBus {
         // Stay live: never let a backlog build.
         if fifo.frames() > cfg.max_latency_frames {
             let drop = fifo.frames() - cfg.trim_to_frames;
-            fifo.buf.drain(..drop * CH);
+            fifo.consume(drop);
             fifo.dropped_frames += drop as u64;
+        }
+    }
+
+    /// Like [`Self::pull`], but plays the source at a requested age so it
+    /// lines up with the video rendered in the same tick.
+    ///
+    /// * `tick_us` — the tick's time on the pipeline clock; the block ends
+    ///   at `tick_us` (it covers the `frames` before it).
+    /// * `target_age_us` — how old the audio should be when played: the
+    ///   age of the video frame rendered this tick plus the manual offset.
+    ///   `None` (or a source without capture timestamps) → plain
+    ///   lowest-latency [`Self::pull`].
+    pub fn pull_aligned(
+        &mut self,
+        id: &str,
+        frames: usize,
+        out: &mut Vec<f32>,
+        tick_us: i64,
+        target_age_us: Option<i64>,
+    ) {
+        let rate = TARGET_SAMPLE_RATE as i64;
+        let head = self.fifos.get(id).and_then(Fifo::head_time);
+        let (Some(target_age), Some(head)) = (target_age_us, head) else {
+            if let Some(f) = self.fifos.get_mut(id) {
+                f.target_age_us = None;
+                f.audio_age_us = f.head_time().map(|h| tick_us - h);
+            }
+            return self.pull(id, frames, out);
+        };
+        let target_age = target_age.clamp(0, MAX_ALIGN_DELAY_US);
+        out.clear();
+        out.resize(frames * CH, 0.0);
+        let fifo = self.fifos.get_mut(id).expect("head exists");
+        fifo.primed = true;
+        fifo.target_age_us = Some(target_age);
+        let block_us = frames as i64 * 1_000_000 / rate;
+        // Where the head *should* be: captured `target_age` before the
+        // start of this block.
+        let want_head = tick_us - block_us - target_age;
+        let err = head - want_head; // > 0: audio too fresh; < 0: too old
+        let mut lead = 0usize;
+        if err < -ALIGN_TOLERANCE_US {
+            // Too old: drop the stale part (stay live).
+            let n = ((-err) * rate / 1_000_000) as usize;
+            let n = n.min(fifo.frames());
+            fifo.consume(n);
+            fifo.dropped_frames += n as u64;
+            fifo.corrections += 1;
+        } else if err > ALIGN_TOLERANCE_US {
+            // Too fresh: delay it — silence now, the audio stays queued.
+            lead = ((err * rate / 1_000_000) as usize).min(frames);
+            fifo.corrections += 1;
+        }
+        let avail = fifo.frames().min(frames - lead);
+        fifo.audio_age_us = fifo
+            .head_time()
+            .map(|h| tick_us - block_us + (lead as i64 * 1_000_000 / rate) - h);
+        for (o, s) in out[lead * CH..].iter_mut().zip(fifo.consume(avail)) {
+            *o = s;
+        }
+        if lead == 0 && avail < frames {
+            fifo.underruns += 1;
         }
     }
 
@@ -240,6 +421,9 @@ impl AudioBus {
                 underruns: f.underruns,
                 dropped_frames: f.dropped_frames,
                 active: f.primed,
+                audio_age_ms: f.audio_age_us.map(|v| v as f32 / 1000.0),
+                target_age_ms: f.target_age_us.map(|v| v as f32 / 1000.0),
+                corrections: f.corrections,
             },
             None => SourceBusStats::default(),
         }
@@ -343,6 +527,65 @@ mod tests {
         bus.pull("nope", n, &mut out);
         assert_eq!(out.len(), 800 * 2);
         assert!(out.iter().all(|&v| v == 0.0));
+    }
+
+    #[test]
+    fn timeline_covers_wall_time_even_when_ticks_are_skipped() {
+        let mut tl = AudioTimeline::new();
+        assert_eq!(tl.frames_until(1_000_000, 1600), 1600);
+        assert_eq!(tl.frames_until(1_033_333, 1600), 1600);
+        // Three ticks missed: the next one covers all elapsed time.
+        assert_eq!(tl.frames_until(1_166_667, 1600), 6400);
+        // Long run: exactly 48 kHz of wall time, no drift.
+        let mut t = 1_166_667i64;
+        for _ in 0..30_000 {
+            t += 33_333;
+            tl.frames_until(t, 1600);
+        }
+        let expect = ((t - (1_000_000 - 33_333)) as f64 * 0.048).round() as u64;
+        assert!((tl.produced() as i64 - expect as i64).abs() <= 1);
+    }
+
+    /// A mic that is 80 ms fresher than the camera picture gets delayed
+    /// by 80 ms (± tolerance); a stale backlog gets dropped.
+    #[test]
+    fn aligns_audio_to_video_age() {
+        let mut bus = AudioBus::new(30, 1);
+        let mut out = Vec::new();
+        let mut cap_t = 0i64; // capture time of next pushed chunk
+        let mut tick = 20_000i64;
+        let mut ages = Vec::new();
+        for _ in 0..90 {
+            // Mic delivers 10 ms chunks arriving 5 ms after capture.
+            while cap_t + 10_000 + 5_000 <= tick {
+                let chunk = vec![0.3f32; 480 * 2];
+                bus.push_timed("mic", &chunk, Some(cap_t));
+                cap_t += 10_000;
+            }
+            bus.pull_aligned("mic", 1600, &mut out, tick, Some(100_000));
+            ages.push(bus.stats("mic").audio_age_ms);
+            tick += 33_333;
+        }
+        let last = ages.last().unwrap().unwrap();
+        assert!((last - 100.0).abs() <= 16.0, "settled age {last} ms, want ~100");
+        assert!(bus.stats("mic").buffered_ms < 130.0);
+
+        // A 500 ms backlog (stalled consumer) is dropped back to the
+        // target age instead of being played late.
+        let mut bus = AudioBus::new(30, 1);
+        bus.push_timed("mic", &vec![0.3; 24_000 * 2], Some(500_000));
+        bus.pull_aligned("mic", 1600, &mut out, 1_000_000, Some(100_000));
+        let age = bus.stats("mic").audio_age_ms.unwrap();
+        assert!((age - 100.0).abs() <= 16.0, "age after drop {age}");
+    }
+
+    #[test]
+    fn untimed_sources_fall_back_to_lowest_latency() {
+        let mut bus = AudioBus::new(30, 1);
+        bus.push("file", &vec![0.2; 4000 * 2]);
+        let mut out = Vec::new();
+        bus.pull_aligned("file", 1600, &mut out, 5_000_000, Some(150_000));
+        assert!(out.iter().all(|&v| v == 0.2));
     }
 
     #[test]

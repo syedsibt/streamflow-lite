@@ -299,6 +299,7 @@ impl FrameProducer for CameraProducer {
             height: self.height,
             pts_us,
             duration_us: self.frame_us,
+            captured_at_us: crate::clock::now_us(),
         }))
     }
 

@@ -43,9 +43,9 @@ export default function Header() {
   };
 
   return (
-    <div className="header">
-      <div className="title">Color Studio</div>
+    <div className="color-header">
       <select
+        className="source-select"
         value={inputId}
         onChange={(e) => {
           const opt = e.target.selectedOptions[0];
@@ -53,9 +53,11 @@ export default function Header() {
         }}
         title="Color Studio target: which source the filters and grades apply to"
       >
-        <option value="cam1" data-name="Camera 1">
-          Camera 1 (default)
-        </option>
+        {realSources.length === 0 && (
+          <option value={inputId} data-name="No video source">
+            No video source
+          </option>
+        )}
         {realSources.map((src) => (
           <option key={src.input_id} value={src.input_id} data-name={src.name}>
             {src.name}
@@ -95,7 +97,7 @@ export default function Header() {
           </button>
         ))}
       </div>
-      <button onClick={() => void resetSection(null)} title="Reset all color">
+      <button className="text-btn" onClick={() => void resetSection(null)} title="Reset all color">
         Reset
       </button>
     </div>

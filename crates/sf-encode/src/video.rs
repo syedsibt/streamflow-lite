@@ -31,15 +31,80 @@ pub struct VideoEncoder {
     scaler: ff::software::scaling::Context,
     src_frame: ff::util::frame::Video,
     dst_frame: ff::util::frame::Video,
-    /// Encoder stream time base: (fps_den, fps_num); frame pts = frame index.
+    /// Encoder stream time base: (fps_den, fps_num) — one tick per frame
+    /// slot. A frame's pts is its *wall-clock* slot (see
+    /// [`VideoEncoder::encode_rgba`]), not a frame counter.
     time_base: ff::Rational,
-    frame_index: i64,
+    /// Last pts sent to the encoder (time-base units).
+    last_pts: Option<i64>,
     /// Microsecond anchor: `packet_pts_us = rescale(encoder_pts) + pts_offset_us`,
     /// where the offset is taken from the first `encode_rgba` call's `pts_us`.
     pts_offset_us: Option<i64>,
+    /// Next frame must be an IDR keyframe (a new output joined, or the
+    /// stream reconnected).
+    force_key: bool,
+    /// Duration of the last `encode_rgba` (convert + encode), µs.
+    last_encode_us: u64,
     id: EncoderId,
     width: u32,
     height: u32,
+}
+
+/// Per-encoder low-latency, CBR options (FFmpeg n6.1 option names).
+///
+/// Each wrapper ignores options it does not define (they simply stay in
+/// the dictionary), so a name valid for one wrapper never fails another.
+fn low_latency_options(id: EncoderId, opts: &VideoEncoderOpts) -> ff::Dictionary<'static> {
+    let mut d = ff::Dictionary::new();
+    match id {
+        EncoderId::H264Libx264 => {
+            d.set("preset", &opts.preset);
+            // zerolatency: no lookahead, no frame-thread delay, no
+            // B-frames — every frame leaves in the same call it went in.
+            d.set("tune", "zerolatency");
+            d.set("profile", "high");
+            d.set("forced-idr", "1");
+            d.set("x264-params", "nal-hrd=cbr");
+        }
+        EncoderId::H264Nvenc => {
+            // NVENC presets are p1..p7; the x264 names ("veryfast") are
+            // invalid since NVENC SDK 10 and used to fail the open,
+            // silently falling back to a slower encoder.
+            d.set("preset", "p4");
+            d.set("tune", "ll");
+            d.set("rc", "cbr");
+            d.set("zerolatency", "1");
+            d.set("delay", "0");
+            d.set("rc-lookahead", "0");
+            d.set("forced-idr", "1");
+            d.set("profile", "high");
+        }
+        EncoderId::H264Qsv => {
+            d.set("preset", "veryfast");
+            d.set("async_depth", "1");
+            d.set("look_ahead", "0");
+            d.set("forced_idr", "1");
+            d.set("low_delay_brc", "1");
+            d.set("profile", "high");
+        }
+        EncoderId::H264Amf => {
+            d.set("usage", "lowlatency");
+            d.set("rc", "cbr");
+            d.set("quality", "speed");
+            d.set("forced_idr", "1");
+            d.set("profile", "high");
+        }
+        EncoderId::Mpeg4 => {}
+    }
+    d
+}
+
+/// Microseconds → frame-slot index in `tb` (seconds per slot = num/den),
+/// rounded to the nearest slot.
+fn us_to_slot(us: i64, tb: ff::Rational) -> i64 {
+    let n = us as i128 * tb.1 as i128;
+    let d = tb.0 as i128 * 1_000_000;
+    (n + d / 2).div_euclid(d) as i64
 }
 
 impl VideoEncoder {
@@ -106,24 +171,26 @@ impl VideoEncoder {
         v.set_time_base(time_base);
         v.set_frame_rate(Some(ff::Rational(opts.fps_num as i32, opts.fps_den as i32)));
         v.set_gop(opts.gop);
-        v.set_max_b_frames(2);
+        // Live: no B-frames. B-frames hold back output by their reorder
+        // depth (2 frames = 66 ms at 30 fps) and every hardware encoder adds
+        // its own lookahead on top; for a live stream the current frame must
+        // leave the encoder immediately.
+        v.set_max_b_frames(0);
         // SPS/PPS in extradata (not in-band): required by MP4/FLV muxers.
         v.set_flags(ff::codec::flag::Flags::GLOBAL_HEADER);
+        // CBR with a 1-second VBV (YouTube / Facebook / TikTok ingest
+        // guidance): constant upload rate, no bitrate spikes that would
+        // queue in the socket and add latency.
+        v.set_bit_rate(opts.bitrate_bps as usize);
+        v.set_max_bit_rate(opts.bitrate_bps as usize);
+        // SAFETY: plain field writes on the not-yet-opened codec context.
+        unsafe {
+            let ctx = v.as_mut_ptr();
+            (*ctx).rc_min_rate = opts.bitrate_bps as i64;
+            (*ctx).rc_buffer_size = opts.bitrate_bps as i32;
+        }
 
-        let mut dict = ff::Dictionary::new();
-        dict.set("b", &opts.bitrate_bps.to_string());
-        match id {
-            EncoderId::H264Libx264 | EncoderId::H264Nvenc => {
-                dict.set("preset", &opts.preset);
-            }
-            _ => {}
-        }
-        // Live streaming: disable encoder buffering so frames are output
-        // immediately (otherwise x264 lookahead delays the first packets
-        // and YouTube sees "No data").
-        if id == EncoderId::H264Libx264 {
-            dict.set("tune", "zerolatency");
-        }
+        let dict = low_latency_options(id, &opts);
         let encoder = v
             .open_with(dict)
             .map_err(|e| EncodeError::Open(format!("{}: {e}", id.ffmpeg_name())))?;
@@ -156,8 +223,10 @@ impl VideoEncoder {
             src_frame,
             dst_frame,
             time_base,
-            frame_index: 0,
+            last_pts: None,
             pts_offset_us: None,
+            force_key: false,
+            last_encode_us: 0,
             id,
             width: opts.width,
             height: opts.height,
@@ -180,15 +249,36 @@ impl VideoEncoder {
         ff::codec::parameters::Parameters::from(&self.encoder)
     }
 
+    /// Request an IDR keyframe on the next encoded frame (a new output
+    /// joined mid-session, or the stream reconnected).
+    pub fn force_keyframe(&mut self) {
+        self.force_key = true;
+    }
+
+    /// Duration of the last [`Self::encode_rgba`] call in µs (RGBA→YUV
+    /// conversion + encode), for diagnostics.
+    pub fn last_encode_us(&self) -> u64 {
+        self.last_encode_us
+    }
+
     /// Encode one RGBA frame (`width*height*4` bytes, tightly packed rows).
     ///
-    /// `pts_us` anchors this frame on the caller's microsecond clock; the
-    /// first call sets the stream's time origin.
+    /// `pts_us` is the frame's presentation time on the caller's
+    /// microsecond clock. The first call sets the stream origin; every
+    /// later frame lands on the frame-slot grid at its **real** time
+    /// (`round((pts_us − origin) · fps)`), so a frame the caller could not
+    /// render (overloaded tick) becomes a timestamp gap instead of pulling
+    /// every later frame earlier. With a frame counter as pts (the old
+    /// behaviour) each skipped tick made the stream's media clock fall
+    /// further behind real time — viewers drifted a minute behind after a
+    /// few minutes under load. A frame mapping to an already-used slot is
+    /// skipped (no packets).
     pub fn encode_rgba(
         &mut self,
         rgba: &[u8],
         pts_us: i64,
     ) -> Result<Vec<EncodedPacket>, EncodeError> {
+        let t0 = std::time::Instant::now();
         let row_bytes = self.width as usize * 4;
         let need = row_bytes * self.height as usize;
         if rgba.len() < need {
@@ -197,8 +287,10 @@ impl VideoEncoder {
                 rgba.len()
             )));
         }
-        if self.pts_offset_us.is_none() {
-            self.pts_offset_us = Some(pts_us);
+        let origin = *self.pts_offset_us.get_or_insert(pts_us);
+        let pts = us_to_slot(pts_us - origin, self.time_base);
+        if self.last_pts.is_some_and(|last| pts <= last) {
+            return Ok(Vec::new());
         }
 
         // Copy rows into the source frame, honoring swscale stride.
@@ -209,17 +301,23 @@ impl VideoEncoder {
                 d_row[..row_bytes].copy_from_slice(s_row);
             }
         }
-        self.src_frame.set_pts(Some(self.frame_index));
         self.scaler
             .run(&self.src_frame, &mut self.dst_frame)
             .map_err(|e| EncodeError::Encode(format!("swscale: {e}")))?;
-        self.dst_frame.set_pts(Some(self.frame_index));
+        self.dst_frame.set_pts(Some(pts));
+        let key = std::mem::take(&mut self.force_key);
+        self.dst_frame.set_kind(if key {
+            ff::picture::Type::I
+        } else {
+            ff::picture::Type::None
+        });
 
         self.encoder
             .send_frame(&self.dst_frame)
             .map_err(|e| EncodeError::Encode(format!("send_frame: {e}")))?;
+        self.last_pts = Some(pts);
         let packets = self.drain()?;
-        self.frame_index += 1;
+        self.last_encode_us = t0.elapsed().as_micros() as u64;
         Ok(packets)
     }
 
@@ -412,6 +510,70 @@ mod tests {
             psnr_mean > 30.0,
             "PSNR too low ({psnr_mean:.2} dB); encoder may be broken"
         );
+    }
+
+    fn open_test(w: u32, h: u32) -> VideoEncoder {
+        VideoEncoder::open_with_encoder(
+            EncoderId::H264Libx264,
+            VideoEncoderOpts {
+                width: w,
+                height: h,
+                fps_num: 30,
+                fps_den: 1,
+                bitrate_bps: 1_000_000,
+                gop: 60,
+                preset: "ultrafast".to_string(),
+            },
+        )
+        .expect("open libx264")
+    }
+
+    /// Skipped ticks must become timestamp gaps — the media clock of the
+    /// stream stays on real time (root cause of the growing live delay).
+    #[test]
+    fn pts_follow_real_time_across_skipped_frames() {
+        let mut enc = open_test(160, 96);
+        let mut pkts = Vec::new();
+        // Real times: frames 0,1,2 on time, then a 10-frame stall, then 13,14.
+        for slot in [0i64, 1, 2, 13, 14] {
+            let t = 5_000_000 + slot * 33_333;
+            pkts.extend(enc.encode_rgba(&synth_frame(160, 96, slot as u32), t).unwrap());
+        }
+        pkts.extend(enc.flush().unwrap());
+        let pts: Vec<i64> = pkts.iter().map(|p| p.pts_us - 5_000_000).collect();
+        assert_eq!(pts.len(), 5, "{pts:?}");
+        // Zero-latency: decode order == presentation order, dts == pts.
+        assert!(pkts.iter().all(|p| p.dts_us == p.pts_us));
+        assert!((pts[3] - 13 * 33_333).abs() <= 10, "{pts:?}");
+        assert!((pts[4] - 14 * 33_333).abs() <= 10, "{pts:?}");
+    }
+
+    /// Zero-latency: the packet for a frame comes out of the same call.
+    #[test]
+    fn no_encoder_delay() {
+        let mut enc = open_test(160, 96);
+        for i in 0..10 {
+            let out = enc.encode_rgba(&synth_frame(160, 96, i), i as i64 * 33_333).unwrap();
+            assert_eq!(out.len(), 1, "frame {i} delayed by the encoder");
+        }
+    }
+
+    #[test]
+    fn duplicate_slot_is_skipped_and_forced_key_is_idr() {
+        let mut enc = open_test(160, 96);
+        let f = synth_frame(160, 96, 0);
+        assert_eq!(enc.encode_rgba(&f, 0).unwrap().len(), 1);
+        for i in 1..5 {
+            let p = enc.encode_rgba(&f, i * 33_333).unwrap();
+            assert!(!p[0].is_keyframe);
+        }
+        // Same slot as the previous frame → skipped.
+        assert!(enc.encode_rgba(&f, 4 * 33_333 + 5_000).unwrap().is_empty());
+        enc.force_keyframe();
+        let p = enc.encode_rgba(&f, 5 * 33_333).unwrap();
+        assert!(p[0].is_keyframe, "forced keyframe not honored");
+        let p = enc.encode_rgba(&f, 6 * 33_333).unwrap();
+        assert!(!p[0].is_keyframe);
     }
 
     #[test]

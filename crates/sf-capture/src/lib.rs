@@ -44,6 +44,11 @@ pub struct CapturedFrame {
     pub pts_us: i64,
     /// Frame duration in microseconds (e.g. 33333 for 30 fps).
     pub duration_us: u64,
+    /// When the frame was captured, on the pipeline's monotonic clock
+    /// ([`clock::now_us`]). Live devices map their own timestamps onto it
+    /// (see [`clock::ClockMapper`]); files use the decode time. Drives
+    /// latency diagnostics and A/V alignment.
+    pub captured_at_us: i64,
 }
 
 impl CapturedFrame {
@@ -198,6 +203,7 @@ impl FrameProducer for MockProducer {
             height: self.info.height,
             pts_us: i as i64 * self.spacing_us as i64,
             duration_us: self.spacing_us,
+            captured_at_us: clock::now_us(),
         }))
     }
 
@@ -206,25 +212,28 @@ impl FrameProducer for MockProducer {
     }
 }
 
+pub mod clock;
+mod live;
+pub use live::{LiveVideo, LiveVideoStats};
+
 #[cfg(target_os = "linux")]
 pub mod camera;
 pub mod media;
 pub mod screen;
 
-#[cfg(windows)]
+#[cfg(any(windows, sf_wincheck))]
 pub mod dshow;
 
-#[cfg(windows)]
 pub mod audio_in;
 
-#[cfg(windows)]
+#[cfg(any(windows, sf_wincheck))]
 pub mod gdigrab;
 
 mod demux;
 
-#[cfg(windows)]
+#[cfg(any(windows, sf_wincheck))]
 pub mod dxgi_capture;
-#[cfg(windows)]
+#[cfg(any(windows, sf_wincheck))]
 pub mod mf_camera;
 
 #[cfg(test)]
