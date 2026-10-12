@@ -2,7 +2,7 @@ import { useProduction } from "../lib/productionStore";
 import { useStudio } from "../lib/store";
 import { api } from "../lib/ipc";
 
-export type ViewId = "production" | "studio" | "video";
+export type ViewId = "production" | "studio" | "video" | "audio";
 
 interface TopBarProps {
   view: ViewId;
@@ -51,6 +51,12 @@ export default function TopBar({ view, setView }: TopBarProps) {
           onClick={() => setView("video")}
         >
           Video
+        </button>
+        <button
+          className={view === "audio" ? "active" : ""}
+          onClick={() => setView("audio")}
+        >
+          Audio
         </button>
       </div>
       <div className="viewbar-fps" title="Output frame rate — applies in real time">

@@ -231,3 +231,58 @@ fn program_monitor_serves_live_jpeg_from_tick_cache() {
         "expected JPEG bytes for non-program scene"
     );
 }
+
+#[test]
+fn source_audio_device_labels() {
+    let mut s = shell();
+    let sc = s.scene_create("S").id;
+    // Audio input source with an explicit device.
+    let mic = s
+        .source_add(
+            &sc, "audio_input", "Mic", [0, 0, 0], None, None, Some("My USB Mic"), None, 0, 0, 0,
+        )
+        .expect("add mic")
+        .id;
+    assert_eq!(s.source_audio_device(&mic), Some("My USB Mic".to_string()));
+    // Camera without audio device → None.
+    let cam = s
+        .source_add(
+            &sc, "camera", "Cam", [0, 0, 0], None, None, None, None, 1280, 720, 30,
+        )
+        .expect("add camera")
+        .id;
+    assert_eq!(s.source_audio_device(&cam), None);
+    // Camera with an audio device keeps it.
+    let cam2 = s
+        .source_add(
+            &sc, "camera", "Cam2", [0, 0, 0], None, None, None, Some("Capture Card Audio"), 1280,
+            720, 30,
+        )
+        .expect("add camera2")
+        .id;
+    assert_eq!(
+        s.source_audio_device(&cam2),
+        Some("Capture Card Audio".to_string())
+    );
+    // Reconfigure keeps the camera's audio device.
+    s.camera_reconfigure(&cam2, None, 1280, 720, 30)
+        .expect("reconfigure keeps audio device");
+    assert_eq!(
+        s.source_audio_device(&cam2),
+        Some("Capture Card Audio".to_string())
+    );
+    // Media source → None.
+    let pat = s
+        .source_add(
+            &sc, "test_pattern", "Pat", [0, 0, 0], None, None, None, None, 0, 0, 0,
+        )
+        .expect("add pattern")
+        .id;
+    assert_eq!(s.source_audio_device(&pat), None);
+    // Unknown id → None.
+    assert_eq!(s.source_audio_device("nope"), None);
+    // Monitor starts off; enabling with no output device returns Err
+    // (never panics) — on this headless VM there is no device.
+    assert!(!s.monitor_enabled());
+    let _ = s.set_monitor_enabled(true);
+}

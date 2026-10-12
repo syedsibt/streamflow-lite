@@ -204,6 +204,8 @@ export const api = {
     cmd<void>("mixer_set_master_mute", { mute }),
   setMonitorEnabled: (enabled: boolean) =>
     cmd<boolean>("set_monitor_enabled", { enabled }),
+  sourceAudioDevice: (source_id: string) =>
+    cmd<string | null>("source_audio_device", { source_id }),
 
   streamSetSettings: (url: string, key: string, platform: string) =>
     cmd<void>("stream_set_settings", { url, key, platform }),

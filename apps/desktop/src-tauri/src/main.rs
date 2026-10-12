@@ -393,6 +393,13 @@ fn camera_format(state: State<'_, AppState>, source_id: String) -> Option<String
     lock(&state).ok().and_then(|s| s.camera_format(&source_id))
 }
 
+/// Audio device label for a source (mic name for audio inputs / camera
+/// audio). None for sources without an audio device.
+#[tauri::command(rename_all = "snake_case")]
+fn source_audio_device(state: State<'_, AppState>, source_id: String) -> Option<String> {
+    lock(&state).ok().and_then(|s| s.source_audio_device(&source_id))
+}
+
 /// Current video input/output settings for the Video menu panel.
 #[tauri::command(rename_all = "snake_case")]
 fn video_settings_get(state: State<'_, AppState>) -> CmdResult<VideoSettings> {
@@ -806,6 +813,7 @@ fn main() {
             source_add,
             list_cameras,
             camera_format,
+            source_audio_device,
             video_settings_get,
             video_settings_set,
             camera_reconfigure,

@@ -55,6 +55,7 @@ use sf_output::{
 };
 
 use super::production::{transition_progress, RecordFormat, RecordRuntime, StreamLifecycle};
+use crate::production::SourceKind;
 use super::{Shell, ShellError};
 use crate::production::crossfade;
 
@@ -364,6 +365,22 @@ impl Shell {
     /// sources or when the camera was never opened.
     pub fn camera_format(&self, source_id: &str) -> Option<String> {
         self.camera_formats.get(source_id).cloned()
+    }
+
+    /// Audio device label for a source: the mic name for audio inputs,
+    /// the camera's audio device when set. `None` for sources without an
+    /// audio device (media files, silent sources).
+    pub fn source_audio_device(&self, source_id: &str) -> Option<String> {
+        let src = self
+            .scenes
+            .iter()
+            .flat_map(|sc| sc.sources.iter())
+            .find(|s| s.id == source_id)?;
+        match &src.kind {
+            SourceKind::AudioInput { device } => device.clone(),
+            SourceKind::Camera { audio_device, .. } => audio_device.clone(),
+            _ => None,
+        }
     }
 
     /// Opens a DirectShow audio-input producer (microphone/line-in,
