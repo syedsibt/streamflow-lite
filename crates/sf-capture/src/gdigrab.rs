@@ -32,14 +32,11 @@ use ffmpeg_next as ff;
 use super::demux::{ensure_init, DemuxDecoder};
 use super::{CaptureError, CapturedFrame, FrameProducer, StreamInfo};
 
-/// A stalled grab must not hang the tick.
-const READ_TIMEOUT_US: u64 = 25_000;
-/// Draining queued packets must return instantly.
-const DRAIN_TIMEOUT_US: u64 = 1_000;
+/// A stalled grab must not hang the tick; the tick never waits on a live
+/// source, so this stays small.
+const READ_TIMEOUT_US: u64 = 10_000;
 /// Opening the desktop grab must fail fast, not hang.
 const OPEN_TIMEOUT_US: u64 = 5_000_000;
-/// Upper bound on drain iterations per `next_frame` call.
-const MAX_DRAIN_FRAMES: u32 = 4;
 
 fn now_us() -> u64 {
     SystemTime::now()
@@ -155,35 +152,21 @@ impl ScreenProducer {
 
 impl FrameProducer for ScreenProducer {
     fn next_frame(&mut self) -> Result<Option<CapturedFrame>, CaptureError> {
-        // Drain to the newest frame (same as the dshow camera): a 60 Hz
-        // desktop behind a 30 fps tick must drop stale frames, not queue.
-        let mut newest: Option<CapturedFrame> = None;
-        let mut reads: u32 = 0;
-        loop {
-            let timeout_us = if reads == 0 {
-                READ_TIMEOUT_US
-            } else {
-                DRAIN_TIMEOUT_US
-            };
-            self.deadline
-                .deadline_us
-                .store(now_us() + timeout_us, Ordering::Relaxed);
-            let r = self.demux.next_video();
-            self.deadline.deadline_us.store(0, Ordering::Relaxed);
-            match r {
-                Ok(Some(f)) => newest = Some(f),
-                Ok(None) => break,
-                Err(CaptureError::EndOfStream) => break,
-                Err(CaptureError::ReadFailed(_)) => break,
-                Err(e) => return Err(e),
-            }
-            reads += 1;
-            if reads >= MAX_DRAIN_FRAMES {
-                break;
-            }
-        }
-        let Some(frame) = newest else {
-            return Ok(None);
+        // Single bounded drain (same as the dshow camera): the demuxer
+        // discards queued packets without decoding and decodes only the
+        // newest frame — a 60 Hz desktop behind a 30 fps tick drops stale
+        // frames instead of melting the tick decoding them.
+        self.deadline
+            .deadline_us
+            .store(now_us() + READ_TIMEOUT_US, Ordering::Relaxed);
+        let r = self.demux.next_video_newest();
+        self.deadline.deadline_us.store(0, Ordering::Relaxed);
+        let frame = match r {
+            Ok(Some(f)) => f,
+            Ok(None) => return Ok(None),
+            Err(CaptureError::EndOfStream) => return Ok(None),
+            Err(CaptureError::ReadFailed(_)) => return Ok(None),
+            Err(e) => return Err(e),
         };
         // OBS `ready_async_frame` hysteresis (2 ms).
         if let Some(last_pts) = self.last_delivered_pts_us {

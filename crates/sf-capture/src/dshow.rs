@@ -250,15 +250,6 @@ pub struct DshowProducer {
 /// frame (latest-frame-wins) and the next tick tries again.
 const READ_TIMEOUT_US: u64 = 10_000;
 
-/// Timeout for drain reads after the first frame (3ms): packets already
-/// queued in dshow return instantly; an empty queue aborts almost at once
-/// so the drain never stalls the tick.
-const DRAIN_TIMEOUT_US: u64 = 3_000;
-
-/// Max frames to drain per tick. Bounds the decode work when the camera
-/// outruns the tick (e.g. 60fps in, 30fps tick → ~2 per tick normally).
-const MAX_DRAIN_FRAMES: u32 = 4;
-
 /// Max time to wait for a dshow device to open (15 seconds per attempt).
 const OPEN_TIMEOUT_US: u64 = 15_000_000;
 
@@ -512,46 +503,28 @@ impl DshowProducer {
 
 impl FrameProducer for DshowProducer {
     fn next_frame(&mut self) -> Result<Option<CapturedFrame>, CaptureError> {
-        // Drain all currently available frames, keeping the newest. The
-        // first read may block up to READ_TIMEOUT_US (device stall → "no
-        // frame yet"); drain reads use DRAIN_TIMEOUT_US so queued packets
-        // return instantly and an empty queue aborts at once. Draining is
-        // what keeps a 60fps camera from building an ever-growing queue
-        // behind our 30fps tick (the classic ever-increasing lag).
-        let mut newest: Option<CapturedFrame> = None;
-        let mut reads: u32 = 0;
-        loop {
-            let timeout_us = if reads == 0 {
-                READ_TIMEOUT_US
-            } else {
-                DRAIN_TIMEOUT_US
-            };
-            // Bound the blocking read: if the device stalls, the interrupt
-            // callback aborts it and we report "no frame yet" instead of
-            // hanging the tick thread.
-            self.deadline
-                .deadline_us
-                .store(now_us() + timeout_us, Ordering::Relaxed);
-            let r = self.demux.next_video();
-            self.deadline.deadline_us.store(0, Ordering::Relaxed);
-            // Live source: the demuxer never yields EndOfStream for dshow;
-            // map it defensively to "no frame yet" so a live source can
-            // never terminate the consumer. A timed-out read surfaces as a
-            // `ReadFailed` — also map that to "no frame yet".
-            match r {
-                Ok(Some(f)) => newest = Some(f),
-                Ok(None) => break,
-                Err(CaptureError::EndOfStream) => break,
-                Err(CaptureError::ReadFailed(_)) => break,
-                Err(e) => return Err(e),
-            }
-            reads += 1;
-            if reads >= MAX_DRAIN_FRAMES {
-                break;
-            }
-        }
-        let Some(frame) = newest else {
-            return Ok(None);
+        // Single bounded drain: the demuxer discards queued video packets
+        // without decoding and decodes only the newest frame. This bounds
+        // the per-tick work to ~one decode no matter how far behind the
+        // queue got (the old loop decoded several per tick while delivering
+        // one — the melt on 1080p60+ capture devices).
+        // If the device stalls, the interrupt callback aborts the read and
+        // we report "no frame yet" instead of hanging the tick thread.
+        self.deadline
+            .deadline_us
+            .store(now_us() + READ_TIMEOUT_US, Ordering::Relaxed);
+        let r = self.demux.next_video_newest();
+        self.deadline.deadline_us.store(0, Ordering::Relaxed);
+        // Live source: the demuxer never yields EndOfStream for dshow;
+        // map it defensively to "no frame yet" so a live source can
+        // never terminate the consumer. A timed-out read surfaces as a
+        // `ReadFailed` — also map that to "no frame yet".
+        let frame = match r {
+            Ok(Some(f)) => f,
+            Ok(None) => return Ok(None),
+            Err(CaptureError::EndOfStream) => return Ok(None),
+            Err(CaptureError::ReadFailed(_)) => return Ok(None),
+            Err(e) => return Err(e),
         };
         // OBS `ready_async_frame` hysteresis (2ms): never emit a frame from
         // a (near-)duplicate source instant — the consumer repeats the last

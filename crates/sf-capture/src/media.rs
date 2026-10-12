@@ -375,6 +375,38 @@ mod tests {
     }
 
     #[test]
+    fn newest_drain_decodes_only_last_frame() {
+        // Exercises DemuxDecoder::next_video_newest (the live capture
+        // path): packets are discarded without decoding, only the newest
+        // packet is decoded. Uses MJPEG (one packet == one frame), like a
+        // real capture device.
+        use crate::demux::DemuxDecoder;
+        use std::path::PathBuf;
+        use std::process::Command;
+        let path = std::env::temp_dir().join("sf-capture-test-mjpeg.avi");
+        let path_str = path.to_string_lossy().into_owned();
+        let st = Command::new("ffmpeg")
+            .args([
+                "-y", "-v", "error",
+                "-f", "lavfi", "-i", "testsrc=size=320x240:rate=30:duration=1",
+                "-c:v", "mjpeg", "-q:v", "5",
+                path_str.as_str(),
+            ])
+            .status()
+            .expect("ffmpeg CLI must be installed");
+        assert!(st.success(), "ffmpeg failed to generate mjpeg file");
+        let ictx = ff::format::input(&PathBuf::from(&path_str)).expect("open mjpeg file");
+        let mut demux = DemuxDecoder::from_input(ictx, 33_333).expect("demux");
+        demux.set_live(true);
+        // Drains the whole 1s file (EOF ends the packet loop), decodes only
+        // the newest packet: exactly one frame comes out.
+        let f = demux.next_video_newest().expect("drain").expect("frame");
+        assert_eq!((f.width, f.height), (320, 240));
+        // At EOF there are no more packets: clean None, not an error.
+        assert!(demux.next_video_newest().expect("eof").is_none());
+    }
+
+    #[test]
     fn pause_freezes_video_and_audio_then_resumes() {
         let path = make_test_file();
         let mut p = MediaFileProducer::open(&path).expect("open test file");

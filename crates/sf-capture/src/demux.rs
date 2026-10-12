@@ -274,6 +274,56 @@ impl DemuxDecoder {
         }
     }
 
+    /// Live-source newest-frame drain: reads packets until the caller's
+    /// interrupt deadline fires, **discarding video packets without
+    /// decoding**, then decodes only the newest video packet.
+    ///
+    /// Decoding every queued frame just to throw all but one away is what
+    /// melts the media tick on 1080p60+ capture devices (each MJPEG decode
+    /// costs milliseconds; the old drain decoded up to 4 per tick while
+    /// delivering 1). Packet reads are cheap; a single decode bounds the
+    /// per-tick work no matter how far behind the queue got — the backlog
+    /// is dropped, never caught up frame-by-frame.
+    ///
+    /// Audio packets met along the way are fed to the audio decoder (via
+    /// [`Self::pump_audio`]) so A/V stays in sync; they are not dropped.
+    /// `Ok(None)` = no video packet arrived before the deadline.
+    /// The caller sets the interrupt deadline before calling; on a live
+    /// source `packets().next()` returns `None` at the deadline (transient,
+    /// not EOF).
+    pub(crate) fn next_video_newest(&mut self) -> Result<Option<CapturedFrame>, CaptureError> {
+        debug_assert!(self.live, "next_video_newest is for live sources");
+        let mut newest_packet: Option<ff::Packet> = None;
+        loop {
+            let Some((stream, packet)) = self.ictx.packets().next() else {
+                break;
+            };
+            if stream.index() == self.video_stream {
+                // Drop the previous video packet without decoding it:
+                // only the newest frame will ever be shown.
+                newest_packet = Some(packet);
+            } else if Some(stream.index()) == self.audio_stream {
+                if let Some(ref mut ad) = self.audio_decoder {
+                    ad.send_packet(&packet)
+                        .map_err(|e| CaptureError::ReadFailed(format!("audio send_packet: {e}")))?;
+                    self.pump_audio()?;
+                }
+            }
+        }
+        let Some(packet) = newest_packet else {
+            return Ok(None);
+        };
+        self.video_decoder
+            .send_packet(&packet)
+            .map_err(|e| CaptureError::ReadFailed(format!("video send_packet: {e}")))?;
+        // One packet yields one frame for MJPEG-like live formats; take
+        // the first decoded frame.
+        match self.decode_one_video()? {
+            Some(f) => Ok(Some(f)),
+            None => Ok(None),
+        }
+    }
+
     /// Pull the next audio chunk (48000 Hz stereo interleaved f32).
     /// `Ok(None)` = no audio stream, or EOF reached on the audio side.
     pub(crate) fn next_audio(&mut self) -> Result<Option<RawAudio>, CaptureError> {
