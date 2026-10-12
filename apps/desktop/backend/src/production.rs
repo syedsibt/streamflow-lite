@@ -74,6 +74,10 @@ pub enum SourceKind {
         height: u32,
         /// Capture fps (0 = default 30).
         fps: u32,
+        /// Optional DirectShow audio device captured alongside the video
+        /// (`video=X:audio=Y`); its audio flows to the mixer like any
+        /// audio input. None = video only.
+        audio_device: Option<String>,
     },
     /// Microphone / line-in audio input (Windows DirectShow audio;
     /// `device` selects which, None = first available). Audio-only:
@@ -267,6 +271,8 @@ pub struct MixerView {
     pub meters_live: bool,
     /// Per-source meter values (all `0.0` while `meters_live` is false).
     pub meters: HashMap<String, f32>,
+    /// True while local speaker monitoring is active.
+    pub monitor_enabled: bool,
 }
 
 // ---------------------------------------------------------------------------
@@ -585,6 +591,7 @@ impl Shell {
             None,
             None,
             None,
+            None,
             0,
             0,
             0,
@@ -796,6 +803,7 @@ fn parse_source_kind(
     text: Option<&str>,
     path: Option<&str>,
     device: Option<&str>,
+    audio_device: Option<&str>,
     width: u32,
     height: u32,
     fps: u32,
@@ -812,6 +820,7 @@ fn parse_source_kind(
             width,
             height,
             fps,
+            audio_device: audio_device.map(|d| d.to_string()),
         }),
         "screen" => Ok(SourceKind::Screen),
         "audio_input" => Ok(SourceKind::AudioInput {
@@ -865,11 +874,12 @@ impl Shell {
         text: Option<&str>,
         path: Option<&str>,
         device: Option<&str>,
+        audio_device: Option<&str>,
         width: u32,
         height: u32,
         fps: u32,
     ) -> Result<SourceState, ShellError> {
-        let kind = parse_source_kind(kind, color, text, path, device, width, height, fps)?;
+        let kind = parse_source_kind(kind, color, text, path, device, audio_device, width, height, fps)?;
         let id = Uuid::new_v4().to_string();
         // Open producers BEFORE the source is pushed, so a bad file or
         // missing camera fails cleanly without leaving a half-added source.
@@ -882,6 +892,7 @@ impl Shell {
             width,
             height,
             fps,
+            audio_device,
         } = &kind
         {
             let (w, h) = if *width > 0 && *height > 0 {
@@ -890,7 +901,7 @@ impl Shell {
                 (1280, 720)
             };
             let f = if *fps == 30 || *fps == 60 { *fps } else { 30 };
-            self.open_camera_producer(&id, device.as_deref(), w, h, f)?;
+            self.open_camera_producer(&id, device.as_deref(), audio_device.as_deref(), w, h, f)?;
         }
         #[cfg(windows)]
         if let SourceKind::AudioInput { device } = &kind {
@@ -1241,6 +1252,7 @@ impl Shell {
                         )
                     })
                     .collect(),
+                monitor_enabled: self.audio_monitor.is_some(),
             },
             stream_settings: self.stream_settings.clone(),
             stream_lifecycle: self.stream_lifecycle.clone(),
@@ -1490,6 +1502,7 @@ impl Shell {
                     width,
                     height,
                     fps,
+                    ..
                 } => Some(CameraSourceInfo {
                     id: s.id.clone(),
                     name: s.name.clone(),
@@ -1582,14 +1595,15 @@ impl Shell {
             .iter()
             .position(|sc| sc.sources.iter().any(|s| s.id == source_id))
             .ok_or_else(|| ShellError::UnknownSource(source_id.to_string()))?;
-        {
+        // Keep the existing audio device across reconfigure.
+        let existing_audio = {
             let src = self.scenes[scene_idx]
                 .sources
-                .iter_mut()
+                .iter()
                 .find(|s| s.id == source_id)
                 .expect("source exists");
             match &src.kind {
-                SourceKind::Camera { .. } => {}
+                SourceKind::Camera { audio_device, .. } => audio_device.clone(),
                 _ => {
                     return Err(ShellError::InvalidSetting(format!(
                         "source '{}' is not a camera source",
@@ -1597,11 +1611,19 @@ impl Shell {
                     )))
                 }
             }
+        };
+        {
+            let src = self.scenes[scene_idx]
+                .sources
+                .iter_mut()
+                .find(|s| s.id == source_id)
+                .expect("source exists");
             src.kind = SourceKind::Camera {
                 device: device.clone(),
                 width,
                 height,
                 fps,
+                audio_device: existing_audio.clone(),
             };
         }
         // Drop the old producer + negotiated-format entry before reopening.
@@ -1615,7 +1637,14 @@ impl Shell {
                 (1280, 720)
             };
             let f = if fps == 30 || fps == 60 { fps } else { 30 };
-            self.open_camera_producer(source_id, device.as_deref(), w, h, f)?;
+            self.open_camera_producer(
+                source_id,
+                device.as_deref(),
+                existing_audio.as_deref(),
+                w,
+                h,
+                f,
+            )?;
         }
         Ok(self
             .camera_formats

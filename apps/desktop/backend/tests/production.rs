@@ -17,7 +17,7 @@ fn empty_scene(s: &mut Shell) -> String {
 }
 
 fn add_pattern(s: &mut Shell, scene_id: &str, name: &str) -> String {
-    s.source_add(scene_id, "test_pattern", name, [0, 0, 0], None, None, None, 0, 0, 0)
+    s.source_add(scene_id, "test_pattern", name, [0, 0, 0], None, None, None, None, 0, 0, 0)
         .expect("add test pattern source")
         .id
 }
@@ -100,7 +100,7 @@ fn source_crud_reorder_visibility() {
 
     let p1 = add_pattern(&mut s, &scene, "P1");
     let red = s
-        .source_add(&scene, "color", "Red", [255, 0, 0], None, None, None, 0, 0, 0)
+        .source_add(&scene, "color", "Red", [255, 0, 0], None, None, None, None, 0, 0, 0)
         .unwrap();
     assert!(matches!(red.kind, SourceKind::Color { r: 255, g: 0, b: 0 }));
     assert!(red.input_id.is_some());
@@ -108,7 +108,7 @@ fn source_crud_reorder_visibility() {
 
     // Pending kinds are honest: status pending + reason, no engine input.
     let cam = s
-        .source_add(&scene, "camera", "Cam", [0, 0, 0], None, None, None, 0, 0, 0)
+        .source_add(&scene, "camera", "Cam", [0, 0, 0], None, None, None, None, 0, 0, 0)
         .unwrap();
     assert!(cam.input_id.is_none());
     assert!(matches!(cam.kind, SourceKind::Camera { .. }));
@@ -118,14 +118,14 @@ fn source_crud_reorder_visibility() {
     );
     // Media with a bad path fails cleanly (no half-added source).
     let media_err = s
-        .source_add(&scene, "media", "Clip", [0, 0, 0], None, Some("/tmp/x.mp4"), None, 0, 0, 0)
+        .source_add(&scene, "media", "Clip", [0, 0, 0], None, Some("/tmp/x.mp4"), None, None, 0, 0, 0)
         .expect_err("nonexistent media must fail");
     assert!(
         media_err.to_string().contains("cannot open media"),
         "unexpected: {media_err}"
     );
     assert!(s
-        .source_add(&scene, "bogus", "X", [0, 0, 0], None, None, None, 0, 0, 0)
+        .source_add(&scene, "bogus", "X", [0, 0, 0], None, None, None, None, 0, 0, 0)
         .is_err());
 
     // Reorder: red to the bottom.
@@ -186,7 +186,7 @@ fn scene_render_returns_valid_nonblank_png_via_real_pipeline() {
     assert!(mx - mn > 40, "frame looks blank: {mn}..{mx}");
 
     // Pending sources are skipped, not faked: adding a camera still renders.
-    s.source_add(&scene, "camera", "Cam", [0, 0, 0], None, None, None, 0, 0, 0)
+    s.source_add(&scene, "camera", "Cam", [0, 0, 0], None, None, None, None, 0, 0, 0)
         .unwrap();
     let png2 = s.scene_render_png(&scene, 160, 90).unwrap();
     assert_eq!(png, png2); // camera contributed nothing
@@ -201,7 +201,7 @@ fn composite_order_and_visibility() {
     // Bottom: test pattern. Top: opaque red — covers everything.
     add_pattern(&mut s, &scene, "P1");
     let red = s
-        .source_add(&scene, "color", "Red", [255, 0, 0], None, None, None, 0, 0, 0)
+        .source_add(&scene, "color", "Red", [255, 0, 0], None, None, None, None, 0, 0, 0)
         .unwrap();
 
     let px = decode_rgba(&s.scene_render_png(&scene, 64, 36).unwrap());
@@ -616,7 +616,7 @@ fn camera_reconfigure_updates_kind_and_lists_sources() {
     let scene = empty_scene(&mut s);
     // fps=0 → default; on non-Windows no producer opens but kind is stored.
     let id = s
-        .source_add(&scene, "camera", "Cam", [0, 0, 0], None, None, None, 1280, 720, 0)
+        .source_add(&scene, "camera", "Cam", [0, 0, 0], None, None, None, None, 1280, 720, 0)
         .expect("add camera")
         .id;
     let cams = s.camera_sources();

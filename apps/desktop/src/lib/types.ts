@@ -233,7 +233,7 @@ export const WHEELS = [
 export type SourceKind =
   | { test_pattern: Record<string, never> }
   | { color: { r: number; g: number; b: number } }
-  | { camera: { device?: string | null; width?: number; height?: number; fps?: number } }
+  | { camera: { device?: string | null; width?: number; height?: number; fps?: number; audio_device?: string | null } }
   | { screen: Record<string, never> }
   | { media: { path: string } }
   | { text: { text: string } }
@@ -298,6 +298,7 @@ export interface MixerView {
   master: { gain: number; mute: boolean };
   meters_live: boolean;
   meters: Record<string, number>; // per-source peak, keyed by source id
+  monitor_enabled: boolean;
 }
 
 export interface StreamStateView {

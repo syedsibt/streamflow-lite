@@ -280,6 +280,19 @@ impl DshowProducer {
         height: u32,
         fps: u32,
     ) -> Result<Self, CaptureError> {
+        Self::open_with_audio(device, None, width, height, fps)
+    }
+
+    /// Open a camera plus an audio input device (`video=X:audio=Y`).
+    /// The shared demuxer decodes both streams; audio flows to the mixer
+    /// through the normal producer audio path.
+    pub fn open_with_audio(
+        device: &str,
+        audio_device: Option<&str>,
+        width: u32,
+        height: u32,
+        fps: u32,
+    ) -> Result<Self, CaptureError> {
         ensure_init();
         // Decimate the camera to the requested fps: if the device delivers
         // faster (e.g. 1080p60 negotiated while we tick at 30fps), stale
@@ -325,7 +338,7 @@ impl DshowProducer {
         ];
         let mut last_err = String::new();
         for (label, opts) in &attempts {
-            match Self::open_with_opts(device, label, opts, min_frame_interval_us) {
+            match Self::open_with_opts(device, audio_device, label, opts, min_frame_interval_us) {
                 Ok(p) => return Ok(p),
                 Err(e) => last_err = e,
             }
@@ -337,6 +350,7 @@ impl DshowProducer {
 
     fn open_with_opts(
         device: &str,
+        audio_device: Option<&str>,
         label: &str,
         opts: &[(String, String)],
         min_frame_interval_us: u64,
@@ -347,9 +361,14 @@ impl DshowProducer {
             return Err("FFmpeg was built without dshow support".into());
         }
 
-        // `video=Device Name` selects the capture device.
-        let url = CString::new(format!("video={device}"))
-            .map_err(|_| "device name contains NUL".to_string())?;
+        // `video=Device Name` selects the capture device; with an audio
+        // device, dshow opens both streams from one input
+        // (`video=X:audio=Y`) so A/V stay in sync.
+        let url_str = match audio_device {
+            Some(a) if !a.is_empty() => format!("video={device}:audio={a}"),
+            _ => format!("video={device}"),
+        };
+        let url = CString::new(url_str).map_err(|_| "device name contains NUL".to_string())?;
 
         let mut dict: *mut ff::ffi::AVDictionary = ptr::null_mut();
         let mut set_opt = |k: &str, v: &str| unsafe {

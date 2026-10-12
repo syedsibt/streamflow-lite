@@ -74,6 +74,7 @@ interface ProductionStore {
   setChannelMute: (source_id: string, mute: boolean) => Promise<void>;
   setMasterGain: (gain: number) => void;
   setMasterMute: (mute: boolean) => Promise<void>;
+  setMonitorEnabled: (enabled: boolean) => Promise<void>;
 
   // Stream
   setStreamUrl: (v: string) => void;
@@ -211,6 +212,7 @@ function normalizeProductionState(raw: unknown): ProductionStateData {
         r.mixer?.meters && typeof r.mixer.meters === "object"
           ? (r.mixer.meters as Record<string, number>)
           : {},
+      monitor_enabled: !!r.mixer?.monitor_enabled,
     },
     stream: {
       state: String(sl.state ?? "idle"),
@@ -567,6 +569,24 @@ export const useProduction = create<ProductionStore>()((set, get) => ({
       await api.mixerSetMasterMute(mute);
     } catch (e) {
       toast(`mixer_set_master_mute failed: ${String(e)}`);
+      await get().refresh();
+    }
+  },
+
+  setMonitorEnabled: async (enabled) => {
+    try {
+      const on = await api.setMonitorEnabled(enabled);
+      const { state } = get();
+      if (state) {
+        set({
+          state: { ...state, mixer: { ...state.mixer, monitor_enabled: on } },
+        });
+      }
+      if (enabled && !on) {
+        toast("Could not start audio monitor — no output device?");
+      }
+    } catch (e) {
+      toast(`set_monitor_enabled failed: ${String(e)}`);
       await get().refresh();
     }
   },

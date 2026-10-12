@@ -44,6 +44,7 @@ pub use sf_color::{LutPosition, LutRef};
 
 /// Real capture/encode/output/audio backend wiring (record, stream, meters,
 /// media sources). Keeps `production.rs` focused on the state machines.
+mod audio_monitor;
 mod av_backends;
 mod production;
 mod send_worker;
@@ -487,6 +488,9 @@ pub struct Shell {
     text_cache: HashMap<(String, String, u32, u32), Vec<u8>>,
     /// Real audio mixer (sf-audio); fed by media-source audio chunks.
     audio_mixer: sf_audio::Mixer,
+    /// Local speaker monitor (None = off). Opened on demand so a missing
+    /// audio device can never break startup.
+    audio_monitor: Option<audio_monitor::AudioMonitor>,
     /// Per-source meter peaks from the last audio tick.
     meter_values: HashMap<String, f32>,
     /// True once real audio has flowed through the mixer.
@@ -557,6 +561,7 @@ impl Shell {
             camera_formats: HashMap::new(),
             text_cache: HashMap::new(),
             audio_mixer: sf_audio::Mixer::new(),
+            audio_monitor: None,
             meter_values: HashMap::new(),
             meters_live: false,
             active_recording: None,
@@ -611,6 +616,7 @@ impl Shell {
             camera_formats: HashMap::new(),
             text_cache: HashMap::new(),
             audio_mixer: sf_audio::Mixer::new(),
+            audio_monitor: None,
             meter_values: HashMap::new(),
             meters_live: false,
             active_recording: None,

@@ -114,6 +114,7 @@ export const api = {
     let text: string | null = null;
     let path: string | null = null;
     let device: string | null = null;
+    let audio_device: string | null = null;
     let width = 0;
     let height = 0;
     let fps = 0;
@@ -128,6 +129,7 @@ export const api = {
       width = kind.camera.width ?? 0;
       height = kind.camera.height ?? 0;
       fps = kind.camera.fps ?? 0;
+      audio_device = kind.camera.audio_device ?? null;
     } else if ("screen" in kind) {
       kindStr = "screen";
     } else if ("media" in kind) {
@@ -150,6 +152,7 @@ export const api = {
       text,
       path,
       device,
+      audio_device,
       width,
       height,
       fps,
@@ -199,6 +202,8 @@ export const api = {
     cmd<void>("mixer_set_master_gain", { gain }),
   mixerSetMasterMute: (mute: boolean) =>
     cmd<void>("mixer_set_master_mute", { mute }),
+  setMonitorEnabled: (enabled: boolean) =>
+    cmd<boolean>("set_monitor_enabled", { enabled }),
 
   streamSetSettings: (url: string, key: string, platform: string) =>
     cmd<void>("stream_set_settings", { url, key, platform }),

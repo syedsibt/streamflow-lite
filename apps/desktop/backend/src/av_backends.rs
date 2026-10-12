@@ -288,6 +288,7 @@ impl Shell {
         &mut self,
         source_id: &str,
         device: Option<&str>,
+        audio_device: Option<&str>,
         width: u32,
         height: u32,
         fps: u32,
@@ -295,9 +296,16 @@ impl Shell {
         // Guard against a panic in the FFmpeg/dshow open path taking down
         // the whole app: convert it into a clean capture error instead.
         let device_owned = device.map(|d| d.to_string());
+        let audio_owned = audio_device.map(|d| d.to_string());
         let opened = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             match device_owned.as_deref() {
-                Some(d) => sf_capture::dshow::DshowProducer::open(d, width, height, fps),
+                Some(d) => sf_capture::dshow::DshowProducer::open_with_audio(
+                    d,
+                    audio_owned.as_deref(),
+                    width,
+                    height,
+                    fps,
+                ),
                 None => sf_capture::dshow::DshowProducer::open_default(width, height, fps),
             }
         }));
@@ -428,6 +436,30 @@ impl Shell {
         }
     }
 
+    /// Enable/disable local speaker monitoring of the master mix.
+    /// Opening is lazy and fallible: no output device → clean error,
+    /// never a startup crash.
+    pub fn set_monitor_enabled(&mut self, enabled: bool) -> Result<(), ShellError> {
+        if enabled && self.audio_monitor.is_none() {
+            match crate::audio_monitor::AudioMonitor::open() {
+                Ok(m) => self.audio_monitor = Some(m),
+                Err(e) => {
+                    return Err(ShellError::Capture(format!(
+                        "cannot start audio monitor: {e}"
+                    )))
+                }
+            }
+        } else if !enabled {
+            self.audio_monitor = None;
+        }
+        Ok(())
+    }
+
+    /// True while local speaker monitoring is active.
+    pub fn monitor_enabled(&self) -> bool {
+        self.audio_monitor.is_some()
+    }
+
     /// True when any open media producer has an audio stream.
     fn has_audio_sources(&self) -> bool {
         if self
@@ -455,6 +487,7 @@ impl Shell {
     pub(crate) fn pump_audio(&mut self) -> Vec<f32> {
         // Sync mixer registration with the current media + audio-input sources.
         let ids: Vec<String> = {
+            #[allow(unused_mut)]
             let mut v: Vec<String> = self.media_producers.keys().cloned().collect();
             #[cfg(windows)]
             v.extend(self.audio_producers.keys().cloned());
@@ -1142,6 +1175,10 @@ impl Shell {
         let t1 = std::time::Instant::now();
         let audio = self.pump_audio();
         let audio_us = t1.elapsed().as_micros() as u64;
+        // Local speaker monitoring (when enabled): the same mixed block.
+        if let Some(monitor) = &self.audio_monitor {
+            monitor.push(&audio);
+        }
         let t2 = std::time::Instant::now();
         if recording {
             self.record_tick(&frame, &audio);

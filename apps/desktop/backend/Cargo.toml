@@ -18,6 +18,9 @@ sf-encode = { path = "../../../crates/sf-encode" }
 sf-output = { path = "../../../crates/sf-output" }
 sf-audio = { path = "../../../crates/sf-audio" }
 sf-graphics = { path = "../../../crates/sf-graphics" }
+# Local audio monitoring (speakers). cpal = cross-platform audio I/O
+# (WASAPI on Windows, ALSA on Linux).
+cpal = "0.15"
 serde = { workspace = true }
 serde_json = { workspace = true }
 uuid = { workspace = true }

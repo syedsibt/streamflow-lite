@@ -12,6 +12,7 @@ export default function MixerPanel() {
   const setChannelMute = useProduction((s) => s.setChannelMute);
   const setMasterGain = useProduction((s) => s.setMasterGain);
   const setMasterMute = useProduction((s) => s.setMasterMute);
+  const setMonitorEnabled = useProduction((s) => s.setMonitorEnabled);
 
   if (!mixer) return null;
 
@@ -85,6 +86,17 @@ export default function MixerPanel() {
               title={mixer.master.mute ? "Unmute" : "Mute"}
             >
               M
+            </button>
+            <button
+              className={mixer.monitor_enabled ? "icon-btn mute-on" : "icon-btn"}
+              onClick={() => void setMonitorEnabled(!mixer.monitor_enabled)}
+              title={
+                mixer.monitor_enabled
+                  ? "Stop monitoring on speakers"
+                  : "Monitor the master mix on your speakers"
+              }
+            >
+              🔊
             </button>
           </div>
           <div className="meter" title="Meters pending audio engine">

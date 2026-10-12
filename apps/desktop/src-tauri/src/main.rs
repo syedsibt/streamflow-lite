@@ -357,6 +357,7 @@ fn source_add(
     text: Option<String>,
     path: Option<String>,
     device: Option<String>,
+    audio_device: Option<String>,
     width: u32,
     height: u32,
     fps: u32,
@@ -370,6 +371,7 @@ fn source_add(
             text.as_deref(),
             path.as_deref(),
             device.as_deref(),
+            audio_device.as_deref(),
             width,
             height,
             fps,
@@ -578,6 +580,13 @@ fn mixer_set_master_gain(state: State<'_, AppState>, gain: f32) -> CmdResult<Cha
 #[tauri::command(rename_all = "snake_case")]
 fn mixer_set_master_mute(state: State<'_, AppState>, mute: bool) -> CmdResult<ChannelStrip> {
     Ok(lock(&state)?.mixer_set_master_mute(mute))
+}
+
+/// Enables/disables local speaker monitoring of the master mix.
+#[tauri::command(rename_all = "snake_case")]
+fn set_monitor_enabled(state: State<'_, AppState>, enabled: bool) -> CmdResult<bool> {
+    lock(&state)?.set_monitor_enabled(enabled).map_err(ue)?;
+    Ok(lock(&state)?.monitor_enabled())
 }
 
 // ---------------------------------------------------------------------------
@@ -818,6 +827,7 @@ fn main() {
             mixer_set_mute,
             mixer_set_master_gain,
             mixer_set_master_mute,
+            set_monitor_enabled,
             stream_set_settings,
             stream_start,
             stream_stop,
