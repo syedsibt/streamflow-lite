@@ -60,23 +60,135 @@ fn set_curve_and_reset_sections() {
     assert!(grade.curves.is_identity());
 }
 
+/// Writes a small identity `.cube` and returns its path.
+fn temp_cube(name: &str) -> String {
+    let dir = std::env::temp_dir().join(format!("sf-shell-luts-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let mut text = format!("TITLE \"{name}\"\nLUT_3D_SIZE 2\n");
+    for b in 0..2 {
+        for g in 0..2 {
+            for r in 0..2 {
+                text.push_str(&format!("{r} {g} {b}\n"));
+            }
+        }
+    }
+    let p = dir.join(format!("{name}.cube"));
+    std::fs::write(&p, text).unwrap();
+    p.to_string_lossy().to_string()
+}
+
 #[test]
 fn load_lut_sets_ref() {
     let mut s = shell();
-    s.load_lut("cam1", "color/luts/podcast_warm.cube", "before", 0.6)
-        .unwrap();
+    let warm = temp_cube("podcast_warm");
+    s.load_lut("cam1", &warm, "before", 0.6).unwrap();
     let grade = s.grade_snapshot("cam1").unwrap();
     let lut = grade.lut.expect("lut must be set");
-    assert_eq!(lut.file, "color/luts/podcast_warm.cube");
+    assert_eq!(lut.file, warm);
     assert!((lut.intensity - 0.6).abs() < 1e-6);
     assert!(matches!(lut.position, sf_ui_backend::LutPosition::Before));
+    // The UI sends capitalized positions.
+    s.load_lut("cam1", &warm, "Before", 0.6).unwrap();
+    assert!(matches!(
+        s.grade_snapshot("cam1").unwrap().lut.unwrap().position,
+        sf_ui_backend::LutPosition::Before
+    ));
     // Unknown position falls back to After (documented).
-    s.load_lut("cam1", "x.cube", "sideways", 1.0).unwrap();
+    let x = temp_cube("x");
+    s.load_lut("cam1", &x, "sideways", 1.0).unwrap();
     let grade = s.grade_snapshot("cam1").unwrap();
     assert!(matches!(
         grade.lut.unwrap().position,
         sf_ui_backend::LutPosition::After
     ));
+}
+
+#[test]
+fn bad_lut_is_rejected_and_old_lut_kept() {
+    let mut s = shell();
+    let good = temp_cube("good");
+    s.load_lut("cam1", &good, "after", 1.0).unwrap();
+    // Missing file, wrong format, truncated data: all rejected clearly.
+    assert!(s.load_lut("cam1", "does/not/exist.cube", "after", 1.0).is_err());
+    let e = s.load_lut("cam1", "C:/luts/film.3dl", "after", 1.0).unwrap_err().to_string();
+    assert!(e.contains(".cube"), "{e}");
+    let dir = std::env::temp_dir().join(format!("sf-shell-luts-{}", std::process::id()));
+    let broken = dir.join("broken.cube");
+    std::fs::write(&broken, "LUT_3D_SIZE 17\n0 0 0\n").unwrap();
+    assert!(s.load_lut("cam1", broken.to_str().unwrap(), "after", 1.0).is_err());
+    assert_eq!(s.grade_snapshot("cam1").unwrap().lut.unwrap().file, good);
+    // Live intensity without reload.
+    let g = s.set_param("cam1", "lut_intensity", 0.35).unwrap();
+    assert!((g.lut.unwrap().intensity - 0.35).abs() < 1e-6);
+}
+
+#[test]
+fn lut_library_import_list_remove() {
+    let mut s = shell();
+    let data = std::env::temp_dir().join(format!("sf-shell-data-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&data);
+    s.set_data_dir(&data);
+    let src = temp_cube("My Cinematic LUT");
+    let info = s.lut_import(&src).unwrap();
+    assert_eq!(info.name, "My Cinematic LUT");
+    assert!(info.path.starts_with(data.to_str().unwrap()));
+    // Re-import of the identical file does not duplicate.
+    let again = s.lut_import(&src).unwrap();
+    assert_eq!(again.path, info.path);
+    assert_eq!(s.lut_library().len(), 1);
+    s.load_lut("cam1", &info.path, "after", 0.7).unwrap();
+    s.lut_remove(&info.id).unwrap();
+    assert!(s.lut_library().is_empty());
+    assert!(s.grade_snapshot("cam1").unwrap().lut.is_none(), "removed LUT detaches");
+}
+
+#[test]
+fn one_active_look_and_presets_roundtrip() {
+    let mut s = shell();
+    let target = sf_ipc::FilterTarget::Input("cam1".to_string());
+    let looks = s.list_looks();
+    assert!(looks.len() >= 3);
+    let a = s.look_apply(target.clone(), &looks[0].id, 0.8).unwrap();
+    let b = s.look_apply(target.clone(), &looks[1].id, 0.5).unwrap();
+    let c = s.look_apply(target.clone(), &looks[2].id, 0.5).unwrap();
+    // Swapping looks keeps one slot (same id) — no stacking, no 2-look limit.
+    assert_eq!(a, b);
+    assert_eq!(b, c);
+    let stack = s.stack_snapshot(&target).unwrap();
+    assert_eq!(stack.iter().filter(|v| v.kind == "look").count(), 1);
+    assert_eq!(stack[0].look_id.as_deref(), Some(looks[2].id.as_str()));
+
+    // Presets: save, change, apply restores grade + stack.
+    let data = std::env::temp_dir().join(format!("sf-shell-presets-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&data);
+    s.set_data_dir(&data);
+    s.set_param("cam1", "faded_film", 30.0).unwrap();
+    s.set_param("cam1", "skin_warmth", 12.0).unwrap();
+    let p = s.color_preset_save("cam1", "My Warm Look").unwrap();
+    s.reset("cam1", None).unwrap();
+    s.look_clear(target.clone()).unwrap();
+    assert!(s.stack_snapshot(&target).unwrap().is_empty());
+    let g = s.color_preset_apply("cam1", &p.id).unwrap();
+    assert!((g.faded_film - 30.0).abs() < 1e-6);
+    assert!((g.skin_warmth - 12.0).abs() < 1e-6);
+    assert_eq!(s.stack_snapshot(&target).unwrap().len(), 1);
+    assert_eq!(s.color_preset_list().len(), 1);
+    s.color_preset_delete(&p.id).unwrap();
+    assert!(s.color_preset_list().is_empty());
+}
+
+#[test]
+fn preview_modes_render() {
+    let mut s = shell();
+    s.set_param("cam1", "exposure", 1.0).unwrap();
+    for m in [
+        sf_ui_backend::PreviewMode::After,
+        sf_ui_backend::PreviewMode::Before,
+        sf_ui_backend::PreviewMode::Split,
+    ] {
+        let jpg = s.preview_frame_jpeg("cam1", 160, 90, m).unwrap();
+        assert_eq!(&jpg[..2], &[0xFF, 0xD8], "JPEG magic");
+    }
 }
 
 #[test]

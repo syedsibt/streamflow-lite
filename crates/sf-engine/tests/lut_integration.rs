@@ -192,9 +192,14 @@ fn podcast_warm_lut_generate_parse_and_apply() {
         .find(|i| i.id == "cam1")
         .expect("cam1 exists")
         .filters = stack;
-    // A missing/unparseable LUT would fail here with LutLoad/io — success
-    // proves the file was found, parsed, and uploaded to the GPU.
+    // A missing/unparseable LUT is skipped (never fails the frame) and
+    // recorded in `lut_error` — so assert it loaded.
     let via_stack = e.grade_input_frame("cam1", 64, 64, &px).unwrap();
+    assert!(
+        e.lut_error("color/luts/podcast_warm.cube").is_none(),
+        "the look's LUT must load: {:?}",
+        e.lut_error("color/luts/podcast_warm.cube")
+    );
     assert_ne!(
         plain.pixels, via_stack.pixels,
         "the look must change the frame"
@@ -229,4 +234,37 @@ fn podcast_warm_lut_generate_parse_and_apply() {
         with_lut.pixels, without_lut.pixels,
         "the 3D LUT stage must change the graded frame"
     );
+}
+
+/// A broken or missing LUT must never stop the live program: the frame is
+/// graded without it and the error is reported.
+#[test]
+fn bad_lut_is_skipped_not_fatal() {
+    let tmp = std::env::temp_dir().join(format!("sf-badlut-{}", std::process::id()));
+    std::fs::create_dir_all(&tmp).unwrap();
+    let bad = tmp.join("broken.cube");
+    std::fs::write(&bad, "LUT_3D_SIZE 17\n0 0 0\n").unwrap(); // truncated
+    let bad = bad.to_string_lossy().to_string();
+
+    let mut e = Engine::new_headless().expect("headless engine");
+    e.state_mut().add_input("cam1", "Camera 1");
+    {
+        let g = &mut e.state_mut().input_color_mut("cam1").unwrap().grade;
+        g.exposure = 0.5;
+        g.lut = Some(sf_color::grade::LutRef {
+            file: bad.clone(),
+            intensity: 1.0,
+            position: sf_color::grade::LutPosition::After,
+        });
+    }
+    let px = gradient64();
+    let out = e.grade_input_frame("cam1", 64, 64, &px);
+    assert!(out.is_ok(), "bad LUT must not fail the frame: {:?}", out.err());
+    assert!(e.lut_error(&bad).is_some());
+    // The rest of the grade still applies.
+    assert_ne!(out.unwrap().pixels, px);
+    // Missing file: same rule.
+    e.state_mut().input_color_mut("cam1").unwrap().grade.lut.as_mut().unwrap().file =
+        "does/not/exist.cube".into();
+    assert!(e.grade_input_frame("cam1", 64, 64, &px).is_ok());
 }

@@ -1,0 +1,14 @@
+{
+  "name": "Warm Skin",
+  "version": 1,
+  "category": "Portrait",
+  "params": {
+    "temperature": 7000,
+    "vibrance": 4,
+    "highlights": -8,
+    "skin_warmth": 22,
+    "skin_saturation": 6,
+    "skin_brightness": 8
+  },
+  "skin_protect": true
+}

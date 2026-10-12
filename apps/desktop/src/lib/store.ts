@@ -8,16 +8,28 @@ import { create } from "zustand";
 import { api, isTauri, onSfEvent } from "./ipc";
 import type {
   ColorGrade,
+  ColorPresetInfo,
   CurveName,
   EffectKindInfo,
+  EffectParams,
   FilterTarget,
   LookInfo,
+  LutInfo,
+  PreviewMode,
   ScopeDataView,
   ScopeKindName,
   SlotView,
 } from "./types";
 
-export type TabId = "basic" | "pro" | "curves" | "lut" | "filters";
+export type TabId =
+  | "basic"
+  | "creative"
+  | "curves"
+  | "wheels"
+  | "lut"
+  | "effects"
+  | "filters"
+  | "presets";
 
 interface Toast {
   id: number;
@@ -35,9 +47,33 @@ interface StudioState {
   scopes: Partial<Record<ScopeKindName, ScopeDataView>>;
   previewUrl: string | null;
   activeTab: TabId;
-  lookIntensity: number; // 0..1, used when applying looks
+  lookIntensity: number; // 0..1 — drives the active look live
   toasts: Toast[];
   autoColorNote: string[]; // last auto-color explanations
+  previewMode: PreviewMode;
+  luts: LutInfo[];
+  presets: ColorPresetInfo[];
+
+  setPreviewMode: (m: PreviewMode) => void;
+  refreshLuts: () => Promise<void>;
+  /** Opens a file picker, validates + imports the .cube, applies it. */
+  importLut: () => Promise<void>;
+  applyLibraryLut: (lut: LutInfo) => Promise<void>;
+  removeLut: (id: string) => Promise<void>;
+  setLutIntensity: (v: number) => void;
+  setLutPosition: (pos: "Before" | "After") => Promise<void>;
+  refreshPresets: () => Promise<void>;
+  savePreset: (name: string) => Promise<void>;
+  applyPreset: (id: string) => Promise<void>;
+  deletePreset: (id: string) => Promise<void>;
+  clearLook: () => Promise<void>;
+  /** Slot of the given effect kind (PascalCase, e.g. "Bloom"), if present. */
+  effectSlot: (kind: string) => SlotView | undefined;
+  /** Adds the effect if missing; returns its slot id. */
+  ensureEffect: (kind: string) => Promise<string | null>;
+  removeEffect: (kind: string) => Promise<void>;
+  /** Live effect parameter edit (throttled). */
+  setEffectParams: (kind: string, patch: Partial<EffectParams>) => Promise<void>;
 
   init: () => Promise<void>;
   setTab: (t: TabId) => void;
@@ -64,6 +100,20 @@ interface StudioState {
 }
 
 let toastId = 0;
+let previewInFlight = false;
+/** Trailing throttles for look intensity / effect params (one per key). */
+const throttles = new Map<string, ReturnType<typeof setTimeout>>();
+function throttled(key: string, ms: number, fn: () => void) {
+  const t = throttles.get(key);
+  if (t) clearTimeout(t);
+  throttles.set(
+    key,
+    setTimeout(() => {
+      throttles.delete(key);
+      fn();
+    }, ms),
+  );
+}
 /** Trailing 60 Hz sync for slider drags (spec §8). */
 let syncTimer: ReturnType<typeof setTimeout> | null = null;
 const pendingSync = new Map<string, number>();
@@ -105,6 +155,9 @@ export const useStudio = create<StudioState>()((set, get) => {
     lookIntensity: 0.8,
     toasts: [],
     autoColorNote: [],
+    previewMode: "after",
+    luts: [],
+    presets: [],
 
     init: async () => {
       if (!isTauri) return; // placeholder mode in plain browsers
@@ -117,6 +170,8 @@ export const useStudio = create<StudioState>()((set, get) => {
           api.listEffectKinds(),
         ]);
         set({ grade, stack, looks, effectKinds, ready: true });
+        void get().refreshLuts();
+        void get().refreshPresets();
         // Subscribe the three main scopes (spec §8 scopes row).
         for (const kind of ["waveform", "vectorscope", "histogram"] as const) {
           await api.scopesSubscribe(inputId, kind).catch(() => {});
@@ -153,7 +208,22 @@ export const useStudio = create<StudioState>()((set, get) => {
     },
 
     setTab: (t) => set({ activeTab: t }),
-    setLookIntensity: (v) => set({ lookIntensity: v }),
+    setLookIntensity: (v) => {
+      set({ lookIntensity: v });
+      // Drive the active look live (one active look per input).
+      const look = get().stack.find((s) => s.kind === "look");
+      if (look) {
+        set({
+          stack: get().stack.map((s) => (s.id === look.id ? { ...s, intensity: v } : s)),
+        });
+        throttled("look-intensity", 30, () => {
+          const { inputId, pushToast } = get();
+          api
+            .filterSetIntensity(targetOf(inputId), look.id, v)
+            .catch((e) => pushToast(`look intensity failed: ${String(e)}`));
+        });
+      }
+    },
 
     setInputId: async (inputId, inputName) => {
       const prev = get();
@@ -191,7 +261,10 @@ export const useStudio = create<StudioState>()((set, get) => {
       const { grade } = get();
       if (grade) {
         // Optimistic local update for responsive sliders.
-        const next = { ...grade, [param]: value } as ColorGrade;
+        const next =
+          param === "lut_intensity"
+            ? ({ ...grade, lut: grade.lut ? { ...grade.lut, intensity: value } : null } as ColorGrade)
+            : ({ ...grade, [param]: value } as ColorGrade);
         set({ grade: next });
       }
       pendingSync.set(param, value);
@@ -349,14 +422,176 @@ export const useStudio = create<StudioState>()((set, get) => {
     },
 
     pollPreview: async () => {
-      const { inputId } = get();
-      if (!isTauri) return;
+      const { inputId, previewMode } = get();
+      if (!isTauri || previewInFlight) return; // never queue requests up
+      previewInFlight = true;
       try {
-        const url = await api.previewGetFrame(inputId, 480, 270);
+        const url = await api.previewGetFrame(inputId, 640, 360, previewMode);
         set({ previewUrl: url });
       } catch {
-        /* silent: backend throttles anyway */
+        /* silent: next poll retries */
+      } finally {
+        previewInFlight = false;
       }
+    },
+
+    setPreviewMode: (m) => set({ previewMode: m }),
+
+    refreshLuts: async () => {
+      try {
+        set({ luts: await api.lutLibrary() });
+      } catch {
+        /* outside Tauri */
+      }
+    },
+
+    importLut: async () => {
+      const { pushToast } = get();
+      if (!isTauri) return;
+      try {
+        const { open } = await import("@tauri-apps/plugin-dialog");
+        const picked = await open({
+          multiple: false,
+          title: "Import LUT (.cube)",
+          filters: [{ name: "Cube LUT", extensions: ["cube", "CUBE"] }],
+        });
+        if (!picked || Array.isArray(picked)) return;
+        const lut = await api.lutImport(picked);
+        await get().refreshLuts();
+        for (const w of lut.warnings) pushToast(`LUT note: ${w}`);
+        await get().applyLibraryLut(lut);
+        pushToast(`LUT imported: ${lut.name}`);
+      } catch (e) {
+        pushToast(String(e));
+      }
+    },
+
+    applyLibraryLut: async (lut) => {
+      const { inputId, grade, pushToast } = get();
+      const intensity = grade?.lut?.intensity ?? 1;
+      const position = grade?.lut?.position ?? "After";
+      try {
+        await api.colorLoadLut(inputId, lut.path, position, intensity);
+        set({ grade: await api.gradeSnapshot(inputId) });
+      } catch (e) {
+        pushToast(String(e));
+      }
+    },
+
+    removeLut: async (id) => {
+      const { pushToast, inputId } = get();
+      try {
+        await api.lutRemove(id);
+        await get().refreshLuts();
+        set({ grade: await api.gradeSnapshot(inputId) });
+      } catch (e) {
+        pushToast(String(e));
+      }
+    },
+
+    setLutIntensity: (v) => get().setParam("lut_intensity", v),
+
+    setLutPosition: async (pos) => {
+      const { inputId, grade, pushToast } = get();
+      if (!grade?.lut) return;
+      try {
+        await api.colorLoadLut(inputId, grade.lut.file, pos, grade.lut.intensity);
+        set({ grade: await api.gradeSnapshot(inputId) });
+      } catch (e) {
+        pushToast(String(e));
+      }
+    },
+
+    refreshPresets: async () => {
+      try {
+        set({ presets: await api.colorPresetList() });
+      } catch {
+        /* outside Tauri */
+      }
+    },
+
+    savePreset: async (name) => {
+      const { inputId, pushToast } = get();
+      try {
+        const p = await api.colorPresetSave(inputId, name);
+        await get().refreshPresets();
+        pushToast(`Preset saved: ${p.name}`);
+      } catch (e) {
+        pushToast(String(e));
+      }
+    },
+
+    applyPreset: async (id) => {
+      const { inputId, pushToast, refreshStack } = get();
+      try {
+        const grade = await api.colorPresetApply(inputId, id);
+        set({ grade });
+        await refreshStack();
+      } catch (e) {
+        pushToast(String(e));
+      }
+    },
+
+    deletePreset: async (id) => {
+      const { pushToast } = get();
+      try {
+        await api.colorPresetDelete(id);
+        await get().refreshPresets();
+      } catch (e) {
+        pushToast(String(e));
+      }
+    },
+
+    clearLook: async () => {
+      const { inputId, pushToast, refreshStack } = get();
+      try {
+        await api.lookClear(targetOf(inputId));
+        await refreshStack();
+        set({ grade: await api.gradeSnapshot(inputId) });
+      } catch (e) {
+        pushToast(`clear look failed: ${String(e)}`);
+      }
+    },
+
+    effectSlot: (kind) => get().stack.find((s) => s.kind === kind.toLowerCase()),
+
+    ensureEffect: async (kind) => {
+      const existing = get().effectSlot(kind);
+      if (existing) return existing.id;
+      const { inputId, effectKinds, pushToast, refreshStack } = get();
+      const info = effectKinds.find((k) => k.kind === kind.toLowerCase());
+      if (!info) return null;
+      try {
+        const id = await api.filterAdd(targetOf(inputId), {
+          Effect: { kind: kind as never, params: info.default_params },
+        });
+        await refreshStack();
+        return id;
+      } catch (e) {
+        pushToast(`add ${kind} failed: ${String(e)}`);
+        return null;
+      }
+    },
+
+    removeEffect: async (kind) => {
+      const slot = get().effectSlot(kind);
+      if (slot) await get().removeSlot(slot.id);
+    },
+
+    setEffectParams: async (kind, patch) => {
+      const id = await get().ensureEffect(kind);
+      if (!id) return;
+      const slot = get().stack.find((s) => s.id === id);
+      const info = get().effectKinds.find((k) => k.kind === kind.toLowerCase());
+      const base = (slot?.params ?? (info?.default_params as unknown as EffectParams)) as EffectParams;
+      const params = { ...base, ...patch } as EffectParams;
+      set({ stack: get().stack.map((s) => (s.id === id ? { ...s, params } : s)) });
+      throttled(`fx-${kind}`, 30, () => {
+        const { inputId, pushToast } = get();
+        api
+          .filterSetParams(targetOf(inputId), id, params)
+          .catch((e) => pushToast(`${kind} update failed: ${String(e)}`));
+      });
     },
 
     pushToast: (text) => {

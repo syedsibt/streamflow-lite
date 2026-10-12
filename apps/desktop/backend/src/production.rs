@@ -1259,6 +1259,19 @@ impl Shell {
                 Ok(px) => canvas = px,
                 Err(_) => composite_over(&mut canvas, &frame.pixels),
             }
+            // Color Studio live tap: hand over the frames we own and were
+            // about to drop (moved, no copy, no second grade). The Color
+            // Studio preview is therefore the exact image in the program /
+            // encoder, not a separate pipeline.
+            if let Some(mode) = self.studio_watching(input_id) {
+                let raw = (mode != crate::color_library::PreviewMode::After).then(|| Frame {
+                    width: w,
+                    height: h,
+                    pixels,
+                });
+                let input_id = input_id.clone();
+                self.studio_tap_store(&input_id, frame, raw);
+            }
         }
         Ok(Frame {
             width: w,

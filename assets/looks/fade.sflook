@@ -1,0 +1,11 @@
+{
+  "name": "Fade",
+  "version": 1,
+  "category": "Creative",
+  "params": {
+    "contrast": -10,
+    "saturation": 85,
+    "faded_film": 45
+  },
+  "skin_protect": true
+}

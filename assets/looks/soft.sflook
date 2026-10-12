@@ -1,0 +1,14 @@
+{
+  "name": "Soft",
+  "version": 1,
+  "category": "Social",
+  "params": {
+    "contrast": -10,
+    "highlights": -15,
+    "shadows": 10,
+    "saturation": 96,
+    "faded_film": 4,
+    "vibrance": 4
+  },
+  "skin_protect": true
+}

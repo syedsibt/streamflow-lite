@@ -161,6 +161,10 @@ pub fn interpolate_grade(from: &ColorGrade, to: &ColorGrade, t: f32) -> ColorGra
         } else {
             to.skin_protect
         },
+        faded_film: lerp(from.faded_film, to.faded_film),
+        skin_warmth: lerp(from.skin_warmth, to.skin_warmth),
+        skin_saturation: lerp(from.skin_saturation, to.skin_saturation),
+        skin_brightness: lerp(from.skin_brightness, to.skin_brightness),
     }
 }
 

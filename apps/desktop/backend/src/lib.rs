@@ -46,10 +46,12 @@ pub use sf_color::{LutPosition, LutRef};
 /// media sources). Keeps `production.rs` focused on the state machines.
 mod audio_monitor;
 mod av_backends;
+mod color_library;
 mod production;
 mod send_worker;
 /// Production state machine (scenes, sources, transitions, mixer, stream,
 /// record, macros) — all headless-testable, no tauri dependency.
+pub use color_library::{encode_preview_jpeg, ColorPresetInfo, LutInfo, PreviewMode};
 pub use production::{
     transition_progress, CameraSourceInfo, ChannelStrip, EnhancerView, Macro, MacroAction,
     MacroDispatchResult, MixerView, ProdScene, ProductionStateView, RecordFormat, RecordLifecycle,
@@ -240,6 +242,12 @@ pub enum ShellError {
     /// Invalid video/setting value from the UI.
     #[error("invalid setting: {0}")]
     InvalidSetting(String),
+    /// LUT import/load failure (bad or unsupported file).
+    #[error("{0}")]
+    Lut(String),
+    /// Color preset save/load failure.
+    #[error("preset error: {0}")]
+    Preset(String),
 }
 
 impl ShellError {
@@ -455,6 +463,13 @@ pub struct SlotView {
     pub cost: String,
     /// True for AI kinds (may grey out without a model).
     pub is_ai: bool,
+    /// Current effect parameters (`None` for looks) — lets the Glow / Skin
+    /// panels show the live values after a preset is applied.
+    #[serde(default)]
+    pub params: Option<sf_filters::EffectParams>,
+    /// Look preset id for look slots.
+    #[serde(default)]
+    pub look_id: Option<String>,
 }
 
 /// The shell binding: owns the engine, look registry, per-input frames,
@@ -575,6 +590,15 @@ pub struct Shell {
     /// [render (capture+grade+composite), audio pump, record encode/write,
     /// stream encode/send] — blueprint "measure before claiming".
     perf_stages_us: [u64; 4],
+    /// Color Studio live tap: the input the Color Studio is watching and
+    /// when it last asked. While watched, `render_scene_frame` hands the
+    /// exact graded frame it composited (and the raw frame, for
+    /// before/after) to the tap — moved, not copied, and no second grade.
+    studio_watch: Option<(String, Instant, PreviewMode)>,
+    /// Last tapped (graded, raw) frames for the watched input.
+    studio_tap: Option<color_library::StudioTap>,
+    /// Per-user data folder (LUT library, color presets).
+    data_dir: PathBuf,
 }
 
 impl Shell {
@@ -628,6 +652,9 @@ impl Shell {
             perf_dropped_network: 0,
             perf_lagged_ticks: 0,
             perf_stages_us: [0; 4],
+            studio_watch: None,
+            studio_tap: None,
+            data_dir: color_library::default_data_dir(),
         };
         shell.init_production();
         // A default input so the UI is usable immediately (the engine
@@ -686,6 +713,9 @@ impl Shell {
             perf_dropped_network: 0,
             perf_lagged_ticks: 0,
             perf_stages_us: [0; 4],
+            studio_watch: None,
+            studio_tap: None,
+            data_dir: color_library::default_data_dir(),
         };
         shell.init_production();
         if let Ok(reg) = LookRegistry::load_dir(looks_dir) {
@@ -796,11 +826,16 @@ impl Shell {
         position: &str,
         intensity: f32,
     ) -> Result<(), ShellError> {
-        let pos = match position {
+        // The UI sends "Before"/"After": compare case-insensitively (the
+        // old exact match silently forced every LUT to "after").
+        let pos = match position.to_ascii_lowercase().as_str() {
             "before" => LutPosition::Before,
-            "after" => LutPosition::After,
             _ => LutPosition::After,
         };
+        // Validate before attaching: a bad file is rejected with a clear
+        // message and the current LUT stays (never a broken grade).
+        color_library::validate_lut_file(path)?;
+        self.engine.invalidate_lut(path);
         let grade = self.grade_mut(input_id)?;
         grade.lut = Some(LutRef {
             file: path.to_string(),
@@ -826,6 +861,17 @@ impl Shell {
             Some("wheels") => reset_wheels(grade),
             Some("curves") => grade.curves = Default::default(),
             Some("lut") => grade.lut = None,
+            Some("creative") => {
+                grade.faded_film = 0.0;
+                grade.vibrance = 0.0;
+                grade.saturation = 100.0;
+                grade.sharpness = 0.0;
+            }
+            Some("skin") => {
+                grade.skin_warmth = 0.0;
+                grade.skin_saturation = 0.0;
+                grade.skin_brightness = 0.0;
+            }
             _ => *grade = ColorGrade::default(),
         }
         let snapshot = grade.clone();
@@ -853,6 +899,17 @@ fn apply_param(grade: &mut ColorGrade, param: &str, value: f32) -> Result<(), Sh
         "blacks" => grade.blacks = cl(value, -100.0, 100.0),
         "gamma" => grade.gamma = cl(value, 0.5, 2.5),
         "sharpness" => grade.sharpness = cl(value, 0.0, 100.0),
+        "faded_film" => grade.faded_film = cl(value, 0.0, 100.0),
+        "skin_warmth" => grade.skin_warmth = cl(value, -100.0, 100.0),
+        "skin_saturation" => grade.skin_saturation = cl(value, -100.0, 100.0),
+        "skin_brightness" => grade.skin_brightness = cl(value, -100.0, 100.0),
+        "skin_protect" => grade.skin_protect = value >= 0.5,
+        // Live LUT blend (no reload): slider drags update the uniform only.
+        "lut_intensity" => {
+            if let Some(l) = grade.lut.as_mut() {
+                l.intensity = cl(value, 0.0, 1.0);
+            }
+        }
         _ => {
             // Wheel channels: `<wheel>_<r|g|b|master>`.
             let (wheel, ch) = param
@@ -881,7 +938,9 @@ fn apply_param(grade: &mut ColorGrade, param: &str, value: f32) -> Result<(), Sh
 fn reset_single_param(grade: &mut ColorGrade, param: &str) -> Result<(), ShellError> {
     let neutral = match param {
         "exposure" | "brightness" | "contrast" | "vibrance" | "tint" | "highlights" | "shadows"
-        | "whites" | "blacks" | "sharpness" => 0.0,
+        | "whites" | "blacks" | "sharpness" | "faded_film" | "skin_warmth" | "skin_saturation"
+        | "skin_brightness" | "skin_protect" => 0.0,
+        "lut_intensity" => 1.0,
         "saturation" => 100.0,
         "temperature" => 6500.0,
         "gamma" => 1.0,
@@ -1146,13 +1205,32 @@ impl Shell {
         if self.engine.look_registry_mut().get(look_id).is_none() {
             return Err(ShellError::UnknownLook(look_id.to_string()));
         }
+        // One active look per stack (filter-app semantics): picking another
+        // look swaps the existing look slot in place — same slot id, so the
+        // intensity slider keeps driving it — instead of stacking looks
+        // (which compounded them and hit the 2-look limit on the 3rd click).
+        let new_filter = Filter::Look {
+            preset_id: look_id.to_string(),
+            intensity: 1.0,
+        };
+        let existing = self
+            .stack(&target)?
+            .slots()
+            .iter()
+            .find(|s| matches!(s.filter, Filter::Look { .. }))
+            .map(|s| s.id);
+        if let Some(id) = existing {
+            let stack = self.stack_mut(&target)?;
+            stack.replace_filter(&id, new_filter, intensity)?;
+            let _ = stack.toggle(&id, true);
+            self.events
+                .push_back(UiEvent::FilterStackChanged { target });
+            return Ok(id);
+        }
         let id = Uuid::new_v4();
         let slot = FilterSlot {
             id,
-            filter: Filter::Look {
-                preset_id: look_id.to_string(),
-                intensity: 1.0,
-            },
+            filter: new_filter,
             enabled: true,
             intensity: intensity.clamp(0.0, 1.0),
             mask: None,
@@ -1170,6 +1248,38 @@ impl Shell {
         self.events
             .push_back(UiEvent::FilterStackChanged { target });
         Ok(id)
+    }
+
+    /// Removes the active look (if any) from a stack.
+    pub fn look_clear(&mut self, target: FilterTarget) -> Result<(), ShellError> {
+        let ids: Vec<Uuid> = self
+            .stack(&target)?
+            .slots()
+            .iter()
+            .filter(|s| matches!(s.filter, Filter::Look { .. }))
+            .map(|s| s.id)
+            .collect();
+        let stack = self.stack_mut(&target)?;
+        for id in &ids {
+            stack.remove(id);
+        }
+        self.events
+            .push_back(UiEvent::FilterStackChanged { target });
+        Ok(())
+    }
+
+    /// Updates an effect slot's parameters live (Glow threshold/radius/
+    /// softness, skin smoothing, …).
+    pub fn filter_set_params(
+        &mut self,
+        target: FilterTarget,
+        slot_id: Uuid,
+        params: sf_filters::EffectParams,
+    ) -> Result<(), ShellError> {
+        self.stack_mut(&target)?.set_effect_params(&slot_id, params)?;
+        self.events
+            .push_back(UiEvent::FilterStackChanged { target });
+        Ok(())
     }
 
     /// Serializable snapshot of a stack for the Filters tab.
@@ -1200,9 +1310,11 @@ impl Shell {
                     intensity: slot.intensity,
                     cost: "low".to_string(),
                     is_ai: false,
+                    params: None,
+                    look_id: Some(preset_id.clone()),
                 }
             }
-            Filter::Effect { kind, params: _ } => SlotView {
+            Filter::Effect { kind, params } => SlotView {
                 id: slot.id,
                 label: effect_label(kind),
                 kind: format!("{kind:?}").to_lowercase(),
@@ -1210,6 +1322,8 @@ impl Shell {
                 intensity: slot.intensity,
                 cost: cost_name(kind.cost()),
                 is_ai: kind.is_ai(),
+                params: Some(params.clone()),
+                look_id: None,
             },
         }
     }

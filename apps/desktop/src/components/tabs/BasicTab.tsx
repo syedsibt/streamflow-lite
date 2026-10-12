@@ -1,24 +1,8 @@
 import { useStudio } from "../../lib/store";
-import { BASIC_PARAMS } from "../../lib/types";
+import { BASIC_GROUPS } from "../../lib/types";
 import Slider from "../Slider";
 
-/** Neutral defaults for the Basic tab (identity grade). */
-const NEUTRAL: Record<string, number> = {
-  exposure: 0,
-  brightness: 0,
-  contrast: 0,
-  saturation: 100,
-  vibrance: 0,
-  temperature: 6500,
-  tint: 0,
-  highlights: 0,
-  shadows: 0,
-  whites: 0,
-  blacks: 0,
-  gamma: 1,
-  sharpness: 0,
-};
-
+/** Basic correction (white balance → tone → color), Lumetri-style order. */
 export default function BasicTab() {
   const grade = useStudio((s) => s.grade);
   const autoColor = useStudio((s) => s.autoColor);
@@ -26,29 +10,34 @@ export default function BasicTab() {
   const autoColorNote = useStudio((s) => s.autoColorNote);
 
   if (grade === null) return <div className="note">Waiting for backend…</div>;
-
   const g = grade as unknown as Record<string, number>;
 
   return (
     <div>
-      {BASIC_PARAMS.map((def) => (
-        <Slider
-          key={def.param}
-          label={def.label}
-          param={def.param}
-          min={def.min}
-          max={def.max}
-          step={def.step}
-          value={g[def.param] ?? NEUTRAL[def.param] ?? def.min}
-          format={def.format}
-        />
+      {BASIC_GROUPS.map((group) => (
+        <div key={group.title} className="param-group">
+          <div className="section-title">{group.title}</div>
+          {group.params.map((def) => (
+            <Slider
+              key={def.param}
+              label={def.label}
+              param={def.param}
+              min={def.min}
+              max={def.max}
+              step={def.step}
+              neutral={def.neutral}
+              value={g[def.param] ?? def.neutral ?? def.min}
+              format={def.format}
+            />
+          ))}
+        </div>
       ))}
       <div className="btn-row">
-        <button className="btn" onClick={() => void autoColor()}>
+        <button className="btn" onClick={() => void autoColor()} title="Analyze the frame and set editable values">
           Auto Color
         </button>
         <button className="btn ghost" onClick={() => void resetSection("basic")}>
-          Reset
+          Reset basic
         </button>
       </div>
       {autoColorNote.map((note, i) => (

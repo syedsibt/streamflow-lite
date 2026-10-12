@@ -1,0 +1,25 @@
+{
+  "name": "Retro",
+  "version": 1,
+  "category": "Creative",
+  "params": {
+    "saturation": 115,
+    "temperature": 7600,
+    "tint": 10,
+    "contrast": 14,
+    "faded_film": 18,
+    "lift": [
+      0,
+      0.01,
+      0.02,
+      0
+    ],
+    "gain": [
+      1.06,
+      1.0,
+      0.88,
+      1.0
+    ]
+  },
+  "skin_protect": true
+}

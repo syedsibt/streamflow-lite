@@ -237,3 +237,32 @@ voice sources only ─► Enhancer: RNNoise AI denoise → voice-aware gate → 
 * Fixed latencies: device packet 10–20 ms, bus queue typically 10–45 ms,
   AI stage 20 ms. Nothing can accumulate: the bus trims past 100 ms, the
   monitor past 120 ms.
+
+## Color pipeline (Color Studio = a processing layer of the live pipeline)
+
+```text
+camera frame (display RGB8)
+  └─ grade_input_frame (one fused GPU compute pass, per input)
+       linearize (γ2.4)
+       → [Input LUT, display-referred]          (LUT "before")
+       → exposure → white balance → shadow/mid/highlight wheels
+       → tone (contrast, highlights, shadows, whites, blacks) → gamma
+       → saturation / vibrance (skin-protected) → skin warmth/sat/brightness
+       → curves (display-referred: RGB, R, G, B, luma, hue-vs-sat)
+       → faded film (display-referred)
+       → [Creative LUT, display-referred, intensity blend]   (LUT "after")
+     → sharpen → effect slots (Glow, skin smoothing, …) in stack order
+  └─ composite → program frame ─┬─ main preview / monitors
+                                ├─ encoder → YouTube / Facebook / TikTok
+                                └─ Color Studio preview (live tap, moved —
+                                   no second grade, no second camera pull)
+```
+
+* Looks/filters are **parameter presets** folded into the same grade pass
+  (`resolve_grade`): intensity scales every parameter (and curves) toward
+  identity. One active look per input.
+* `.cube` LUTs and curves operate on **display-referred** values (what
+  Premiere/Resolve LUTs and curve editors assume); grading math stays linear.
+* Non-destructive: the camera frame is never modified; all state is
+  parameters (saved as presets in the user data folder).
+* A bad/missing LUT is skipped (reported), never failing the live frame.

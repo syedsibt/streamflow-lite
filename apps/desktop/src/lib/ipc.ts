@@ -16,6 +16,10 @@ import type {
   Filter,
   FilterTarget,
   LookInfo,
+  LutInfo,
+  ColorPresetInfo,
+  EffectParams,
+  PreviewMode,
   MacroActionInput,
   MacroView,
   SceneView,
@@ -87,9 +91,21 @@ export const api = {
   scopesUnsubscribe: (input_id: string, kind: string) =>
     cmd<void>("scopes_unsubscribe", { input_id, kind }),
 
-  /** PNG data URL, ~10 Hz throttled by the backend. */
-  previewGetFrame: (input_id: string, width: number, height: number) =>
-    cmd<string>("preview_get_frame", { input_id, width, height }),
+  /** JPEG data URL of the live processed frame (same as program/encoder). */
+  previewGetFrame: (input_id: string, width: number, height: number, mode: PreviewMode = "after") =>
+    cmd<string>("preview_get_frame", { input_id, width, height, mode }),
+  lookClear: (target: FilterTarget) => cmd<void>("look_clear", { target }),
+  filterSetParams: (target: FilterTarget, slot_id: string, params: EffectParams) =>
+    cmd<void>("filter_set_params", { target, slot_id, params }),
+  lutImport: (path: string) => cmd<LutInfo>("lut_import", { path }),
+  lutLibrary: () => cmd<LutInfo[]>("lut_library"),
+  lutRemove: (id: string) => cmd<void>("lut_remove", { id }),
+  colorPresetSave: (input_id: string, name: string) =>
+    cmd<ColorPresetInfo>("color_preset_save", { input_id, name }),
+  colorPresetList: () => cmd<ColorPresetInfo[]>("color_preset_list"),
+  colorPresetApply: (input_id: string, id: string) =>
+    cmd<ColorGrade>("color_preset_apply", { input_id, id }),
+  colorPresetDelete: (id: string) => cmd<void>("color_preset_delete", { id }),
 
   // -------------------------------------------------------------------------
   // Production (command names and snake_case args must match the Rust

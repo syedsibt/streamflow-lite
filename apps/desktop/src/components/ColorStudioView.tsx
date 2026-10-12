@@ -3,10 +3,10 @@
  * original App.tsx so the screen stays exactly as-is; App.tsx now switches
  * between this and the Production view.
  *
- *   Header: Color Studio | [CAM 1 ▾] | A | B | Before/After | Reset
- *   Left:   large preview, scopes row (waveform | vectorscope | histogram)
- *   Right:  tabs [Basic][Pro][Curves][LUT][Filters]
- *   Bottom: looks strip
+ *   Header: Color Studio | [source ▾] | A | B | Before/Split/After | Reset
+ *   Left:   live preview (= program/stream frame), scopes row
+ *   Right:  tabs [Basic][Creative][Curves][Wheels][LUT][Glow & Skin][Effects][Presets]
+ *   Bottom: filter strip (categories, one active filter, live intensity)
  */
 import { useEffect } from "react";
 import { useStudio, type TabId } from "../lib/store";
@@ -15,18 +15,24 @@ import Header from "./Header";
 import PreviewPane from "./PreviewPane";
 import ScopesRow from "./ScopesRow";
 import BasicTab from "./tabs/BasicTab";
-import ProTab from "./tabs/ProTab";
+import CreativeTab from "./tabs/CreativeTab";
 import CurvesTab from "./tabs/CurvesTab";
+import WheelsTab from "./tabs/WheelsTab";
 import LutTab from "./tabs/LutTab";
+import EffectsTab from "./tabs/EffectsTab";
 import FiltersTab from "./tabs/FiltersTab";
+import PresetsTab from "./tabs/PresetsTab";
 import LooksStrip from "./LooksStrip";
 
 const TABS: { id: TabId; label: string }[] = [
   { id: "basic", label: "Basic" },
-  { id: "pro", label: "Pro" },
+  { id: "creative", label: "Creative" },
   { id: "curves", label: "Curves" },
+  { id: "wheels", label: "Wheels" },
   { id: "lut", label: "LUT" },
-  { id: "filters", label: "Filters" },
+  { id: "effects", label: "Glow & Skin" },
+  { id: "filters", label: "Effects" },
+  { id: "presets", label: "Presets" },
 ];
 
 export default function ColorStudioView() {
@@ -52,8 +58,9 @@ export default function ColorStudioView() {
         if (first?.input_id) await st.setInputId(first.input_id, first.name);
       }
     })();
-    // Preview poll: the backend throttles rendering to ~10 Hz itself.
-    const t = setInterval(() => void pollPreview(), 500);
+    // Live preview at ~10 fps. The backend serves the frame the media tick
+    // already produced (no extra grade); pollPreview never queues requests.
+    const t = setInterval(() => void pollPreview(), 100);
     return () => clearInterval(t);
   }, [init, pollPreview]);
 
@@ -79,10 +86,13 @@ export default function ColorStudioView() {
           </div>
           <div className="tab-panel">
             {activeTab === "basic" && <BasicTab />}
-            {activeTab === "pro" && <ProTab />}
+            {activeTab === "creative" && <CreativeTab />}
             {activeTab === "curves" && <CurvesTab />}
+            {activeTab === "wheels" && <WheelsTab />}
             {activeTab === "lut" && <LutTab />}
+            {activeTab === "effects" && <EffectsTab />}
             {activeTab === "filters" && <FiltersTab />}
+            {activeTab === "presets" && <PresetsTab />}
           </div>
         </div>
       </div>

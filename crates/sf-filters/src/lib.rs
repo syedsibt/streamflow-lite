@@ -50,6 +50,15 @@ pub enum LookCategory {
     /// Corrective grades (exposure/contrast rescue).
     #[serde(rename = "Fix")]
     Fix,
+    /// Skin-first portrait looks (natural, never "beauty filter").
+    #[serde(rename = "Portrait")]
+    Portrait,
+    /// Stylized creative looks (warm/cold/dreamy/fade/glow…).
+    #[serde(rename = "Creative")]
+    Creative,
+    /// Clean, bright, punchy looks for social platforms.
+    #[serde(rename = "Social")]
+    Social,
 }
 
 /// LUT reference inside a look preset (`.sflook`).
@@ -436,6 +445,34 @@ impl FilterStack {
         Ok(())
     }
 
+    /// Replaces a slot's filter in place (same id and position) and sets its
+    /// intensity — used for "one active look": picking another look swaps
+    /// the look slot instead of stacking looks.
+    pub fn replace_filter(&mut self, id: &Uuid, filter: Filter, intensity: f32) -> Result<(), StackError> {
+        match self.slots.iter_mut().find(|s| &s.id == id) {
+            Some(slot) => {
+                slot.filter = filter;
+                slot.intensity = intensity.clamp(0.0, 1.0);
+                Ok(())
+            }
+            None => Err(StackError::SlotNotFound),
+        }
+    }
+
+    /// Updates the parameters of an effect slot (no-op error for looks).
+    pub fn set_effect_params(&mut self, id: &Uuid, params: EffectParams) -> Result<(), StackError> {
+        match self.slots.iter_mut().find(|s| &s.id == id) {
+            Some(FilterSlot {
+                filter: Filter::Effect { params: p, .. },
+                ..
+            }) => {
+                *p = params;
+                Ok(())
+            }
+            _ => Err(StackError::SlotNotFound),
+        }
+    }
+
     /// Sets a slot's intensity, clamped to `0.0..=1.0`.
     pub fn set_intensity(&mut self, id: &Uuid, v: f32) -> Result<(), StackError> {
         match self.slots.iter_mut().find(|s| &s.id == id) {
@@ -500,6 +537,7 @@ impl LookRegistry {
         let mut entries: Vec<_> = std::fs::read_dir(dir)?.collect::<Result<Vec<_>, _>>()?;
         entries.sort_by_key(|e| e.file_name());
         let mut looks = HashMap::new();
+        let mut bad = 0usize;
         for entry in entries {
             let path = entry.path();
             if path.extension().and_then(|e| e.to_str()) != Some("sflook") {
@@ -508,9 +546,25 @@ impl LookRegistry {
             let Some(stem) = path.file_stem().and_then(|s| s.to_str()) else {
                 continue;
             };
-            let text = std::fs::read_to_string(&path)?;
-            let preset: LookPreset = serde_json::from_str(&text)?;
-            looks.insert(stem.to_string(), preset);
+            // One malformed `.sflook` must not hide every other look.
+            let parsed = std::fs::read_to_string(&path)
+                .map_err(|e| e.to_string())
+                .and_then(|t| serde_json::from_str::<LookPreset>(&t).map_err(|e| e.to_string()));
+            match parsed {
+                Ok(preset) => {
+                    looks.insert(stem.to_string(), preset);
+                }
+                Err(e) => {
+                    bad += 1;
+                    eprintln!("look '{}' skipped: {e}", path.display());
+                }
+            }
+        }
+        if looks.is_empty() && bad > 0 {
+            return Err(RegistryError::Io(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("all {bad} look files in {} failed to parse", dir.display()),
+            )));
         }
         Ok(Self { looks })
     }
@@ -589,8 +643,11 @@ pub fn apply_look(preset: &LookPreset, intensity: f32) -> ColorGrade {
         gamma_wheel: blend_wheel_mul(p.gamma_wheel),
         gain: blend_wheel_mul(p.gain),
         offset: blend_wheel_add(p.offset),
+        // Curves scale toward the identity diagonal with intensity, so a
+        // 30 % look really is 30 % of its curve (it used to apply the whole
+        // curve at any non-zero intensity).
         curves: if i > 0.0 {
-            p.curves.clone()
+            p.curves.scaled(i)
         } else {
             CurveSet::default()
         },
@@ -603,6 +660,10 @@ pub fn apply_look(preset: &LookPreset, intensity: f32) -> ColorGrade {
             _ => None,
         },
         skin_protect: preset.skin_protect,
+        faded_film: blend(p.faded_film, d.faded_film),
+        skin_warmth: blend(p.skin_warmth, d.skin_warmth),
+        skin_saturation: blend(p.skin_saturation, d.skin_saturation),
+        skin_brightness: blend(p.skin_brightness, d.skin_brightness),
     }
 }
 
@@ -777,9 +838,23 @@ mod tests {
     }
 
     #[test]
-    fn registry_loads_30_builtin_looks() {
+    fn registry_loads_51_builtin_looks() {
         let registry = LookRegistry::load_dir(&looks_dir()).unwrap();
-        assert_eq!(registry.len(), 30);
+        assert_eq!(registry.len(), 51);
+        // The four main filter families are populated.
+        for (cat, min) in [
+            (LookCategory::Cinematic, 6),
+            (LookCategory::Portrait, 5),
+            (LookCategory::Creative, 7),
+            (LookCategory::Social, 5),
+        ] {
+            let n = registry
+                .ids()
+                .iter()
+                .filter(|id| registry.get(id).unwrap().category == cat)
+                .count();
+            assert!(n >= min, "{cat:?}: {n} looks");
+        }
         assert!(!registry.is_empty());
         // Spot-check a few ids and categories.
         let teal = registry.get("teal-orange").unwrap();
@@ -796,7 +871,7 @@ mod tests {
     #[test]
     fn all_looks_roundtrip_json() {
         let registry = LookRegistry::load_dir(&looks_dir()).unwrap();
-        assert_eq!(registry.len(), 30);
+        assert_eq!(registry.len(), 51);
         for id in registry.ids() {
             let preset = registry.get(&id).unwrap();
             let json = serde_json::to_string(preset).unwrap();
@@ -808,6 +883,31 @@ mod tests {
                 "skin_protect mismatch for {id}"
             );
         }
+    }
+
+    #[test]
+    fn look_intensity_scales_curves_and_new_params() {
+        let registry = LookRegistry::load_dir(&looks_dir()).unwrap();
+        let film = registry.get("film").unwrap();
+        let full = apply_look(film, 1.0);
+        let half = apply_look(film, 0.5);
+        assert!((half.faded_film - full.faded_film * 0.5).abs() < 1e-4);
+        let y_full = full.curves.master.points[0][1];
+        let y_half = half.curves.master.points[0][1];
+        assert!((y_half - y_full * 0.5).abs() < 1e-4, "curve must scale with intensity");
+        let none = apply_look(film, 0.0);
+        assert!(none.is_identity() || none.lut.is_none() && none.curves.is_identity());
+    }
+
+    #[test]
+    fn one_bad_look_file_does_not_hide_the_rest() {
+        let dir = std::env::temp_dir().join(format!("sf-looks-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("good.sflook"), r#"{"name":"Good","version":1,"category":"Social","params":{"contrast":5}}"#).unwrap();
+        std::fs::write(dir.join("bad.sflook"), "{ not json").unwrap();
+        let reg = LookRegistry::load_dir(&dir).unwrap();
+        assert_eq!(reg.len(), 1);
+        assert!(reg.get("good").is_some());
     }
 
     #[test]

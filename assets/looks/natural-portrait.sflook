@@ -1,0 +1,15 @@
+{
+  "name": "Natural Portrait",
+  "version": 1,
+  "category": "Portrait",
+  "params": {
+    "exposure": 0.1,
+    "contrast": 6,
+    "vibrance": 8,
+    "highlights": -8,
+    "shadows": 6,
+    "skin_warmth": 6,
+    "skin_brightness": 6
+  },
+  "skin_protect": true
+}

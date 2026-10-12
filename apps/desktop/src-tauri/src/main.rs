@@ -278,22 +278,91 @@ fn scopes_unsubscribe(state: State<'_, AppState>, input_id: String, kind: String
         .map_err(ue)
 }
 
-/// `preview.get_frame` — PNG data URL, ~10 Hz throttled by the backend.
-/// Production will replace this with a zero-copy path; the command shape stays.
+/// `preview.get_frame` — JPEG data URL of the Color Studio preview. When the
+/// input is on air this is the exact graded frame the media tick sent to the
+/// program/encoder (live tap); `mode` = "after" (default) | "before" | "split".
 #[tauri::command(rename_all = "snake_case")]
 fn preview_get_frame(
     state: State<'_, AppState>,
     input_id: String,
     width: u32,
     height: u32,
+    mode: Option<String>,
 ) -> CmdResult<String> {
-    let png = lock(&state)?
-        .preview_png(&input_id, width, height)
+    let mode = sf_ui_backend::PreviewMode::parse(mode.as_deref());
+    // Under the lock: grab/downscale only. JPEG encode happens after the
+    // lock is released so the media tick is never stalled by the preview.
+    let frame = lock(&state)?
+        .preview_frame(&input_id, width, height, mode)
         .map_err(ue)?;
-    Ok(format!(
-        "data:image/png;base64,{}",
-        base64::Engine::encode(&base64::engine::general_purpose::STANDARD, &png)
-    ))
+    let jpg = sf_ui_backend::encode_preview_jpeg(&frame).map_err(ue)?;
+    Ok(jpg_data_url(&jpg))
+}
+
+/// Removes the active look from a stack.
+#[tauri::command(rename_all = "snake_case")]
+fn look_clear(state: State<'_, AppState>, target: FilterTarget) -> CmdResult<()> {
+    lock(&state)?.look_clear(target).map_err(ue)
+}
+
+/// Live effect parameters (Glow threshold/radius/softness, skin smoothing).
+#[tauri::command(rename_all = "snake_case")]
+fn filter_set_params(
+    state: State<'_, AppState>,
+    target: FilterTarget,
+    slot_id: String,
+    params: sf_filters::EffectParams,
+) -> CmdResult<()> {
+    let slot_id = slot_id
+        .parse::<uuid::Uuid>()
+        .map_err(|_| format!("bad slot id: {slot_id}"))?;
+    lock(&state)?
+        .filter_set_params(target, slot_id, params)
+        .map_err(ue)
+}
+
+/// Imports a `.cube` into the LUT library (validated; clear error otherwise).
+#[tauri::command(rename_all = "snake_case")]
+fn lut_import(state: State<'_, AppState>, path: String) -> CmdResult<sf_ui_backend::LutInfo> {
+    lock(&state)?.lut_import(&path).map_err(ue)
+}
+
+#[tauri::command(rename_all = "snake_case")]
+fn lut_library(state: State<'_, AppState>) -> CmdResult<Vec<sf_ui_backend::LutInfo>> {
+    Ok(lock(&state)?.lut_library())
+}
+
+#[tauri::command(rename_all = "snake_case")]
+fn lut_remove(state: State<'_, AppState>, id: String) -> CmdResult<()> {
+    lock(&state)?.lut_remove(&id).map_err(ue)
+}
+
+#[tauri::command(rename_all = "snake_case")]
+fn color_preset_save(
+    state: State<'_, AppState>,
+    input_id: String,
+    name: String,
+) -> CmdResult<sf_ui_backend::ColorPresetInfo> {
+    lock(&state)?.color_preset_save(&input_id, &name).map_err(ue)
+}
+
+#[tauri::command(rename_all = "snake_case")]
+fn color_preset_list(state: State<'_, AppState>) -> CmdResult<Vec<sf_ui_backend::ColorPresetInfo>> {
+    Ok(lock(&state)?.color_preset_list())
+}
+
+#[tauri::command(rename_all = "snake_case")]
+fn color_preset_apply(
+    state: State<'_, AppState>,
+    input_id: String,
+    id: String,
+) -> CmdResult<sf_color::ColorGrade> {
+    lock(&state)?.color_preset_apply(&input_id, &id).map_err(ue)
+}
+
+#[tauri::command(rename_all = "snake_case")]
+fn color_preset_delete(state: State<'_, AppState>, id: String) -> CmdResult<()> {
+    lock(&state)?.color_preset_delete(&id).map_err(ue)
 }
 
 fn jpg_data_url(jpg: &[u8]) -> String {
@@ -810,6 +879,15 @@ fn main() {
             apply_grade,
             color_set_curve,
             color_load_lut,
+            look_clear,
+            filter_set_params,
+            lut_import,
+            lut_library,
+            lut_remove,
+            color_preset_save,
+            color_preset_list,
+            color_preset_apply,
+            color_preset_delete,
             color_reset,
             color_auto,
             color_match,

@@ -4,9 +4,9 @@
 // mirrors the CPU reference one-to-one in f32. Any change to the chain must be
 // made in both places.
 //
-// The `Grade` struct below must match `sf_color::GradeUniform` (160 bytes)
+// The `Grade` struct below must match `sf_color::GradeUniform` (176 bytes)
 // field for field. Note `_pad1a/_pad1b/_pad1c`: three f32 pads (offsets
-// 148/152/156) — a single vec3f pad would be misaligned.
+// 164/168/172) — a single vec3f pad would be misaligned.
 
 struct Grade {
   exposure_ev: f32, transfer: f32, use_limited_range: f32, brightness: f32, // 0..12
@@ -19,7 +19,9 @@ struct Grade {
   shadows: f32, whites: f32, blacks: f32, basic_gamma: f32,                 // 112..124
   sharpness: f32, lut_intensity: f32, lut_flags: f32,                       // 128..136
   skin_protect: f32, curves_enabled: f32,                                   // 140..144
-  _pad1a: f32, _pad1b: f32, _pad1c: f32,                                    // 148..156
+  faded_film: f32, skin_warmth: f32, skin_saturation: f32,                  // 148..156
+  skin_brightness: f32,                                                     // 160
+  _pad1a: f32, _pad1b: f32, _pad1c: f32,                                    // 164..172
 };
 
 @group(0) @binding(0) var<uniform> grade: Grade;
@@ -31,12 +33,11 @@ struct Grade {
 
 const LUM: vec3f = vec3f(0.2126, 0.7152, 0.0722);
 
-// --- HSV helpers (exact branch structure of sf_color::cpu) ---
+// --- HSV helpers (standard hexcone HSV; twin of sf_color::cpu) ---
 //
-// NOTE: this is NOT standard colorimetric HSV — the red-max branch omits the
-// usual /6, so e.g. yellow maps to hue 0 rather than 1/6. This is deliberate:
-// the CPU reference implements the same branches, and CPU/GPU agreement is
-// the contract. Do not "fix" one side independently.
+// The hue fraction is divided by 6 per sector. (An earlier version omitted
+// the /6, which rotated every non-primary hue through the curves stage —
+// orange turned green, skin turned cyan — whenever a curve was edited.)
 
 fn rgb_to_hsv(c: vec3f) -> vec3f {
   let mx = max(c.r, max(c.g, c.b));
@@ -44,9 +45,9 @@ fn rgb_to_hsv(c: vec3f) -> vec3f {
   let d = mx - mn;
   var h = 0.0;
   if (d > 1e-6) {
-    if (mx == c.r) { h = fract((c.g - c.b) / d + 1.0); }
-    else if (mx == c.g) { h = (c.b - c.r) / d + 1.0 / 3.0; }
-    else { h = (c.r - c.g) / d + 2.0 / 3.0; }
+    if (mx == c.r) { h = (c.g - c.b) / d / 6.0; }
+    else if (mx == c.g) { h = ((c.b - c.r) / d + 2.0) / 6.0; }
+    else { h = ((c.r - c.g) / d + 4.0) / 6.0; }
   }
   let s = select(0.0, d / max(mx, 1e-6), mx > 1e-6);
   return vec3f(fract(h), s, mx);
@@ -95,6 +96,22 @@ fn srgb_eotf(c: vec3f) -> vec3f {
   return select(c / 12.92, pow((c + 0.055) / 1.055, vec3f(2.4)), c > vec3f(0.04045));
 }
 
+// Linear <-> display (gamma 2.4, the MVP transfer), negative-safe. Creative
+// .cube LUTs and the curve editor work on display-referred values.
+fn enc(c: vec3f) -> vec3f { return pow(max(c, vec3f(0.0)), vec3f(1.0 / 2.4)); }
+fn dec(d: vec3f) -> vec3f { return pow(max(d, vec3f(0.0)), vec3f(2.4)); }
+
+// LUT applied on display values and blended there (layer-opacity semantics).
+fn apply_lut(c: vec3f) -> vec3f {
+  let d = enc(c);
+  return dec(mix(d, lut_sample(clamp(d, vec3f(0.0), vec3f(1.0))), grade.lut_intensity));
+}
+
+// Skin-tone mask heuristic (twin of sf_color::cpu::skin_mask).
+fn skin_mask(c: vec3f, l: f32) -> f32 {
+  return smoothstep(0.05, 0.25, c.r - c.g) * smoothstep(0.02, 0.12, c.g - c.b) * smoothstep(0.15, 0.45, l);
+}
+
 @compute @workgroup_size(16, 16, 1)
 fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
   let dims = textureDimensions(src_tex);
@@ -115,7 +132,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
 
   // 2. LUT before the grade.
   if (lut_enabled && lut_before) {
-    c = mix(c, lut_sample(clamp(c, vec3f(0.0), vec3f(1.0))), grade.lut_intensity);
+    c = apply_lut(c);
   }
 
   // 3. Exposure.
@@ -149,9 +166,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
   let l2 = dot(c, LUM);
   var skin_m = 0.0;
   if (grade.skin_protect > 0.5) {
-    skin_m = smoothstep(0.05, 0.25, c.r - c.g)
-           * smoothstep(0.02, 0.12, c.g - c.b)
-           * smoothstep(0.15, 0.45, l2);
+    skin_m = skin_mask(c, l2);
   }
   var sat_eff = grade.saturation;
   if (grade.skin_protect > 0.5 && sat_eff > 1.0) {
@@ -168,23 +183,48 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
   }
   c = mix(vec3f(l3), c, vscale);
 
-  // 10. Curves: per-channel, then master, then luma delta, then hue-vs-sat.
+  // 9b. Skin-only warmth / saturation / brightness (natural ranges).
+  if (grade.skin_warmth != 0.0 || grade.skin_saturation != 0.0 || grade.skin_brightness != 0.0) {
+    let m = skin_mask(c, dot(c, LUM));
+    c.r *= 1.0 + 0.08 * grade.skin_warmth * m;
+    c.b *= 1.0 - 0.08 * grade.skin_warmth * m;
+    let ls2 = dot(c, LUM);
+    c = mix(vec3f(ls2), c, 1.0 + 0.35 * grade.skin_saturation * m);
+    c *= 1.0 + 0.25 * grade.skin_brightness * m;
+  }
+
+  // 10. Curves on display-encoded values: per-channel, master, luma delta,
+  //     hue-vs-sat (baked as a saturation multiplier).
   if (grade.curves_enabled > 0.5) {
-    let r = curve_sample(3u, 0u, curve_sample(0u, 0u, c.r));
-    let g = curve_sample(3u, 0u, curve_sample(1u, 0u, c.g));
-    let b = curve_sample(3u, 0u, curve_sample(2u, 0u, c.b));
+    let d0 = enc(c);
+    let r = curve_sample(3u, 0u, curve_sample(0u, 0u, d0.r));
+    let g = curve_sample(3u, 0u, curve_sample(1u, 0u, d0.g));
+    let b = curve_sample(3u, 0u, curve_sample(2u, 0u, d0.b));
     var cc = vec3f(r, g, b);
     let l4 = dot(cc, LUM);
     let dl = curve_sample(0u, 1u, l4) - l4;
     cc += vec3f(dl);
     let hsv = rgb_to_hsv(cc);
     let s2 = hsv.g * curve_sample(1u, 1u, hsv.r);
-    c = hsv_to_rgb(vec3f(hsv.r, s2, hsv.b));
+    c = dec(hsv_to_rgb(vec3f(hsv.r, s2, hsv.b)));
   }
 
-  // 11. LUT after the grade.
+  // 10b. Faded film (display-encoded): lift + soften blacks, mute shadows.
+  if (grade.faded_film > 0.0) {
+    let k = grade.faded_film;
+    var d = enc(c);
+    let ld = clamp(dot(d, LUM), 0.0, 1.0);
+    let shadow = (1.0 - ld) * (1.0 - ld);
+    d = mix(vec3f(ld), d, 1.0 - 0.35 * k * shadow);
+    let x = clamp(d, vec3f(0.0), vec3f(1.0));
+    let ix = vec3f(1.0) - x;
+    d += 0.6 * k * 0.2 * ix * ix * ix;
+    c = dec(d);
+  }
+
+  // 11. LUT after the grade (display-referred, see apply_lut).
   if (lut_enabled && !lut_before) {
-    c = mix(c, lut_sample(clamp(c, vec3f(0.0), vec3f(1.0))), grade.lut_intensity);
+    c = apply_lut(c);
   }
 
   // Output is linear; the encode pass handles output transfer + clamp.

@@ -51,7 +51,28 @@ export interface ColorGrade {
   curves: CurveSet;
   lut: LutRef | null;
   skin_protect: boolean;
+  faded_film: number; // 0..100
+  skin_warmth: number; // -100..100 (skin only)
+  skin_saturation: number; // -100..100 (skin only)
+  skin_brightness: number; // -100..100 (skin only)
 }
+
+/** A LUT in the user's library (imported .cube, copied into app data). */
+export interface LutInfo {
+  id: string;
+  name: string;
+  path: string;
+  warnings: string[];
+}
+
+/** A saved color preset (grade + filter stack). */
+export interface ColorPresetInfo {
+  id: string;
+  name: string;
+}
+
+/** Color Studio preview comparison mode (preview only — never the stream). */
+export type PreviewMode = "after" | "before" | "split";
 
 export const CURVE_NAMES = [
   "master",
@@ -103,6 +124,28 @@ export interface SlotView {
   intensity: number; // 0..1
   cost: GpuCost;
   is_ai: boolean;
+  /** Current effect parameters (effects only). */
+  params?: EffectParams | null;
+  /** Look preset id (look slots only). */
+  look_id?: string | null;
+}
+
+/** sf_filters::EffectParams — sent whole by `filter_set_params`. */
+export interface EffectParams {
+  amount: number;
+  radius: number;
+  softness: number;
+  center: [number, number];
+  color: [number, number, number];
+  threshold: number;
+  zoom: number;
+  aspect: number;
+  k1: number;
+  k2: number;
+  axis: string;
+  spill: number;
+  tolerance: number;
+  key_softness: number;
 }
 
 export interface EffectKindInfo {
@@ -194,26 +237,63 @@ export interface ParamDef {
   min: number;
   max: number;
   step: number;
+  /** Value the reset button returns to. */
+  neutral?: number;
   format: (v: number) => string;
 }
 
-const f1 = (v: number) => v.toFixed(1);
+
 const f0 = (v: number) => v.toFixed(0);
 
-export const BASIC_PARAMS: ParamDef[] = [
-  { param: "exposure", label: "Exposure", min: -3, max: 3, step: 0.1, format: (v) => `${v >= 0 ? "+" : ""}${f1(v)}` },
-  { param: "brightness", label: "Brightness", min: -100, max: 100, step: 1, format: (v) => `${v >= 0 ? "+" : ""}${f0(v)}` },
-  { param: "contrast", label: "Contrast", min: -100, max: 100, step: 1, format: (v) => `${v >= 0 ? "+" : ""}${f0(v)}` },
-  { param: "saturation", label: "Saturation", min: 0, max: 200, step: 1, format: (v) => `${f0(v)}%` },
-  { param: "vibrance", label: "Vibrance", min: -100, max: 100, step: 1, format: (v) => `${v >= 0 ? "+" : ""}${f0(v)}` },
-  { param: "temperature", label: "Temp", min: 2500, max: 10000, step: 50, format: (v) => `${f0(v)}K` },
-  { param: "tint", label: "Tint", min: -100, max: 100, step: 1, format: (v) => `${v >= 0 ? "+" : ""}${f0(v)}` },
-  { param: "highlights", label: "Highlights", min: -100, max: 100, step: 1, format: (v) => `${v >= 0 ? "+" : ""}${f0(v)}` },
-  { param: "shadows", label: "Shadows", min: -100, max: 100, step: 1, format: (v) => `${v >= 0 ? "+" : ""}${f0(v)}` },
-  { param: "whites", label: "Whites", min: -100, max: 100, step: 1, format: (v) => `${v >= 0 ? "+" : ""}${f0(v)}` },
-  { param: "blacks", label: "Blacks", min: -100, max: 100, step: 1, format: (v) => `${v >= 0 ? "+" : ""}${f0(v)}` },
-  { param: "gamma", label: "Gamma", min: 0.5, max: 2.5, step: 0.05, format: f1 },
-  { param: "sharpness", label: "Sharpness", min: 0, max: 100, step: 1, format: f0 },
+const signed0 = (v: number) => `${v >= 0 ? "+" : ""}${f0(v)}`;
+
+/** Basic correction, in grading order: white balance → tone → color. */
+export const BASIC_GROUPS: { title: string; params: ParamDef[] }[] = [
+  {
+    title: "White balance",
+    params: [
+      { param: "temperature", label: "Temperature", min: 2500, max: 10000, step: 50, neutral: 6500, format: (v) => `${f0(v)} K` },
+      { param: "tint", label: "Tint", min: -100, max: 100, step: 1, neutral: 0, format: signed0 },
+    ],
+  },
+  {
+    title: "Tone",
+    params: [
+      { param: "exposure", label: "Exposure", min: -3, max: 3, step: 0.05, neutral: 0, format: (v) => `${v >= 0 ? "+" : ""}${v.toFixed(2)} EV` },
+      { param: "brightness", label: "Brightness", min: -100, max: 100, step: 1, neutral: 0, format: signed0 },
+      { param: "contrast", label: "Contrast", min: -100, max: 100, step: 1, neutral: 0, format: signed0 },
+      { param: "highlights", label: "Highlights", min: -100, max: 100, step: 1, neutral: 0, format: signed0 },
+      { param: "shadows", label: "Shadows", min: -100, max: 100, step: 1, neutral: 0, format: signed0 },
+      { param: "whites", label: "Whites", min: -100, max: 100, step: 1, neutral: 0, format: signed0 },
+      { param: "blacks", label: "Blacks", min: -100, max: 100, step: 1, neutral: 0, format: signed0 },
+    ],
+  },
+  {
+    title: "Color",
+    params: [
+      { param: "saturation", label: "Saturation", min: 0, max: 200, step: 1, neutral: 100, format: (v) => `${f0(v)}%` },
+      { param: "vibrance", label: "Vibrance", min: -100, max: 100, step: 1, neutral: 0, format: signed0 },
+    ],
+  },
+];
+
+/** Flat list (kept for callers that iterate every basic control). */
+export const BASIC_PARAMS: ParamDef[] = BASIC_GROUPS.flatMap((g) => g.params);
+
+/** Creative section (Lumetri-style). Look + intensity live in the looks strip. */
+export const CREATIVE_PARAMS: ParamDef[] = [
+  { param: "faded_film", label: "Faded Film", min: 0, max: 100, step: 1, neutral: 0, format: f0 },
+  { param: "sharpness", label: "Sharpen", min: 0, max: 100, step: 1, neutral: 0, format: f0 },
+  { param: "vibrance", label: "Vibrance", min: -100, max: 100, step: 1, neutral: 0, format: signed0 },
+  { param: "saturation", label: "Saturation", min: 0, max: 200, step: 1, neutral: 100, format: (v) => `${f0(v)}%` },
+  { param: "gamma", label: "Gamma", min: 0.5, max: 2.5, step: 0.01, neutral: 1, format: (v) => v.toFixed(2) },
+];
+
+/** Skin / portrait (applied through the skin mask only — natural ranges). */
+export const SKIN_PARAMS: ParamDef[] = [
+  { param: "skin_warmth", label: "Skin warmth", min: -100, max: 100, step: 1, neutral: 0, format: signed0 },
+  { param: "skin_saturation", label: "Skin saturation", min: -100, max: 100, step: 1, neutral: 0, format: signed0 },
+  { param: "skin_brightness", label: "Skin brightness", min: -100, max: 100, step: 1, neutral: 0, format: signed0 },
 ];
 
 /** Wheel definitions for the Pro tab: puck (hue/sat) + luma slider each. */

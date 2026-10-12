@@ -1,0 +1,50 @@
+{
+  "name": "Cinematic",
+  "version": 1,
+  "category": "Cinematic",
+  "params": {
+    "contrast": 18,
+    "saturation": 92,
+    "temperature": 6700,
+    "tint": -4,
+    "highlights": -15,
+    "shadows": 5,
+    "blacks": -8,
+    "faded_film": 8,
+    "lift": [
+      0,
+      0.004,
+      0.012,
+      0
+    ],
+    "gain": [
+      1.03,
+      1.0,
+      0.97,
+      1.0
+    ],
+    "curves": {
+      "master": {
+        "points": [
+          [
+            0,
+            0
+          ],
+          [
+            0.25,
+            0.22
+          ],
+          [
+            0.75,
+            0.79
+          ],
+          [
+            1,
+            1
+          ]
+        ]
+      }
+    }
+  },
+  "skin_protect": true
+}

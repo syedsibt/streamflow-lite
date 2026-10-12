@@ -44,20 +44,20 @@ fn fract(x: f32) -> f32 {
     x - x.floor()
 }
 
-/// RGB (0..1) -> HSV, with hue in 0..1.
+/// RGB (0..1) -> HSV, with hue in 0..1 (standard hexcone HSV).
 ///
-/// NOTE: the hue encoding follows the shared pseudocode exactly and is *not*
-/// standard colorimetric HSV — the red-max branch omits the usual `/6`, so
-/// e.g. yellow maps to hue 0 rather than 1/6. The WGSL shader implements the
-/// same branches, so CPU and GPU agree; do not "fix" one side independently.
+/// Earlier versions omitted the `/6` on the in-sector hue fraction. That
+/// only agreed with standard HSV on the primaries (which is all the old
+/// test checked) — for every other color the HSV round-trip in the curves
+/// stage rotated hues, e.g. an orange jacket turned green and skin turned
+/// cyan as soon as any curve was edited. Mirrors the WGSL `rgb_to_hsv`.
 ///
-/// Branch structure (mirrors the WGSL):
 /// ```text
 /// mx = max(r,g,b); mn = min(r,g,b); d = mx - mn; h = 0
 /// if d > 1e-6:
-///     if mx == r: h = fract((g - b) / d + 1.0)
-///     elif mx == g: h = (b - r) / d + 1/3
-///     else: h = (r - g) / d + 2/3
+///     if mx == r: h = (g - b) / d / 6
+///     elif mx == g: h = ((b - r) / d + 2) / 6
+///     else: h = ((r - g) / d + 4) / 6
 /// s = mx > 1e-6 ? d / mx : 0
 /// return (fract(h), s, mx)
 /// ```
@@ -69,11 +69,11 @@ pub fn rgb_to_hsv(rgb: [f32; 3]) -> [f32; 3] {
     let mut h = 0.0;
     if d > 1e-6 {
         if mx == r {
-            h = fract((g - b) / d + 1.0);
+            h = (g - b) / d / 6.0;
         } else if mx == g {
-            h = (b - r) / d + 1.0 / 3.0;
+            h = ((b - r) / d + 2.0) / 6.0;
         } else {
-            h = (r - g) / d + 2.0 / 3.0;
+            h = ((r - g) / d + 4.0) / 6.0;
         }
     }
     let s = if mx > 1e-6 { d / mx } else { 0.0 };
@@ -112,8 +112,8 @@ pub fn hsv_to_rgb(hsv: [f32; 3]) -> [f32; 3] {
 /// ```text
 ///  0. identity bypass -> return pixel unchanged
 ///  1. c = clamp(pixel, 0, 1); c = pow(c, 2.4)              // linearize
-///  2. if LUT enabled and position == Before:
-///         c = mix(c, trilinear(lut, clamp(c,0,1)), intensity)
+///  2. if LUT enabled and position == Before (display-referred, see 11):
+///         d = enc(c); c = dec(mix(d, trilinear(lut, clamp(d,0,1)), intensity))
 ///  3. c *= 2^exposure
 ///  4. c *= wb_gain                                        // temperature+tint
 ///  5. c += lift.rgb + lift.master
@@ -125,13 +125,41 @@ pub fn hsv_to_rgb(hsv: [f32; 3]) -> [f32; 3] {
 ///  7. c = pow(max(c,0), gamma)                             // basic gamma
 ///  8. saturation around luma l2, with skin-tone protection mask m
 ///  9. vibrance scaled by (1 - chroma), skin-limited when boosted
-/// 10. curves (if any non-identity): per-channel, master, luma delta,
-///     hue-vs-sat in HSV
-/// 11. if LUT enabled and position == After:
-///         c = mix(c, trilinear(lut, clamp(c,0,1)), intensity)
+///  9b. skin-only warmth / saturation / brightness through the skin mask
+/// 10. curves (if any non-identity), on display-encoded values d = enc(c)
+///     (so a curve point at 0.5 means mid-grey, as on screen): per-channel,
+///     master, luma delta, hue-vs-sat in HSV; then c = dec(d)
+/// 10b. faded film (display-encoded): black lift + shadow desaturation
+/// 11. if LUT enabled and position == After — creative `.cube` LUTs expect
+///     display-referred input, so the LUT is sampled on enc(c) and blended
+///     there: d = enc(c); c = dec(mix(d, trilinear(lut, clamp(d,0,1)), i))
 /// 12. sharpness: SKIPPED (spatial op, GPU-only)
 /// 13. c = pow(max(c,0), 1/2.4); c = clamp(c, 0, 1)         // output encode
 /// ```
+/// Skin-tone mask heuristic (shared with the shader): reddish-orange hue,
+/// mid luminance.
+fn skin_mask(c: [f32; 3], l: f32) -> f32 {
+    smoothstep(0.05, 0.25, c[0] - c[1]) * smoothstep(0.02, 0.12, c[1] - c[2]) * smoothstep(0.15, 0.45, l)
+}
+
+/// Linear -> display (gamma 2.4, the MVP transfer), negative-safe.
+fn enc3(c: [f32; 3]) -> [f32; 3] {
+    [
+        c[0].max(0.0).powf(1.0 / 2.4),
+        c[1].max(0.0).powf(1.0 / 2.4),
+        c[2].max(0.0).powf(1.0 / 2.4),
+    ]
+}
+
+/// Display -> linear (gamma 2.4), negative-safe.
+fn dec3(d: [f32; 3]) -> [f32; 3] {
+    [
+        d[0].max(0.0).powf(2.4),
+        d[1].max(0.0).powf(2.4),
+        d[2].max(0.0).powf(2.4),
+    ]
+}
+
 pub fn apply_grade_cpu(
     grade: &ColorGrade,
     baked: &BakedCurves,
@@ -156,17 +184,18 @@ pub fn apply_grade_cpu(
         .map_or(false, |l| l.position == LutPosition::Before);
     let apply_lut = |c: [f32; 3]| -> [f32; 3] {
         let lf = lut.expect("lut_active implies lut.is_some()");
+        let d = enc3(c);
         let clamped = [
-            c[0].clamp(0.0, 1.0),
-            c[1].clamp(0.0, 1.0),
-            c[2].clamp(0.0, 1.0),
+            d[0].clamp(0.0, 1.0),
+            d[1].clamp(0.0, 1.0),
+            d[2].clamp(0.0, 1.0),
         ];
         let s = trilinear_sample(&lf.data, lf.size, clamped);
-        [
-            mixf(c[0], s[0], lut_intensity),
-            mixf(c[1], s[1], lut_intensity),
-            mixf(c[2], s[2], lut_intensity),
-        ]
+        dec3([
+            mixf(d[0], s[0], lut_intensity),
+            mixf(d[1], s[1], lut_intensity),
+            mixf(d[2], s[2], lut_intensity),
+        ])
     };
 
     // 1. Clamp + linearize (MVP: gamma 2.4 only; range fix skipped).
@@ -232,9 +261,7 @@ pub fn apply_grade_cpu(
     // 8. Saturation around luma, with skin-tone protection.
     let l2 = dot3(c, LUM);
     let skin_m = if grade.skin_protect {
-        smoothstep(0.05, 0.25, c[0] - c[1])
-            * smoothstep(0.02, 0.12, c[1] - c[2])
-            * smoothstep(0.15, 0.45, l2)
+        skin_mask(c, l2)
     } else {
         0.0
     };
@@ -257,18 +284,54 @@ pub fn apply_grade_cpu(
         c[i] = mixf(l3, c[i], vscale);
     }
 
-    // 10. Curves: per-channel, then master, then luma delta, then hue-vs-sat.
+    // 9b. Skin-only adjustments (natural ranges: ±8 % warmth, ±35 %
+    //     saturation, ±25 % brightness at the slider ends).
+    if u.skin_warmth != 0.0 || u.skin_saturation != 0.0 || u.skin_brightness != 0.0 {
+        let ls = dot3(c, LUM);
+        let m = skin_mask(c, ls);
+        c[0] *= 1.0 + 0.08 * u.skin_warmth * m;
+        c[2] *= 1.0 - 0.08 * u.skin_warmth * m;
+        let ls2 = dot3(c, LUM);
+        let sk = 1.0 + 0.35 * u.skin_saturation * m;
+        for i in 0..3 {
+            c[i] = mixf(ls2, c[i], sk);
+        }
+        let bk = 1.0 + 0.25 * u.skin_brightness * m;
+        for i in 0..3 {
+            c[i] *= bk;
+        }
+    }
+
+    // 10. Curves on display-encoded values: per-channel, master, luma
+    //     delta, hue-vs-sat.
     if !grade.curves.is_identity() {
-        let r = baked.sample(0, 3, baked.sample(0, 0, c[0]));
-        let g = baked.sample(0, 3, baked.sample(0, 1, c[1]));
-        let b = baked.sample(0, 3, baked.sample(0, 2, c[2]));
-        c = [r, g, b];
-        let l4 = dot3(c, LUM);
+        let d = enc3(c);
+        let r = baked.sample(0, 3, baked.sample(0, 0, d[0]));
+        let g = baked.sample(0, 3, baked.sample(0, 1, d[1]));
+        let b = baked.sample(0, 3, baked.sample(0, 2, d[2]));
+        let mut d = [r, g, b];
+        let l4 = dot3(d, LUM);
         let dl = baked.sample(1, 0, l4) - l4;
-        c = [c[0] + dl, c[1] + dl, c[2] + dl];
-        let hsv = rgb_to_hsv(c);
+        d = [d[0] + dl, d[1] + dl, d[2] + dl];
+        let hsv = rgb_to_hsv(d);
         let s2 = hsv[1] * baked.sample(1, 1, hsv[0]);
-        c = hsv_to_rgb([hsv[0], s2, hsv[2]]);
+        c = dec3(hsv_to_rgb([hsv[0], s2, hsv[2]]));
+    }
+
+    // 10b. Faded film (display-encoded): lift + soften blacks, mute
+    //      shadow color.
+    if u.faded_film > 0.0 {
+        let k = u.faded_film;
+        let mut d = enc3(c);
+        let ld = dot3(d, LUM).clamp(0.0, 1.0);
+        let shadow = (1.0 - ld) * (1.0 - ld);
+        let desat = 1.0 - 0.35 * k * shadow;
+        for i in 0..3 {
+            d[i] = mixf(ld, d[i], desat);
+            let x = d[i].clamp(0.0, 1.0);
+            d[i] += 0.6 * k * 0.2 * (1.0 - x) * (1.0 - x) * (1.0 - x);
+        }
+        c = dec3(d);
     }
 
     // 11. LUT after the grade.
@@ -382,31 +445,34 @@ mod tests {
 
     #[test]
     fn hsv_known_values_match_spec_branches() {
-        // Exact branch structure from the shared pseudocode (hue is NOT
-        // divided by 6 in the red-max branch — this is intentional and the
-        // WGSL shader implements the same branches, so both sides agree).
         assert_eq!(rgb_to_hsv([1.0, 0.0, 0.0]), [0.0, 1.0, 1.0]);
+        let y = rgb_to_hsv([1.0, 1.0, 0.0]);
+        assert!((y[0] - 1.0 / 6.0).abs() < 1e-6, "yellow hue {y:?}");
         let g = rgb_to_hsv([0.0, 1.0, 0.0]);
         assert!((g[0] - 1.0 / 3.0).abs() < 1e-6 && g[1] == 1.0 && g[2] == 1.0);
         let b = rgb_to_hsv([0.0, 0.0, 1.0]);
         assert!((b[0] - 2.0 / 3.0).abs() < 1e-6 && b[1] == 1.0 && b[2] == 1.0);
+        let m = rgb_to_hsv([1.0, 0.0, 1.0]);
+        assert!((m[0] - 5.0 / 6.0).abs() < 1e-6, "magenta hue {m:?}");
         assert_eq!(rgb_to_hsv([0.5, 0.5, 0.5]), [0.0, 0.0, 0.5]);
         assert_eq!(rgb_to_hsv([0.0, 0.0, 0.0]), [0.0, 0.0, 0.0]);
-
         assert_eq!(hsv_to_rgb([0.0, 1.0, 1.0]), [1.0, 0.0, 0.0]);
-        let g = hsv_to_rgb([1.0 / 3.0, 1.0, 1.0]);
-        for i in 0..3 {
-            assert!((g[i] - [0.0, 1.0, 0.0][i]).abs() < 1e-6, "{g:?}");
-        }
-        let b = hsv_to_rgb([2.0 / 3.0, 1.0, 1.0]);
-        for i in 0..3 {
-            assert!((b[i] - [0.0, 0.0, 1.0][i]).abs() < 1e-6, "{b:?}");
-        }
-        // Achromatic colors round-trip exactly through both functions.
-        for v in [0.0, 0.25, 0.9] {
-            let back = hsv_to_rgb(rgb_to_hsv([v, v, v]));
+    }
+
+    #[test]
+    fn hsv_roundtrip_preserves_any_color() {
+        // Regression: orange / skin / teal must survive RGB -> HSV -> RGB.
+        for c in [
+            [0.9, 0.4, 0.1],
+            [0.85, 0.62, 0.5],
+            [0.1, 0.6, 0.55],
+            [0.3, 0.2, 0.8],
+            [0.7, 0.7, 0.2],
+            [0.95, 0.1, 0.5],
+        ] {
+            let back = hsv_to_rgb(rgb_to_hsv(c));
             for i in 0..3 {
-                assert!((back[i] - v).abs() < 1e-6, "{back:?}");
+                assert!((back[i] - c[i]).abs() < 1e-5, "{c:?} -> {back:?}");
             }
         }
     }
@@ -430,6 +496,99 @@ mod tests {
         };
         for v in graded(&grade, [0.9, 0.1, 0.4]) {
             assert!(v.is_finite() && (0.0..=1.0).contains(&v), "{v}");
+        }
+    }
+
+    #[test]
+    fn lut_is_sampled_on_display_values() {
+        // A 1D LUT that maps display 0.5 -> 0.5 and is identity: a mid-grey
+        // pixel must come back unchanged. Sampling on linear values (the old
+        // bug) would read the LUT at 0.5^2.4 ≈ 0.19 — fine for identity, so
+        // use a LUT that is identity below 0.4 and white above: mid-grey
+        // (display 0.5) must turn white.
+        let mut text = String::from("LUT_1D_SIZE 11\n");
+        for i in 0..11 {
+            let v = i as f32 / 10.0;
+            let o = if v < 0.45 { v } else { 1.0 };
+            text.push_str(&format!("{o} {o} {o}\n"));
+        }
+        let cube = crate::lut::parse_cube(&text).unwrap();
+        let mut g = ColorGrade::default();
+        g.lut = Some(crate::grade::LutRef {
+            file: "x.cube".into(),
+            intensity: 1.0,
+            position: LutPosition::After,
+        });
+        let out = apply_grade_cpu(&g, &g.curves.bake(), Some(&cube), [0.5, 0.5, 0.5]);
+        assert!(out[0] > 0.95, "LUT must see display value 0.5, got {out:?}");
+    }
+
+    #[test]
+    fn lut_intensity_blends_proportionally() {
+        let mut text = String::from("LUT_1D_SIZE 2\n");
+        text.push_str("1 1 1\n0 0 0\n"); // invert
+        let cube = crate::lut::parse_cube(&text).unwrap();
+        let mut g = ColorGrade::default();
+        let mut run = |i: f32| {
+            g.lut = Some(crate::grade::LutRef {
+                file: "inv.cube".into(),
+                intensity: i,
+                position: LutPosition::After,
+            });
+            apply_grade_cpu(&g, &g.curves.bake(), Some(&cube), [0.2, 0.2, 0.2])[0]
+        };
+        assert!((run(0.0) - 0.2).abs() < 1e-4);
+        assert!((run(1.0) - 0.8).abs() < 1e-3);
+        assert!((run(0.5) - 0.5).abs() < 1e-3);
+    }
+
+    #[test]
+    fn curve_midpoint_means_display_mid_grey() {
+        // Pull the master curve's 0.5 point to 0.6: display mid-grey must
+        // land at ~0.6 on screen.
+        let mut g = ColorGrade::default();
+        g.curves.master.set_points(vec![[0.0, 0.0], [0.5, 0.6], [1.0, 1.0]]).unwrap();
+        let out = apply_grade_cpu(&g, &g.curves.bake(), None, [0.5, 0.5, 0.5]);
+        assert!((out[0] - 0.6).abs() < 0.01, "{out:?}");
+    }
+
+    #[test]
+    fn editing_rgb_curve_does_not_desaturate() {
+        // Regression: the default hue-vs-sat curve used to multiply
+        // saturation by hue as soon as any curve was edited.
+        let mut g = ColorGrade::default();
+        g.curves.r.set_points(vec![[0.0, 0.0], [0.5, 0.5], [1.0, 1.0]]).unwrap();
+        g.curves.r.points.push([0.75, 0.75]);
+        g.curves.r.points.sort_by(|a, b| a[0].partial_cmp(&b[0]).unwrap());
+        let red = [0.8, 0.1, 0.1];
+        let out = apply_grade_cpu(&g, &g.curves.bake(), None, red);
+        for c in 0..3 {
+            assert!((out[c] - red[c]).abs() < 0.02, "{out:?}");
+        }
+    }
+
+    #[test]
+    fn faded_film_lifts_blacks_keeps_whites() {
+        let mut g = ColorGrade::default();
+        g.faded_film = 100.0;
+        let black = apply_grade_cpu(&g, &g.curves.bake(), None, [0.0, 0.0, 0.0]);
+        let white = apply_grade_cpu(&g, &g.curves.bake(), None, [1.0, 1.0, 1.0]);
+        assert!(black[0] > 0.08 && black[0] < 0.16, "{black:?}");
+        assert!(white[0] > 0.99, "{white:?}");
+    }
+
+    #[test]
+    fn skin_controls_touch_skin_only() {
+        let mut g = ColorGrade::default();
+        g.skin_warmth = 100.0;
+        g.skin_brightness = 50.0;
+        let skin = [0.85, 0.62, 0.50];
+        let sky = [0.35, 0.55, 0.85];
+        let s_out = apply_grade_cpu(&g, &g.curves.bake(), None, skin);
+        let k_out = apply_grade_cpu(&g, &g.curves.bake(), None, sky);
+        assert!(s_out[0] > skin[0] && s_out[2] < skin[2] + 0.01, "skin {s_out:?}");
+        for c in 0..3 {
+            assert!((k_out[c] - sky[c]).abs() < 1e-3, "sky changed {k_out:?}");
         }
     }
 }

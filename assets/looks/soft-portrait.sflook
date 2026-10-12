@@ -1,0 +1,16 @@
+{
+  "name": "Soft Portrait",
+  "version": 1,
+  "category": "Portrait",
+  "params": {
+    "contrast": -12,
+    "highlights": -15,
+    "shadows": 12,
+    "saturation": 94,
+    "temperature": 6800,
+    "faded_film": 10,
+    "skin_brightness": 10,
+    "skin_saturation": -6
+  },
+  "skin_protect": true
+}
