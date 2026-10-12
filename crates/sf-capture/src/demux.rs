@@ -44,6 +44,11 @@ pub(crate) struct RawAudio {
     pub pts_us: i64,
 }
 
+// SAFETY: `DemuxDecoder` wraps FFmpeg contexts (raw pointers) which have
+// no thread affinity. It is only ever accessed from a single thread at a
+// time — the capture thread that owns it after being moved there.
+unsafe impl Send for DemuxDecoder {}
+
 pub(crate) struct DemuxDecoder {
     ictx: ff::format::context::Input,
     video_stream: usize,

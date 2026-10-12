@@ -220,39 +220,40 @@ fn parse_dshow_devices(buf: &str, kind_tag: &str) -> Vec<String> {
 ///
 /// A live source: [`next_frame`](FrameProducer::next_frame) returns
 /// `Ok(None)` when no frame is ready yet and never reports end-of-stream.
-// SAFETY: FFmpeg contexts have no thread affinity; the backend serializes
-// all producer access through the shell `Mutex`.
+///
+/// # Capture thread (OBS parity)
+///
+/// A dedicated thread owns the dshow demuxer and drains it as fast as the
+/// device delivers, keeping only the **latest** decoded frame in a shared
+/// slot. [`next_frame`](FrameProducer::next_frame) just takes the latest —
+/// it never touches the device, never blocks, and never slows down when
+/// the render tick jitters. This decouples capture from rendering: even if
+/// the tick stalls, the device queue cannot grow into minutes of lag.
+// SAFETY: FFmpeg contexts have no thread affinity; the demuxer is owned by
+// the capture thread after being moved there, and all other fields are
+// `Send`. The backend additionally serializes producer access through the
+// shell `Mutex`.
 unsafe impl Send for DshowProducer {}
 
 pub struct DshowProducer {
-    demux: DemuxDecoder,
+    /// Latest decoded frame from the capture thread (`None` until the
+    /// first frame arrives). `next_frame` takes it (leaving `None`) so a
+    /// slow tick can never see the same frame twice.
+    latest: Arc<Mutex<Option<CapturedFrame>>>,
+    /// Set on drop; the capture thread exits its loop when it sees this.
+    stop: Arc<std::sync::atomic::AtomicBool>,
     info: StreamInfo,
-    deadline: Arc<ReadDeadline>,
     /// Human-readable description of what the camera actually negotiated
     /// (codec, resolution, fps) — e.g. `"mjpeg 1920×1080@60fps"`.
     /// Shown in diagnostics so users see what the camera gave, not just
     /// what was requested.
     negotiated_format: String,
-    /// Minimum microseconds between delivered frames (decimation): the
-    /// camera may run faster than our tick (e.g. 1080p60 in, 30fps tick).
-    /// Stale frames are consumed-and-dropped so the dshow packet queue can
-    /// never grow — a growing queue shows up as ever-increasing lag.
-    min_frame_interval_us: u64,
-    /// Timestamp of the last delivered frame (for decimation).
-    last_delivered_us: u64,
-    /// Source timestamp (`pts_us`) of the last delivered frame. OBS's
-    /// `ready_async_frame` applies a 2ms hysteresis against the source
-    /// clock so (near-)duplicate source instants are never emitted twice
-    /// (frame-boundary judder); the consumer repeats the last frame.
-    last_delivered_pts_us: Option<i64>,
 }
 
-/// Max time to wait for a frame from a dshow device before giving up
-/// on that tick (10ms). The media tick runs every 33.3ms and must never
-/// wait on a live source — a longer timeout shows up directly as capture
-/// latency. When no frame is ready the consumer repeats the last
-/// frame (latest-frame-wins) and the next tick tries again.
-const READ_TIMEOUT_US: u64 = 10_000;
+/// Per-iteration read deadline for the dedicated capture thread (250ms).
+/// The capture thread has nothing else to do, so it may block waiting for
+/// the next frame; this just keeps a wedged driver from hanging it forever.
+const CAPTURE_READ_TIMEOUT_US: u64 = 250_000;
 
 /// Max time to wait for a dshow device to open (15 seconds per attempt).
 const OPEN_TIMEOUT_US: u64 = 15_000_000;
@@ -289,12 +290,6 @@ impl DshowProducer {
         fps: u32,
     ) -> Result<Self, CaptureError> {
         ensure_init();
-        // Decimate the camera to the requested fps: if the device delivers
-        // faster (e.g. 1080p60 negotiated while we tick at 30fps), stale
-        // frames are dropped instead of queueing up as lag. The gate is set
-        // to 90% of the nominal interval so normal tick jitter (±ms) never
-        // causes a false skip (which would halve the fps).
-        let min_frame_interval_us = 1_000_000 * 9 / (fps.max(1) as u64 * 10);
         // Try strict format first, then progressively looser.
         // Each entry is (label, dshow options). The label is recorded in
         // `negotiated_format` for diagnostics.
@@ -333,7 +328,7 @@ impl DshowProducer {
         ];
         let mut last_err = String::new();
         for (label, opts) in &attempts {
-            match Self::open_with_opts(device, audio_device, label, opts, min_frame_interval_us) {
+            match Self::open_with_opts(device, audio_device, label, opts) {
                 Ok(p) => return Ok(p),
                 Err(e) => last_err = e,
             }
@@ -348,7 +343,6 @@ impl DshowProducer {
         audio_device: Option<&str>,
         label: &str,
         opts: &[(String, String)],
-        min_frame_interval_us: u64,
     ) -> Result<Self, String> {
         let fmt_name = CString::new("dshow").unwrap();
         let fmt = unsafe { ff::ffi::av_find_input_format(fmt_name.as_ptr()) };
@@ -462,15 +456,64 @@ impl DshowProducer {
         );
         // Keep the attempt label for diagnostics (which request succeeded).
         negotiated_format.push_str(&format!(" [via {label}]"));
+        // Spawn the dedicated capture thread (see struct docs): it owns
+        // the demuxer and keeps the shared `latest` slot fresh. The tick
+        // never touches the device. Detached — the thread exits when
+        // `stop` is set (see `Drop`); we keep no handle because joining a
+        // wedged driver thread could hang.
+        let latest = Arc::new(Mutex::new(None));
+        let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let latest_thread = latest.clone();
+        let stop_thread = stop.clone();
+        // The capture thread arms a generous per-iteration deadline: it
+        // has nothing else to do, so it may wait for the next frame.
+        // 250ms keeps CPU idle when the device stalls without letting a
+        // wedged driver hang the thread forever.
+        std::thread::spawn(move || {
+            Self::capture_loop(demux, deadline, latest_thread, stop_thread);
+        });
         Ok(Self {
-            demux,
+            latest,
+            stop,
             info,
-            deadline,
             negotiated_format,
-            min_frame_interval_us,
-            last_delivered_us: 0,
-            last_delivered_pts_us: None,
         })
+    }
+
+    /// The capture thread body: drain the device as fast as it delivers,
+    /// decode only the newest frame, and publish it to the shared slot.
+    /// Exits when `stop` is set.
+    fn capture_loop(
+        mut demux: DemuxDecoder,
+        deadline: Arc<ReadDeadline>,
+        latest: Arc<Mutex<Option<CapturedFrame>>>,
+        stop: Arc<std::sync::atomic::AtomicBool>,
+    ) {
+        use std::sync::atomic::Ordering;
+        while !stop.load(Ordering::Relaxed) {
+            // Arm the interrupt deadline for this iteration: the thread
+            // may block in `av_read_frame` waiting for the next packet.
+            deadline
+                .deadline_us
+                .store(now_us() + CAPTURE_READ_TIMEOUT_US, Ordering::Relaxed);
+            match demux.next_video_newest() {
+                Ok(Some(frame)) => {
+                    // Latest-frame-wins: overwrite whatever was there.
+                    if let Ok(mut slot) = latest.lock() {
+                        *slot = Some(frame);
+                    }
+                }
+                Ok(None) => {
+                    // No frame before the deadline (device stalled or
+                    // between frames) — brief sleep, then try again.
+                    std::thread::sleep(std::time::Duration::from_millis(1));
+                }
+                Err(_) => {
+                    // Transient decode/read error — don't spin hot.
+                    std::thread::sleep(std::time::Duration::from_millis(10));
+                }
+            }
+        }
     }
 
     /// Human-readable description of what the camera actually negotiated,
@@ -489,68 +532,40 @@ impl DshowProducer {
         Self::open(&first, width, height, fps)
     }
 
-    /// Pull the next audio chunk when the producer was opened with an
-    /// audio device (`open_with_audio`). The demuxer normalizes to
-    /// 48 kHz stereo f32. `Ok(None)` = no audio device / nothing ready.
+    /// Audio is now opened as a separate [`AudioInputProducer`] (see
+    /// `open_camera_producer`), never in the video's dshow graph — so a
+    /// video-only `DshowProducer` has no audio stream. Returns `Ok(None)`.
     pub fn next_audio(&mut self) -> Result<Option<media::DecodedAudio>, CaptureError> {
-        match self.demux.next_audio()? {
-            Some(raw) => Ok(Some(media::DecodedAudio {
-                samples: raw.samples,
-                channels: 2,
-                sample_rate: 48_000,
-                pts_us: raw.pts_us,
-            })),
-            None => Ok(None),
-        }
+        Ok(None)
     }
 }
 
 impl FrameProducer for DshowProducer {
     fn next_frame(&mut self) -> Result<Option<CapturedFrame>, CaptureError> {
-        // Single bounded drain: the demuxer discards queued video packets
-        // without decoding and decodes only the newest frame. This bounds
-        // the per-tick work to ~one decode no matter how far behind the
-        // queue got (the old loop decoded several per tick while delivering
-        // one — the melt on 1080p60+ capture devices).
-        // If the device stalls, the interrupt callback aborts the read and
-        // we report "no frame yet" instead of hanging the tick thread.
-        self.deadline
-            .deadline_us
-            .store(now_us() + READ_TIMEOUT_US, Ordering::Relaxed);
-        let r = self.demux.next_video_newest();
-        self.deadline.deadline_us.store(0, Ordering::Relaxed);
-        // Live source: the demuxer never yields EndOfStream for dshow;
-        // map it defensively to "no frame yet" so a live source can
-        // never terminate the consumer. A timed-out read surfaces as a
-        // `ReadFailed` — also map that to "no frame yet".
-        let frame = match r {
-            Ok(Some(f)) => f,
-            Ok(None) => return Ok(None),
-            Err(CaptureError::EndOfStream) => return Ok(None),
-            Err(CaptureError::ReadFailed(_)) => return Ok(None),
-            Err(e) => return Err(e),
-        };
-        // OBS `ready_async_frame` hysteresis (2ms): never emit a frame from
-        // a (near-)duplicate source instant — the consumer repeats the last
-        // frame instead of juddering at frame boundaries.
-        if let Some(last_pts) = self.last_delivered_pts_us {
-            if frame.pts_us <= last_pts.saturating_add(2_000) {
-                return Ok(None);
-            }
-        }
-        // Decimate to the target fps: drop the frame when we delivered one
-        // too recently; the consumer repeats the last frame (no stutter,
-        // no accumulation).
-        let now = now_us();
-        if now.saturating_sub(self.last_delivered_us) < self.min_frame_interval_us {
-            return Ok(None);
-        }
-        self.last_delivered_us = now;
-        self.last_delivered_pts_us = Some(frame.pts_us);
-        Ok(Some(frame))
+        // Non-blocking take from the capture thread's latest slot. The
+        // tick never touches the device: if the capture thread hasn't
+        // produced a new frame yet, the consumer repeats the last frame.
+        // Decimation is implicit — a 60fps device with a 30fps tick simply
+        // has its latest frame taken every 33ms.
+        let mut slot = self
+            .latest
+            .lock()
+            .map_err(|_| CaptureError::ReadFailed("capture slot poisoned".into()))?;
+        Ok(slot.take())
     }
 
     fn stream_info(&self) -> StreamInfo {
         self.info
+    }
+}
+
+impl Drop for DshowProducer {
+    fn drop(&mut self) {
+        use std::sync::atomic::Ordering;
+        // Signal the capture thread to exit. We don't join it: if the
+        // thread is wedged inside `av_read_frame` (driver ignoring the
+        // interrupt), joining would hang the drop. The thread exits on its
+        // own when it observes `stop`; the OS reaps it at process exit.
+        self.stop.store(true, Ordering::Relaxed);
     }
 }
