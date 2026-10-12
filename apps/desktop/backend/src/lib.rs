@@ -511,11 +511,12 @@ pub struct Shell {
     /// Open media-file producers keyed by source id. The `Send` wrapper is
     /// sound: every producer is only touched through the shell's `Mutex`.
     media_producers: HashMap<String, av_backends::SendProducer>,
-    /// Open microphone/line-in producers keyed by source id (Windows
-    /// dshow audio). Separate from `media_producers`: audio inputs have
+    /// Live audio inputs (microphone / line-in / camera audio) keyed by
+    /// source id. Each runs its device reads on its own thread
+    /// (`sf_audio::LiveInput`) so a blocking device read can never stall
+    /// the media tick. Separate from `media_producers`: audio inputs have
     /// no video frames, so they never touch the video pull path.
-    #[cfg(windows)]
-    audio_producers: HashMap<String, sf_capture::audio_in::AudioInputProducer>,
+    audio_inputs: HashMap<String, sf_audio::LiveInput>,
     /// Last decoded video frame per media source (freeze on end-of-stream).
     media_last_frame: HashMap<String, (u32, u32, Vec<u8>)>,
     /// Negotiated camera format per camera source id, e.g.
@@ -525,10 +526,17 @@ pub struct Shell {
     /// Rasterized text overlays keyed by (source_id, text, w, h). Text
     /// rarely changes, so it renders once — not on every tick.
     text_cache: HashMap<(String, String, u32, u32), Vec<u8>>,
-    /// Real audio mixer (sf-audio); fed by media-source audio chunks.
+    /// Real audio mixer (sf-audio); fed equal-length blocks by the bus.
     audio_mixer: sf_audio::Mixer,
-    /// Free offline enhancer (gate → EQ → compressor) on the master mix.
-    audio_enhancer: sf_audio::Enhancer,
+    /// Clocked audio bus: per-source jitter FIFOs, exact samples per tick
+    /// (keeps the audio timeline locked to video PTS).
+    audio_bus: sf_audio::AudioBus,
+    /// Voice enhancer settings (AI denoise → gate → EQ → compressor),
+    /// shared by every voice source.
+    enhancer_settings: sf_audio::EnhancerSettings,
+    /// One stateful enhancer per live voice source (mic / camera audio),
+    /// applied PRE-fader. Media files are never processed.
+    voice_enhancers: HashMap<String, sf_audio::Enhancer>,
     /// Local speaker monitor (None = off). Opened on demand so a missing
     /// audio device can never break startup.
     audio_monitor: Option<audio_monitor::AudioMonitor>,
@@ -597,13 +605,14 @@ impl Shell {
             record_error: None,
             macros: Vec::new(),
             media_producers: HashMap::new(),
-            #[cfg(windows)]
-            audio_producers: HashMap::new(),
+            audio_inputs: HashMap::new(),
             media_last_frame: HashMap::new(),
             camera_formats: HashMap::new(),
             text_cache: HashMap::new(),
             audio_mixer: sf_audio::Mixer::new(),
-            audio_enhancer: sf_audio::Enhancer::new(48_000),
+            audio_bus: sf_audio::AudioBus::new(30, 1),
+            enhancer_settings: sf_audio::EnhancerSettings::default(),
+            voice_enhancers: HashMap::new(),
             audio_monitor: None,
             meter_values: HashMap::new(),
             meters_live: false,
@@ -654,13 +663,14 @@ impl Shell {
             record_error: None,
             macros: Vec::new(),
             media_producers: HashMap::new(),
-            #[cfg(windows)]
-            audio_producers: HashMap::new(),
+            audio_inputs: HashMap::new(),
             media_last_frame: HashMap::new(),
             camera_formats: HashMap::new(),
             text_cache: HashMap::new(),
             audio_mixer: sf_audio::Mixer::new(),
-            audio_enhancer: sf_audio::Enhancer::new(48_000),
+            audio_bus: sf_audio::AudioBus::new(30, 1),
+            enhancer_settings: sf_audio::EnhancerSettings::default(),
+            voice_enhancers: HashMap::new(),
             audio_monitor: None,
             meter_values: HashMap::new(),
             meters_live: false,

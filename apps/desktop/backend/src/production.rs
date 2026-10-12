@@ -273,12 +273,17 @@ pub struct MixerView {
     pub meters: HashMap<String, f32>,
     /// True while local speaker monitoring is active.
     pub monitor_enabled: bool,
-    /// Audio enhancer (gate → EQ → compressor) settings.
+    /// Voice enhancer (AI denoise → gate → EQ → compressor) settings.
     pub enhancer: EnhancerView,
+    /// Live per-voice-source enhancer telemetry + bus health, keyed by
+    /// source id (only live inputs: mics / camera audio).
+    #[serde(default)]
+    pub voice: HashMap<String, VoiceStatsView>,
 }
 
-/// UI-facing audio-enhancer settings (mirror of
-/// `sf_audio::EnhancerSettings`; free offline DSP, no APIs).
+/// UI-facing voice-enhancer settings (mirror of
+/// `sf_audio::EnhancerSettings`). Runs locally in real time — RNNoise AI
+/// denoise + DSP; no network API in the audio path.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct EnhancerView {
     pub enabled: bool,
@@ -288,6 +293,43 @@ pub struct EnhancerView {
     pub eq_mid_db: f32,
     pub eq_high_db: f32,
     pub compressor_enabled: bool,
+    /// AI noise suppression on/off (older saved state: on).
+    #[serde(default = "default_true")]
+    pub ai_denoise: bool,
+    /// AI suppression strength 0..1 (older saved state: full).
+    #[serde(default = "default_one")]
+    pub ai_strength: f32,
+}
+
+fn default_true() -> bool {
+    true
+}
+
+fn default_one() -> f32 {
+    1.0
+}
+
+/// Live telemetry for one voice source.
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct VoiceStatsView {
+    /// Voice-activity probability from the AI stage (0..1).
+    pub vad: f32,
+    /// Compressor gain reduction, dB.
+    pub gain_reduction_db: f32,
+    /// Gate currently closed (silencing).
+    pub gate_closed: bool,
+    /// Latency added by the enhancer chain, ms (20 with AI denoise).
+    pub latency_ms: f32,
+    /// CPU time of the last enhancer block, µs.
+    pub process_us: u32,
+    /// Audio queued in the bus for this source, ms.
+    pub buffered_ms: f32,
+    /// Underruns (silence inserted) since the source opened.
+    pub underruns: u64,
+    /// Sample frames dropped to stay live.
+    pub dropped_frames: u64,
+    /// Device health: "starting" | "running" | "error: …" | "stopped".
+    pub device: String,
 }
 
 // ---------------------------------------------------------------------------
@@ -1012,8 +1054,10 @@ impl Shell {
         }
         self.mixer.channels.remove(source_id);
         self.media_producers.remove(source_id);
-        #[cfg(windows)]
-        self.audio_producers.remove(source_id);
+        // Dropping the LiveInput stops + joins its capture thread.
+        self.audio_inputs.remove(source_id);
+        self.voice_enhancers.remove(source_id);
+        self.audio_bus.remove(source_id);
         self.media_last_frame.remove(source_id);
         self.camera_formats.remove(source_id);
         // Drop any cached text rasterizations for this source.
@@ -1313,6 +1357,7 @@ impl Shell {
                     .collect(),
                 monitor_enabled: self.audio_monitor.is_some(),
                 enhancer: self.enhancer_settings(),
+                voice: self.voice_stats(),
             },
             stream_settings: self.stream_settings.clone(),
             stream_lifecycle: self.stream_lifecycle.clone(),

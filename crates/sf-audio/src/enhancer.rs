@@ -1,11 +1,23 @@
-//! Free offline audio enhancer: 3-band EQ + noise gate + compressor.
+//! Real-time voice enhancer: AI noise suppression + noise gate + 3-band EQ +
+//! compressor.
 //!
-//! Everything is plain DSP running in-process — no cloud APIs, no keys,
-//! no licensing, works offline forever. Applied to the 48 kHz stereo
-//! master mix after the channel/master gains.
+//! Everything runs in-process on the audio tick — no cloud round-trip, no
+//! keys, works offline. A network API cannot be used here: a live stream
+//! needs every 33 ms audio block processed before the next one arrives, and
+//! an HTTP round-trip (100–500 ms, plus jitter) would either add that much
+//! delay to the whole stream or drop audio. The AI stage is RNNoise, a
+//! neural network small enough to run per 10 ms frame on the CPU.
 //!
-//! Chain order (standard): **gate → EQ → compressor**.
-//! * Noise gate: silences background hiss/hum when nobody is speaking.
+//! Applied **per voice source** (microphones / camera audio), PRE-fader, at
+//! the mixer's AI-FX insert point #1 — never to music/media files, which a
+//! speech denoiser would damage.
+//!
+//! Chain order: **AI denoise → gate → EQ → compressor**.
+//! * AI denoise (RNNoise): removes fans, hum, keyboard, room noise while
+//!   keeping speech. Fixed 20 ms latency; strength 0–100 %.
+//! * Noise gate: silences what's left between phrases. When AI denoise is
+//!   on, the gate is voice-aware: RNNoise's voice-activity detector holds it
+//!   open during soft speech that falls below the level threshold.
 //! * 3-band EQ: lowshelf (200 Hz) / peaking (1 kHz) / highshelf (6 kHz),
 //!   ±12 dB each — voice clarity lives in the mids/highs.
 //! * Compressor: gentle 3:1 levelling so quiet and loud moments sit
@@ -23,20 +35,41 @@ pub struct EnhancerSettings {
     pub eq_mid_db: f32,
     pub eq_high_db: f32,
     pub compressor_enabled: bool,
+    /// AI noise suppression (RNNoise) on/off.
+    pub ai_denoise: bool,
+    /// AI suppression strength, 0.0 (dry) ..= 1.0 (full).
+    pub ai_strength: f32,
 }
 
 impl Default for EnhancerSettings {
     fn default() -> Self {
         Self {
-            enabled: false,
+            enabled: true,
             gate_enabled: true,
             gate_threshold_db: -40.0,
             eq_low_db: 0.0,
             eq_mid_db: 2.0,
             eq_high_db: 2.0,
             compressor_enabled: true,
+            ai_denoise: true,
+            ai_strength: 1.0,
         }
     }
+}
+
+/// Live telemetry from one enhancer (for meters / diagnostics).
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct EnhancerStats {
+    /// Voice-activity probability from the AI stage (0..1; 0 when AI off).
+    pub vad: f32,
+    /// Current compressor gain reduction in dB (≥ 0).
+    pub gain_reduction_db: f32,
+    /// True while the gate is (mostly) closed.
+    pub gate_closed: bool,
+    /// Algorithmic latency added by the chain, in milliseconds.
+    pub latency_ms: f32,
+    /// Wall time of the last `process` call, microseconds.
+    pub process_us: u32,
 }
 
 /// RBJ cookbook biquad (Direct Form I).
@@ -160,6 +193,9 @@ pub struct Enhancer {
     /// Compressor envelope (peak, mono-ized).
     comp_env: f32,
     comp_gain: f32,
+    /// AI noise suppressor (created lazily on first use: ~40 KB of state).
+    denoiser: Option<crate::denoise::NoiseSuppressor>,
+    stats: EnhancerStats,
 }
 
 impl Enhancer {
@@ -174,14 +210,32 @@ impl Enhancer {
             gate_gain: [1.0; 2],
             comp_env: 0.0,
             comp_gain: 1.0,
+            denoiser: None,
+            stats: EnhancerStats::default(),
         };
         e.retune();
         e
     }
 
-    pub fn set_settings(&mut self, s: EnhancerSettings) {
+    /// Apply new settings. Safe to call on every slider move: EQ state is
+    /// preserved and AI strength is smoothed, so live changes don't click.
+    pub fn set_settings(&mut self, mut s: EnhancerSettings) {
+        s.ai_strength = s.ai_strength.clamp(0.0, 1.0);
         self.settings = s;
         self.retune();
+        if let Some(d) = self.denoiser.as_mut() {
+            let st = if self.settings.ai_denoise {
+                self.settings.ai_strength
+            } else {
+                0.0
+            };
+            d.set_strength(st);
+        }
+    }
+
+    /// Latest telemetry.
+    pub fn stats(&self) -> EnhancerStats {
+        self.stats
     }
 
     pub fn settings(&self) -> &EnhancerSettings {
@@ -211,19 +265,34 @@ impl Enhancer {
         // (a tiny click on slider release is acceptable, no zipper
         // noise during the drag since retune happens on change end).
         for ch in 0..2 {
-            let (lx1, lx2, ly1, ly2) = (self.low[ch].x1, self.low[ch].x2, self.low[ch].y1, self.low[ch].y2);
+            let (lx1, lx2, ly1, ly2) = (
+                self.low[ch].x1,
+                self.low[ch].x2,
+                self.low[ch].y1,
+                self.low[ch].y2,
+            );
             self.low[ch] = lo;
             self.low[ch].x1 = lx1;
             self.low[ch].x2 = lx2;
             self.low[ch].y1 = ly1;
             self.low[ch].y2 = ly2;
-            let (mx1, mx2, my1, my2) = (self.mid[ch].x1, self.mid[ch].x2, self.mid[ch].y1, self.mid[ch].y2);
+            let (mx1, mx2, my1, my2) = (
+                self.mid[ch].x1,
+                self.mid[ch].x2,
+                self.mid[ch].y1,
+                self.mid[ch].y2,
+            );
             self.mid[ch] = mid;
             self.mid[ch].x1 = mx1;
             self.mid[ch].x2 = mx2;
             self.mid[ch].y1 = my1;
             self.mid[ch].y2 = my2;
-            let (hx1, hx2, hy1, hy2) = (self.high[ch].x1, self.high[ch].x2, self.high[ch].y1, self.high[ch].y2);
+            let (hx1, hx2, hy1, hy2) = (
+                self.high[ch].x1,
+                self.high[ch].x2,
+                self.high[ch].y1,
+                self.high[ch].y2,
+            );
             self.high[ch] = hi;
             self.high[ch].x1 = hx1;
             self.high[ch].x2 = hx2;
@@ -236,8 +305,36 @@ impl Enhancer {
     /// rate works — `rate` was fixed at construction).
     pub fn process(&mut self, samples: &mut [f32]) {
         if !self.settings.enabled || samples.is_empty() {
+            self.stats = EnhancerStats::default();
             return;
         }
+        let t0 = std::time::Instant::now();
+        // --- AI noise suppression (RNNoise) ---
+        // Once created, the denoiser keeps running even when AI is toggled
+        // off (strength 0 skips the network but keeps the 20 ms delay line),
+        // so toggling never shifts A/V sync mid-stream.
+        if self.settings.ai_denoise && self.denoiser.is_none() {
+            let mut d = crate::denoise::NoiseSuppressor::new();
+            d.set_strength(self.settings.ai_strength);
+            self.denoiser = Some(d);
+        }
+        let (vad, latency_ms) = match self.denoiser.as_mut() {
+            Some(d) => {
+                d.process(samples);
+                let v = if self.settings.ai_denoise {
+                    d.vad()
+                } else {
+                    0.0
+                };
+                (
+                    v,
+                    crate::denoise::NoiseSuppressor::LATENCY_FRAMES as f32 * 1000.0 / self.rate,
+                )
+            }
+            None => (0.0, 0.0),
+        };
+        // Voice-aware gate: speech detected by the RNN holds the gate open.
+        let voice = self.settings.ai_denoise && vad > 0.5;
         let gate_on = self.settings.gate_enabled;
         let comp_on = self.settings.compressor_enabled;
         let gate_thr = 10f32.powf(self.settings.gate_threshold_db / 20.0);
@@ -260,7 +357,7 @@ impl Enhancer {
                     } else {
                         g_rel * *env + (1.0 - g_rel) * x
                     };
-                    let target = if *env > gate_thr { 1.0 } else { 0.0 };
+                    let target = if *env > gate_thr || voice { 1.0 } else { 0.0 };
                     let g = &mut self.gate_gain[ch];
                     // 5 ms smoothing on the gain itself avoids clicks.
                     *g += (target - *g) * (1.0 - g_att);
@@ -295,6 +392,17 @@ impl Enhancer {
                 frame[1] *= self.comp_gain;
             }
         }
+        self.stats = EnhancerStats {
+            vad,
+            gain_reduction_db: if comp_on {
+                -20.0 * self.comp_gain.max(1e-6).log10()
+            } else {
+                0.0
+            },
+            gate_closed: gate_on && self.gate_gain[0].max(self.gate_gain[1]) < 0.5,
+            latency_ms,
+            process_us: t0.elapsed().as_micros().min(u32::MAX as u128) as u32,
+        };
     }
 }
 
@@ -305,6 +413,10 @@ mod tests {
     #[test]
     fn disabled_is_passthrough() {
         let mut e = Enhancer::new(48_000);
+        e.set_settings(EnhancerSettings {
+            enabled: false,
+            ..EnhancerSettings::default()
+        });
         let mut s = vec![0.5f32, -0.5, 0.25, -0.25];
         let orig = s.clone();
         e.process(&mut s);
@@ -316,6 +428,7 @@ mod tests {
         let mut e = Enhancer::new(48_000);
         let mut st = EnhancerSettings::default();
         st.enabled = true;
+        st.ai_denoise = false;
         st.gate_enabled = true;
         st.gate_threshold_db = -20.0;
         st.compressor_enabled = false;
@@ -333,12 +446,15 @@ mod tests {
         let mut e = Enhancer::new(48_000);
         let mut st = EnhancerSettings::default();
         st.enabled = true;
+        st.ai_denoise = false;
         st.gate_enabled = true;
         st.gate_threshold_db = -40.0;
         st.compressor_enabled = false;
         e.set_settings(st);
         // Loud 440 Hz-ish tone: alternate samples.
-        let mut s: Vec<f32> = (0..48_000).flat_map(|i| [0.5 * (i as f32 * 0.1).sin(); 2]).collect();
+        let mut s: Vec<f32> = (0..48_000)
+            .flat_map(|i| [0.5 * (i as f32 * 0.1).sin(); 2])
+            .collect();
         e.process(&mut s);
         let peak = s.iter().fold(0.0f32, |a, &b| a.max(b.abs()));
         assert!(peak > 0.2, "gate closed on loud signal, peak={peak}");
@@ -349,12 +465,15 @@ mod tests {
         let mut e = Enhancer::new(48_000);
         let mut st = EnhancerSettings::default();
         st.enabled = true;
+        st.ai_denoise = false;
         st.gate_enabled = false;
         st.compressor_enabled = false;
         st.eq_high_db = 12.0;
         e.set_settings(st);
         // High-frequency tone (10 kHz): alternating ±.
-        let mut s: Vec<f32> = (0..4800).flat_map(|i| [if i % 2 == 0 { 0.3 } else { -0.3 }; 2]).collect();
+        let mut s: Vec<f32> = (0..4800)
+            .flat_map(|i| [if i % 2 == 0 { 0.3 } else { -0.3 }; 2])
+            .collect();
         let before: f32 = s.iter().map(|v| v * v).sum::<f32>() / s.len() as f32;
         e.process(&mut s);
         let after: f32 = s.iter().map(|v| v * v).sum::<f32>() / s.len() as f32;
@@ -366,6 +485,7 @@ mod tests {
         let mut e = Enhancer::new(48_000);
         let mut st = EnhancerSettings::default();
         st.enabled = true;
+        st.ai_denoise = false;
         st.gate_enabled = false;
         st.compressor_enabled = true;
         e.set_settings(st);
@@ -376,5 +496,47 @@ mod tests {
         let peak = s[half..].iter().fold(0.0f32, |a, &b| a.max(b.abs()));
         assert!(peak < 0.85, "compressor did not reduce peaks, peak={peak}");
     }
-}
 
+    #[test]
+    fn ai_chain_removes_noise_and_reports_stats() {
+        let mut e = Enhancer::new(48_000);
+        let mut st = EnhancerSettings::default();
+        st.gate_enabled = false;
+        st.compressor_enabled = false;
+        st.eq_mid_db = 0.0;
+        st.eq_high_db = 0.0;
+        e.set_settings(st);
+        let mut seed = 7u32;
+        let mut s: Vec<f32> = (0..48_000 * 2)
+            .map(|_| {
+                seed ^= seed << 13;
+                seed ^= seed >> 17;
+                seed ^= seed << 5;
+                ((seed as f32 / u32::MAX as f32) * 2.0 - 1.0) * 0.05
+            })
+            .flat_map(|v| [v, v])
+            .collect();
+        let before: f32 = s[s.len() / 2..].iter().map(|v| v * v).sum();
+        for c in s.chunks_mut(3200) {
+            e.process(c);
+        }
+        let after: f32 = s[s.len() / 2..].iter().map(|v| v * v).sum();
+        assert!(after < before * 0.1, "AI stage did not suppress noise");
+        assert!((e.stats().latency_ms - 20.0).abs() < 0.01);
+    }
+
+    #[test]
+    fn toggling_ai_keeps_latency_constant() {
+        let mut e = Enhancer::new(48_000);
+        let mut st = EnhancerSettings::default();
+        st.gate_enabled = false;
+        st.compressor_enabled = false;
+        e.set_settings(st.clone());
+        let mut b = vec![0.0f32; 3200];
+        e.process(&mut b);
+        st.ai_denoise = false;
+        e.set_settings(st);
+        e.process(&mut b);
+        assert!((e.stats().latency_ms - 20.0).abs() < 0.01);
+    }
+}

@@ -54,7 +54,9 @@ use sf_output::{
     redact_url, ContainerFormat, RealTransport, ReconnectPolicy, Recorder, StreamTarget, Streamer,
 };
 
-use super::production::{transition_progress, EnhancerView, RecordFormat, RecordRuntime, StreamLifecycle};
+use super::production::{
+    transition_progress, EnhancerView, RecordFormat, RecordRuntime, StreamLifecycle, VoiceStatsView,
+};
 use crate::production::SourceKind;
 use super::{Shell, ShellError};
 use crate::production::crossfade;
@@ -102,6 +104,23 @@ where
             "{label}: timed out — the device is not responding (it may be in use by another app, or its driver is wedged)"
         ))),
     }
+}
+
+/// Moves a live audio producer onto its own capture thread
+/// (`sf_audio::LiveInput`). The tick then only drains a FIFO, so a
+/// blocking device read (dshow waits up to 25 ms per packet) can never
+/// stall rendering/encoding.
+#[cfg(windows)]
+fn spawn_live_audio(
+    source_id: &str,
+    mut prod: sf_capture::audio_in::AudioInputProducer,
+) -> Result<sf_audio::LiveInput, ShellError> {
+    sf_audio::LiveInput::spawn(source_id, move || match prod.next_audio() {
+        Ok(Some(c)) => Ok(Some(c.samples)),
+        Ok(None) => Ok(None),
+        Err(e) => Err(e.to_string()),
+    })
+    .map_err(|e| ShellError::Capture(format!("cannot start audio capture thread: {e}")))
 }
 
 /// An active recording session: encoders + muxer + clocks.
@@ -366,8 +385,8 @@ impl Shell {
                     open_device("camera audio", move || {
                         sf_capture::audio_in::AudioInputProducer::open(Some(a.as_str()))
                     })?;
-                self.audio_producers
-                    .insert(source_id.to_string(), audio_prod);
+                let live = spawn_live_audio(source_id, audio_prod)?;
+                self.audio_inputs.insert(source_id.to_string(), live);
             }
         }
         Ok(())
@@ -428,7 +447,8 @@ impl Shell {
             open_device("audio input", move || {
                 sf_capture::audio_in::AudioInputProducer::open(device_owned.as_deref())
             })?;
-        self.audio_producers.insert(source_id.to_string(), prod);
+        let live = spawn_live_audio(source_id, prod)?;
+        self.audio_inputs.insert(source_id.to_string(), live);
         Ok(())
     }
 
@@ -516,7 +536,7 @@ impl Shell {
 
     /// Current enhancer settings for the UI.
     pub fn enhancer_settings(&self) -> EnhancerView {
-        let s = self.audio_enhancer.settings();
+        let s = &self.enhancer_settings;
         EnhancerView {
             enabled: s.enabled,
             gate_enabled: s.gate_enabled,
@@ -525,55 +545,116 @@ impl Shell {
             eq_mid_db: s.eq_mid_db,
             eq_high_db: s.eq_high_db,
             compressor_enabled: s.compressor_enabled,
+            ai_denoise: s.ai_denoise,
+            ai_strength: s.ai_strength,
         }
     }
 
     /// Applies enhancer settings from the UI (clamped to sane ranges).
+    /// Takes effect on the very next audio block (≤ one 33 ms tick) for
+    /// every live voice source — this is what makes slider moves audible
+    /// in real time.
     pub fn set_enhancer_settings(&mut self, v: EnhancerView) {
-        self.audio_enhancer.set_settings(sf_audio::EnhancerSettings {
+        let num = |x: f32, lo: f32, hi: f32, dflt: f32| {
+            if x.is_finite() {
+                x.clamp(lo, hi)
+            } else {
+                dflt
+            }
+        };
+        let settings = sf_audio::EnhancerSettings {
             enabled: v.enabled,
             gate_enabled: v.gate_enabled,
-            gate_threshold_db: v.gate_threshold_db.clamp(-60.0, 0.0),
-            eq_low_db: v.eq_low_db.clamp(-12.0, 12.0),
-            eq_mid_db: v.eq_mid_db.clamp(-12.0, 12.0),
-            eq_high_db: v.eq_high_db.clamp(-12.0, 12.0),
+            gate_threshold_db: num(v.gate_threshold_db, -60.0, 0.0, -40.0),
+            eq_low_db: num(v.eq_low_db, -12.0, 12.0, 0.0),
+            eq_mid_db: num(v.eq_mid_db, -12.0, 12.0, 0.0),
+            eq_high_db: num(v.eq_high_db, -12.0, 12.0, 0.0),
             compressor_enabled: v.compressor_enabled,
-        });
+            ai_denoise: v.ai_denoise,
+            ai_strength: num(v.ai_strength, 0.0, 1.0, 1.0),
+        };
+        for e in self.voice_enhancers.values_mut() {
+            e.set_settings(settings.clone());
+        }
+        self.enhancer_settings = settings;
     }
 
-    /// True when any open media producer has an audio stream.
-    fn has_audio_sources(&self) -> bool {
-        if self
-            .media_producers
-            .values()
-            .any(|p| p.stream_info().has_audio)
-        {
-            return true;
-        }
-        #[cfg(windows)]
-        if !self.audio_producers.is_empty() {
-            return true;
-        }
-        false
+    /// Live per-voice-source telemetry for the UI (enhancer + bus + device).
+    pub fn voice_stats(&self) -> std::collections::HashMap<String, VoiceStatsView> {
+        self.audio_inputs
+            .iter()
+            .map(|(id, inp)| {
+                let e = self
+                    .voice_enhancers
+                    .get(id)
+                    .map(|e| e.stats())
+                    .unwrap_or_default();
+                let b = self.audio_bus.stats(id);
+                let device = match inp.status() {
+                    sf_audio::LiveStatus::Starting => "starting".to_string(),
+                    sf_audio::LiveStatus::Running => "running".to_string(),
+                    sf_audio::LiveStatus::Error(m) => format!("error: {m}"),
+                    sf_audio::LiveStatus::Stopped => "stopped".to_string(),
+                };
+                (
+                    id.clone(),
+                    VoiceStatsView {
+                        vad: e.vad,
+                        gain_reduction_db: e.gain_reduction_db,
+                        gate_closed: e.gate_closed,
+                        latency_ms: e.latency_ms,
+                        process_us: e.process_us,
+                        buffered_ms: b.buffered_ms,
+                        underruns: b.underruns,
+                        dropped_frames: b.dropped_frames + inp.dropped_frames(),
+                        device,
+                    },
+                )
+            })
+            .collect()
     }
 
     // ------------------------------------------------------------------
     // Audio: pull + mix + meters
     // ------------------------------------------------------------------
 
-    /// Pulls pending audio chunks from all media producers, runs the
-    /// `sf-audio` mixer, and refreshes meter state. Returns the owned
-    /// mixed samples (empty when nothing flowed). This is the single
-    /// place meters become real.
+    /// Runs one audio tick and returns exactly one tick's worth of mixed
+    /// 48 kHz stereo samples (`frames_per_tick * 2`, silence when nothing
+    /// is playing). This is the single place meters become real.
+    ///
+    /// Pipeline per tick:
+    /// 1. The bus clock says how many sample frames this tick covers
+    ///    (exact, rational fps — 1600 at 30 fps).
+    /// 2. Live inputs: drain their capture threads' FIFOs into the bus
+    ///    (never blocks — device reads happen on their own threads).
+    /// 3. Media files: pull decoded audio only until the bus holds one
+    ///    block + prebuffer (paced by the audio clock — files play at the
+    ///    right speed instead of being decoded ahead and dropped).
+    /// 4. Pull exactly one block per source; voice sources go through
+    ///    their own enhancer (RNNoise AI denoise → gate → EQ → compressor)
+    ///    PRE-fader; then the mixer sums equal-length blocks.
+    ///
+    /// Because the block length is fixed per tick, the encoder's audio
+    /// timeline advances exactly like video PTS — no A/V drift — and
+    /// ticks with no new audio still produce (silent) samples.
     pub(crate) fn pump_audio(&mut self) -> Vec<f32> {
-        // Sync mixer registration with the current media + audio-input sources.
-        let ids: Vec<String> = {
-            #[allow(unused_mut)]
-            let mut v: Vec<String> = self.media_producers.keys().cloned().collect();
-            #[cfg(windows)]
-            v.extend(self.audio_producers.keys().cloned());
-            v
-        };
+        self.audio_bus
+            .set_fps(self.video_settings.output_fps.max(1), 1);
+        let frames = self.audio_bus.next_block_frames();
+
+        // Sources that actually carry audio.
+        // (A camera's audio arrives through `audio_inputs` under the same
+        // id; never count it twice.)
+        let media_ids: Vec<String> = self
+            .media_producers
+            .iter()
+            .filter(|(id, p)| p.stream_info().has_audio && !self.audio_inputs.contains_key(*id))
+            .map(|(id, _)| id.clone())
+            .collect();
+        let live_ids: Vec<String> = self.audio_inputs.keys().cloned().collect();
+        let ids: Vec<String> = media_ids.iter().chain(live_ids.iter()).cloned().collect();
+
+        // Sync mixer registration + strips with the current sources.
         for id in &ids {
             if !self.audio_mixer.source_ids().contains(id) {
                 let gain = self.mixer.channels.get(id).map(|c| c.gain).unwrap_or(1.0);
@@ -593,62 +674,68 @@ impl Shell {
         }
         self.audio_mixer.set_master_gain(self.mixer.master.gain);
         self.audio_mixer.set_master_mute(self.mixer.master.mute);
+        self.audio_bus.retain(&ids);
+        self.voice_enhancers.retain(|k, _| live_ids.contains(k));
 
-        // Drain a bounded number of chunks per producer per tick.
-        let mut chunks: Vec<(String, Vec<f32>, u32, u32)> = Vec::new();
-        for id in &ids {
-            if let Some(prod) = self.media_producers.get_mut(id) {
-                for _ in 0..4 {
-                    match prod.next_audio() {
-                        Ok(Some(c)) => {
-                            chunks.push((id.clone(), c.samples, c.channels, c.sample_rate))
-                        }
-                        _ => break,
-                    }
-                }
+        if ids.is_empty() {
+            // Keep the audio timeline continuous for the encoders.
+            return vec![0.0; frames * 2];
+        }
+
+        // Live inputs → bus (non-blocking drain of the capture threads).
+        let mut tmp: Vec<f32> = Vec::new();
+        for (id, input) in &self.audio_inputs {
+            tmp.clear();
+            input.drain_into(&mut tmp);
+            if !tmp.is_empty() {
+                self.audio_bus.push(id, &tmp);
             }
         }
-        // Live audio inputs: drain up to 2 chunks per tick (~42 ms of
-        // 48 kHz audio covers the 33 ms tick; the producer's queue is
-        // newest-wins so nothing accumulates).
-        #[cfg(windows)]
-        for (id, prod) in self.audio_producers.iter_mut() {
-            for _ in 0..2 {
+        // Media files → bus, paced by the audio clock.
+        let target = self.audio_bus.refill_target_frames(frames);
+        for id in &media_ids {
+            let Some(prod) = self.media_producers.get_mut(id) else {
+                continue;
+            };
+            let mut guard = 0;
+            while self.audio_bus.buffered_frames(id) < target && guard < 16 {
+                guard += 1;
                 match prod.next_audio() {
-                    Ok(Some(c)) => {
-                        chunks.push((id.clone(), c.samples, c.channels, c.sample_rate))
+                    Ok(Some(c)) if c.channels == 2 && c.sample_rate == 48_000 => {
+                        self.audio_bus.push(id, &c.samples)
                     }
+                    Ok(Some(_)) => {} // off-contract chunk: skip (capture normalizes)
                     _ => break,
                 }
             }
         }
-        if chunks.is_empty() {
-            return Vec::new();
+
+        // Exactly one block per source; voice sources get enhanced.
+        let mut blocks: Vec<(String, Vec<f32>)> = Vec::with_capacity(ids.len());
+        for id in &ids {
+            let mut block = Vec::with_capacity(frames * 2);
+            self.audio_bus.pull(id, frames, &mut block);
+            if live_ids.contains(id) {
+                let settings = &self.enhancer_settings;
+                let enh = self.voice_enhancers.entry(id.clone()).or_insert_with(|| {
+                    let mut e = sf_audio::Enhancer::new(48_000);
+                    e.set_settings(settings.clone());
+                    e
+                });
+                enh.process(&mut block);
+            }
+            blocks.push((id.clone(), block));
         }
-        let frames: Vec<(&str, AudioFrame)> = chunks
+        let frames_in: Vec<(&str, AudioFrame)> = blocks
             .iter()
-            .map(|(id, s, ch, sr)| {
-                (
-                    id.as_str(),
-                    AudioFrame {
-                        samples: s,
-                        channels: *ch,
-                        sample_rate: *sr,
-                    },
-                )
-            })
+            .map(|(id, b)| (id.as_str(), AudioFrame::new(b, 2, 48_000)))
             .collect();
-        let mixed = self.audio_mixer.mix(&frames);
+        let mixed = self.audio_mixer.mix(&frames_in);
         for m in &mixed.per_source {
             self.meter_values.insert(m.id.clone(), m.peak);
         }
-        if !mixed.samples.is_empty() {
-            self.meters_live = true;
-        }
-        let mut out = mixed.samples;
-        // Free offline enhancer (gate → EQ → compressor) on the master mix.
-        self.audio_enhancer.process(&mut out);
-        out
+        self.meters_live = true;
+        mixed.samples
     }
 
     // ------------------------------------------------------------------
@@ -790,14 +877,15 @@ impl Shell {
             recorder
                 .add_video_stream(&video_enc.parameters())
                 .map_err(|e| format!("recorder: {e}"))?;
-            let audio_enc = if self.has_audio_sources() {
+            // Always record an audio track (silent until a source plays):
+            // a mic added mid-recording must still be heard, and the
+            // audio timeline stays locked to video from frame 0.
+            let audio_enc = {
                 let enc = AudioEncoder::open().map_err(|e| format!("audio encoder: {e}"))?;
                 recorder
                     .add_audio_stream(&enc.parameters(), enc.sample_rate())
                     .map_err(|e| format!("recorder: {e}"))?;
                 Some(enc)
-            } else {
-                None
             };
             Ok(ActiveRecording {
                 video_enc,
@@ -992,11 +1080,10 @@ impl Shell {
             let video_enc = self
                 .open_video_encoder(self.video_encoder_opts())
                 .map_err(|e| e.to_string())?;
-            let audio_enc = if self.has_audio_sources() {
-                Some(AudioEncoder::open().map_err(|e| format!("audio encoder: {e}"))?)
-            } else {
-                None
-            };
+            // Always stream an audio track: YouTube/Facebook/TikTok ingest
+            // expect one, and a mic added mid-stream can only be heard if
+            // the track was declared at connect time.
+            let audio_enc = Some(AudioEncoder::open().map_err(|e| format!("audio encoder: {e}"))?);
             let audio_params = audio_enc.as_ref().map(|a| a.parameters());
             let target = StreamTarget::Rtmp(full_url.clone());
             let transport =
@@ -1238,7 +1325,11 @@ impl Shell {
         if !recording && !streaming {
             // Audio metering runs even when idle so the UI meters stay live.
             let t = std::time::Instant::now();
-            self.pump_audio();
+            let audio = self.pump_audio();
+            // Local monitoring must work before going live too (mic check).
+            if let Some(monitor) = &self.audio_monitor {
+                monitor.push(&audio);
+            }
             // The program monitor must stay live even when idle: render the
             // program scene small directly on this tick. (When recording or
             // streaming the full-res frame below is downscaled instead, so

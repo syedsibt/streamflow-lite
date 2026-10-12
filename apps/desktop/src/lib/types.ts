@@ -301,6 +301,23 @@ export interface EnhancerSettings {
   eq_mid_db: number;
   eq_high_db: number;
   compressor_enabled: boolean;
+  /** Real-time AI noise suppression (RNNoise, on-device). */
+  ai_denoise: boolean;
+  /** AI suppression strength 0..1. */
+  ai_strength: number;
+}
+
+/** Live per-voice-source telemetry (mics / camera audio). */
+export interface VoiceStats {
+  vad: number; // voice-activity probability 0..1
+  gain_reduction_db: number;
+  gate_closed: boolean;
+  latency_ms: number;
+  process_us: number;
+  buffered_ms: number;
+  underruns: number;
+  dropped_frames: number;
+  device: string; // "starting" | "running" | "error: …" | "stopped"
 }
 
 export interface MixerView {
@@ -310,6 +327,7 @@ export interface MixerView {
   meters: Record<string, number>; // per-source peak, keyed by source id
   monitor_enabled: boolean;
   enhancer: EnhancerSettings;
+  voice: Record<string, VoiceStats>;
 }
 
 export interface StreamStateView {

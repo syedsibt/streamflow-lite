@@ -125,6 +125,12 @@ impl AudioInputProducer {
             let val = CString::new(v).unwrap();
             ff::ffi::av_dict_set(&mut dict, key.as_ptr(), val.as_ptr(), 0);
         };
+        // DirectShow's default capture buffer is ~500 ms: the mic is then
+        // delivered in half-second lumps, i.e. every word arrives 0.5 s
+        // late and in bursts. 20 ms packets (dshow `audio_buffer_size`, in
+        // ms) is what OBS-class low latency needs and is supported by all
+        // WDM audio drivers.
+        set_opt("audio_buffer_size", "20");
         // Live: no internal buffering (the lag lesson from cameras), tiny probe.
         set_opt("fflags", "nobuffer");
         set_opt("probesize", "32");

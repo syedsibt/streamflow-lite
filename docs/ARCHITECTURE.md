@@ -25,7 +25,7 @@ The UI only sends parameters; the engine applies everything on the GPU.
 | `sf-filters` | Look presets (`.sflook`), `FilterStack` rules, effect kind/param models |
 | `sf-filterfx` | Effect-filter GPU passes (WGSL) + CPU references |
 | `sf-scopes` | GPU scopes: waveform, vectorscope, histogram, false color, zebra |
-| `sf-audio` | Audio engine (AI denoise, leveling — later phases) |
+| `sf-audio` | Audio engine: clocked bus (exact samples per tick), live-input capture threads, mixer, real-time voice chain (RNNoise AI denoise → gate → EQ → compressor, 20 ms fixed latency) |
 | `sf-encode` | Hardware encoders (NVENC/QuickSync/AMF via wgpu-interop or FFmpeg) |
 | `sf-output` | Streaming / recording outputs |
 | `sf-replay` | Replay buffer |
@@ -213,3 +213,27 @@ Rules: slider drag → realtime GPU update, IPC throttled to 60 Hz; double-click
 = reset; per-camera color tab + "Apply to all cameras"; compact mode shows only
 Exposure, Temp, Saturation, Look picker; accent `#3B82F6`, dark theme, scopes use
 natural channel colors.
+
+## Audio pipeline (real-time)
+
+```text
+mic / camera audio ─► LiveInput thread (dshow, 20 ms packets) ─┐
+media file audio  ─► paced pull (fills one block + 10 ms) ─────┼─► AudioBus
+                                                               │   per-source jitter FIFO,
+                                                               │   exact frames per tick
+                                                               │   (1600 @ 30 fps), silence on
+                                                               │   underrun, trim > 100 ms
+voice sources only ─► Enhancer: RNNoise AI denoise → voice-aware gate → EQ → compressor
+                    ─► Mixer (equal-length blocks) ─► AAC encoder / monitor / meters
+```
+
+* Enhancement runs on-device. A cloud/HTTP enhancement API cannot sit in a
+  live audio path: each 33 ms block must be finished before the next one, and
+  a network round-trip (100–500 ms + jitter) would either delay the whole
+  stream by that much or drop audio.
+* RNNoise is vendored in `crates/sf-audio/src/rnnoise` (from `nnnoiseless`
+  0.5.2, BSD-3) with a built-in 960-point FFT, so `sf-audio` keeps zero
+  dependencies. It is verified against Xiph's reference output.
+* Fixed latencies: device packet 10–20 ms, bus queue typically 10–45 ms,
+  AI stage 20 ms. Nothing can accumulate: the bus trims past 100 ms, the
+  monitor past 120 ms.

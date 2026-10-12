@@ -18,6 +18,7 @@ import { api, isTauri, onSfEvent } from "./ipc";
 import { useStudio } from "./store";
 import type {
   EnhancerSettings,
+  VoiceStats,
   MacroActionInput,
   ProductionStateData,
   SourceKind,
@@ -239,7 +240,16 @@ function normalizeProductionState(raw: unknown): ProductionStateData {
             ? r.mixer.enhancer.eq_high_db
             : 2,
         compressor_enabled: r.mixer?.enhancer?.compressor_enabled !== false,
+        ai_denoise: r.mixer?.enhancer?.ai_denoise !== false,
+        ai_strength:
+          typeof r.mixer?.enhancer?.ai_strength === "number"
+            ? r.mixer.enhancer.ai_strength
+            : 1,
       },
+      voice:
+        r.mixer?.voice && typeof r.mixer.voice === "object"
+          ? (r.mixer.voice as Record<string, VoiceStats>)
+          : {},
     },
     stream: {
       state: String(sl.state ?? "idle"),

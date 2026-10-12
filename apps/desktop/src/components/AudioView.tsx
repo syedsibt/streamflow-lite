@@ -2,7 +2,7 @@ import { useEffect, useMemo, useState } from "react";
 import { useProduction } from "../lib/productionStore";
 import { useStudio } from "../lib/store";
 import { api } from "../lib/ipc";
-import type { EnhancerSettings } from "../lib/types";
+import type { EnhancerSettings, VoiceStats } from "../lib/types";
 
 /**
  * Dedicated Audio view: the complete audio control panel.
@@ -141,6 +141,7 @@ export default function AudioView() {
           {audioSources.map((src) => {
             const ch = mixer.channels.find((c) => c.source_id === src.id);
             const level = mixer.meters[src.id] ?? 0;
+            const voice = mixer.voice[src.id];
             return (
               <div key={src.id} className="mixer-strip audio-strip">
                 <div className="mixer-name" title={src.id}>
@@ -190,6 +191,7 @@ export default function AudioView() {
                     style={{ width: `${Math.min(100, level * 100)}%` }}
                   />
                 </div>
+                {voice && <VoiceStatus voice={voice} enh={mixer.enhancer} />}
               </div>
             );
           })}
@@ -277,10 +279,37 @@ export default function AudioView() {
         </div>
         <div className="panel-body">
           <div className="note" style={{ marginBottom: 8 }}>
-            Free offline DSP — noise gate → 3-band EQ → compressor. No cloud, no keys.
+            Real-time voice chain on every mic / camera-audio source: AI noise removal → noise
+            gate → 3-band EQ → compressor. Runs on this PC (no internet, no added network
+            delay); changes are heard within one audio tick. Music / media files are left
+            untouched.
           </div>
           <div className={`mixer-strip ${enh.enabled ? "" : "disabled"}`}>
             <div className="mixer-row">
+              <span className="mixer-name">AI noise removal</span>
+              <button
+                className={enh.ai_denoise ? "icon-btn mute-on" : "icon-btn"}
+                onClick={() => setEnh({ ai_denoise: !enh.ai_denoise })}
+                title="RNNoise neural network: removes fans, hum, keyboard and room noise, keeps speech (20 ms latency)"
+              >
+                {enh.ai_denoise ? "ON" : "OFF"}
+              </button>
+            </div>
+            <div className="mixer-row">
+              <span className="note">Strength</span>
+              <input
+                type="range"
+                min={0}
+                max={1}
+                step={0.05}
+                value={enh.ai_strength}
+                disabled={!enh.ai_denoise}
+                onChange={(e) => setEnh({ ai_strength: parseFloat(e.target.value) })}
+                title="How much noise to remove (lower keeps more room ambience)"
+              />
+              <span className="value">{Math.round(enh.ai_strength * 100)}%</span>
+            </div>
+            <div className="mixer-row" style={{ marginTop: 8 }}>
               <span className="mixer-name">Noise gate</span>
               <button
                 className={enh.gate_enabled ? "icon-btn mute-on" : "icon-btn"}
@@ -355,6 +384,46 @@ export default function AudioView() {
           </div>
         </div>
       </div>
+    </div>
+  );
+}
+
+/** Live per-mic readout: device health, voice detection, processing. */
+function VoiceStatus({ voice, enh }: { voice: VoiceStats; enh: EnhancerSettings }) {
+  const deviceOk = voice.device === "running";
+  const talking = enh.enabled && enh.ai_denoise && voice.vad > 0.5;
+  const parts: string[] = [];
+  if (!deviceOk) parts.push(voice.device.startsWith("error") ? `⚠ ${voice.device}` : voice.device);
+  if (enh.enabled) {
+    if (enh.ai_denoise) parts.push(talking ? "🗣 voice" : "· quiet");
+    if (enh.gate_enabled && voice.gate_closed) parts.push("gate closed");
+    if (enh.compressor_enabled && voice.gain_reduction_db > 0.5)
+      parts.push(`comp −${voice.gain_reduction_db.toFixed(1)} dB`);
+    parts.push(`+${Math.round(voice.latency_ms)} ms`);
+  } else {
+    parts.push("enhancer bypassed");
+  }
+  parts.push(`buf ${Math.round(voice.buffered_ms)} ms`);
+  if (voice.underruns > 0) parts.push(`${voice.underruns} gaps`);
+  return (
+    <div
+      className="note"
+      title={`Voice activity ${(voice.vad * 100).toFixed(0)}% · enhancer CPU ${voice.process_us} µs/tick · dropped ${voice.dropped_frames} frames to stay live`}
+      style={{ display: "flex", gap: 8, flexWrap: "wrap", alignItems: "center" }}
+    >
+      {enh.enabled && enh.ai_denoise && (
+        <span
+          aria-label="voice activity"
+          style={{
+            width: 8,
+            height: 8,
+            borderRadius: 4,
+            background: talking ? "var(--accent, #3ddc84)" : "var(--muted, #555)",
+            display: "inline-block",
+          }}
+        />
+      )}
+      {parts.join(" · ")}
     </div>
   );
 }
