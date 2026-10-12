@@ -424,9 +424,10 @@ fn camera_reconfigure(
     width: u32,
     height: u32,
     fps: u32,
+    audio_device: Option<String>,
 ) -> CmdResult<String> {
     lock(&state)?
-        .camera_reconfigure(&source_id, device, width, height, fps)
+        .camera_reconfigure(&source_id, device, width, height, fps, audio_device)
         .map_err(ue)
 }
 

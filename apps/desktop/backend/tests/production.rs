@@ -624,7 +624,7 @@ fn camera_reconfigure_updates_kind_and_lists_sources() {
     assert_eq!(cams[0].id, id);
 
     let negotiated = s
-        .camera_reconfigure(&id, Some("FakeCam".to_string()), 1920, 1080, 60)
+        .camera_reconfigure(&id, Some("FakeCam".to_string()), 1920, 1080, 60, None)
         .expect("reconfigure");
     assert!(!negotiated.is_empty());
 
@@ -636,7 +636,7 @@ fn camera_reconfigure_updates_kind_and_lists_sources() {
 
     // Non-camera source must be rejected.
     let pat = add_pattern(&mut s, &scene, "Pat");
-    assert!(s.camera_reconfigure(&pat, None, 640, 480, 30).is_err());
+    assert!(s.camera_reconfigure(&pat, None, 640, 480, 30, None).is_err());
     // Unknown source must be rejected.
-    assert!(s.camera_reconfigure("nope", None, 640, 480, 30).is_err());
+    assert!(s.camera_reconfigure("nope", None, 640, 480, 30, None).is_err());
 }

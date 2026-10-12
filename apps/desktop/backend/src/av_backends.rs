@@ -219,12 +219,15 @@ impl FrameProducer for ProducerKind {
 
 impl ProducerKind {
     /// Next normalized audio chunk, if the producer has audio.
-    /// Camera sources have no audio capture in this MVP.
+    /// Cameras opened with an audio device (`open_with_audio`) deliver
+    /// it here; screen capture has no audio.
     fn next_audio(&mut self) -> Result<Option<sf_capture::media::DecodedAudio>, CaptureError> {
         match self {
             ProducerKind::Media(p) => p.next_audio(),
             #[cfg(windows)]
-            ProducerKind::Camera(_) => Ok(None),
+            ProducerKind::Camera(p) => p.next_audio(),
+            #[cfg(windows)]
+            ProducerKind::Screen(_) => Ok(None),
         }
     }
 }

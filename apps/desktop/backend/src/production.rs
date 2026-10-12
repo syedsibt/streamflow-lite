@@ -1589,27 +1589,27 @@ impl Shell {
         width: u32,
         height: u32,
         fps: u32,
+        audio_device: Option<String>,
     ) -> Result<String, ShellError> {
         let scene_idx = self
             .scenes
             .iter()
             .position(|sc| sc.sources.iter().any(|s| s.id == source_id))
             .ok_or_else(|| ShellError::UnknownSource(source_id.to_string()))?;
-        // Keep the existing audio device across reconfigure.
-        let existing_audio = {
+        // The caller passes the desired audio device (the Video panel's
+        // dropdown is the source of truth; "No audio" = None).
+        let existing_audio = audio_device;
+        {
             let src = self.scenes[scene_idx]
                 .sources
                 .iter()
                 .find(|s| s.id == source_id)
                 .expect("source exists");
-            match &src.kind {
-                SourceKind::Camera { audio_device, .. } => audio_device.clone(),
-                _ => {
-                    return Err(ShellError::InvalidSetting(format!(
-                        "source '{}' is not a camera source",
-                        src.name,
-                    )))
-                }
+            if !matches!(&src.kind, SourceKind::Camera { .. }) {
+                return Err(ShellError::InvalidSetting(format!(
+                    "source '{}' is not a camera source",
+                    src.name,
+                )));
             }
         };
         {

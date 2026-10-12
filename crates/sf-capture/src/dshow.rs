@@ -23,6 +23,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use ffmpeg_next as ff;
 
 use super::demux::{ensure_init, DemuxDecoder};
+use super::media;
 use super::{CaptureError, CapturedFrame, FrameProducer, StreamInfo};
 
 /// Log capture for [`list_devices`]: dshow reports devices via `av_log`,
@@ -455,7 +456,7 @@ impl DshowProducer {
         // Live capture: never accumulate a frame backlog (prevents
         // unbounded memory growth when the device outpaces the poll loop).
         demux.set_live(true);
-        let info = demux.stream_info(false);
+        let info = demux.stream_info(audio_device.is_some());
         // Compact single-line form for the UI badge, e.g.
         // "mjpeg 1920×1080@60fps" — what the camera actually gave.
         let mut negotiated_format = format!(
@@ -492,6 +493,21 @@ impl DshowProducer {
             .next()
             .ok_or_else(|| CaptureError::DeviceNotFound("no DirectShow cameras found".into()))?;
         Self::open(&first, width, height, fps)
+    }
+
+    /// Pull the next audio chunk when the producer was opened with an
+    /// audio device (`open_with_audio`). The demuxer normalizes to
+    /// 48 kHz stereo f32. `Ok(None)` = no audio device / nothing ready.
+    pub fn next_audio(&mut self) -> Result<Option<media::DecodedAudio>, CaptureError> {
+        match self.demux.next_audio()? {
+            Some(raw) => Ok(Some(media::DecodedAudio {
+                samples: raw.samples,
+                channels: 2,
+                sample_rate: 48_000,
+                pts_us: raw.pts_us,
+            })),
+            None => Ok(None),
+        }
     }
 }
 

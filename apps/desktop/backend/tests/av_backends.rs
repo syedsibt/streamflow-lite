@@ -264,13 +264,16 @@ fn source_audio_device_labels() {
         s.source_audio_device(&cam2),
         Some("Capture Card Audio".to_string())
     );
-    // Reconfigure keeps the camera's audio device.
-    s.camera_reconfigure(&cam2, None, 1280, 720, 30)
+    // Reconfigure with the same audio device keeps it; None clears it.
+    s.camera_reconfigure(&cam2, None, 1280, 720, 30, Some("Capture Card Audio".to_string()))
         .expect("reconfigure keeps audio device");
     assert_eq!(
         s.source_audio_device(&cam2),
         Some("Capture Card Audio".to_string())
     );
+    s.camera_reconfigure(&cam2, None, 1280, 720, 30, None)
+        .expect("reconfigure clears audio device");
+    assert_eq!(s.source_audio_device(&cam2), None);
     // Media source → None.
     let pat = s
         .source_add(

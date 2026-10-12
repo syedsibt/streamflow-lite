@@ -167,6 +167,7 @@ export const api = {
     width: number;
     height: number;
     fps: number;
+    audio_device: string | null;
   }) => cmd<string>("camera_reconfigure", args),
   cameraSources: () => cmd<CameraSourceInfo[]>("camera_sources", {}),
   videoSettingsGet: () => cmd<VideoSettings>("video_settings_get", {}),

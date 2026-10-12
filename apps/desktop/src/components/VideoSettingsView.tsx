@@ -49,19 +49,23 @@ export default function VideoSettingsView() {
   const [inDevice, setInDevice] = useState<string>("");
   const [inSize, setInSize] = useState<string>("1280x720");
   const [inFps, setInFps] = useState<number>(30);
+  const [inAudio, setInAudio] = useState<string>("");
+  const [audioDevs, setAudioDevs] = useState<string[]>([]);
   const [applying, setApplying] = useState(false);
   const [saving, setSaving] = useState(false);
 
   const refresh = useCallback(async () => {
     try {
-      const [s, cams, devs] = await Promise.all([
+      const [s, cams, devs, adevs] = await Promise.all([
         api.videoSettingsGet(),
         api.cameraSources(),
         api.listCameras(),
+        api.listAudioDevices().catch(() => [] as string[]),
       ]);
       setSettings(s);
       setCameras(cams);
       setDevices(devs);
+      setAudioDevs(adevs);
       setSelCamId((prev) => {
         if (prev && cams.some((c) => c.id === prev)) return prev;
         return cams[0]?.id ?? "";
@@ -82,10 +86,15 @@ export default function VideoSettingsView() {
       setInDevice(cam.device ?? "");
       setInSize(`${cam.width}x${cam.height}`);
       setInFps(cam.fps === 60 ? 60 : 30);
+      void api
+        .sourceAudioDevice(cam.id)
+        .then((d) => setInAudio(d ?? ""))
+        .catch(() => setInAudio(""));
     } else if (settings) {
       setInDevice(settings.camera_device ?? "");
       setInSize(`${settings.camera_width}x${settings.camera_height}`);
       setInFps(settings.camera_fps === 60 ? 60 : 30);
+      setInAudio("");
     }
   }, [selCamId, cameras, settings]);
 
@@ -103,6 +112,7 @@ export default function VideoSettingsView() {
         width: w,
         height: h,
         fps: inFps,
+        audio_device: inAudio || null,
       });
       toast(`Camera applied — negotiated: ${negotiated}`);
       await refresh();
@@ -192,6 +202,23 @@ export default function VideoSettingsView() {
                   {f} fps
                 </option>
               ))}
+            </select>
+
+            <label>Audio input</label>
+            <select
+              value={inAudio}
+              onChange={(e) => setInAudio(e.target.value)}
+              title="Capture audio together with this camera (optional)"
+            >
+              <option value="">No audio (video only)</option>
+              {audioDevs.map((d) => (
+                <option key={d} value={d}>
+                  {d}
+                </option>
+              ))}
+              {inAudio && !audioDevs.includes(inAudio) && (
+                <option value={inAudio}>{inAudio}</option>
+              )}
             </select>
           </div>
 
