@@ -220,6 +220,10 @@ fn parse_dshow_devices(buf: &str, kind_tag: &str) -> Vec<String> {
 ///
 /// A live source: [`next_frame`](FrameProducer::next_frame) returns
 /// `Ok(None)` when no frame is ready yet and never reports end-of-stream.
+// SAFETY: FFmpeg contexts have no thread affinity; the backend serializes
+// all producer access through the shell `Mutex`.
+unsafe impl Send for DshowProducer {}
+
 pub struct DshowProducer {
     demux: DemuxDecoder,
     info: StreamInfo,
