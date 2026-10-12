@@ -640,3 +640,39 @@ fn camera_reconfigure_updates_kind_and_lists_sources() {
     // Unknown source must be rejected.
     assert!(s.camera_reconfigure("nope", None, 640, 480, 30, None).is_err());
 }
+
+#[test]
+fn camera_auto_audio_attaches() {
+    let mut s = shell();
+    let scene = s.scene_create("S").id;
+    // No audio device passed → auto-attach attempts (None on this
+    // platform without DirectShow, but must not fail or mis-store).
+    let cam = s
+        .source_add(
+            &scene, "camera", "Cam", [0, 0, 0], None, None, None, None, 1280, 720, 30,
+        )
+        .expect("add camera")
+        .id;
+    assert_eq!(s.source_audio_device(&cam), s.auto_camera_audio(None));
+    // Explicit device is kept as-is (no override).
+    let cam2 = s
+        .source_add(
+            &scene,
+            "camera",
+            "Cam2",
+            [0, 0, 0],
+            None,
+            None,
+            None,
+            Some("Explicit Mic"),
+            1280,
+            720,
+            30,
+        )
+        .expect("add camera2")
+        .id;
+    assert_eq!(
+        s.source_audio_device(&cam2),
+        Some("Explicit Mic".to_string())
+    );
+}

@@ -17,6 +17,7 @@ import { create } from "zustand";
 import { api, isTauri, onSfEvent } from "./ipc";
 import { useStudio } from "./store";
 import type {
+  EnhancerSettings,
   MacroActionInput,
   ProductionStateData,
   SourceKind,
@@ -75,6 +76,7 @@ interface ProductionStore {
   setMasterGain: (gain: number) => void;
   setMasterMute: (mute: boolean) => Promise<void>;
   setMonitorEnabled: (enabled: boolean) => Promise<void>;
+  setEnhancerSettings: (settings: EnhancerSettings) => Promise<void>;
 
   // Stream
   setStreamUrl: (v: string) => void;
@@ -213,6 +215,27 @@ function normalizeProductionState(raw: unknown): ProductionStateData {
           ? (r.mixer.meters as Record<string, number>)
           : {},
       monitor_enabled: !!r.mixer?.monitor_enabled,
+      enhancer: {
+        enabled: !!r.mixer?.enhancer?.enabled,
+        gate_enabled: r.mixer?.enhancer?.gate_enabled !== false,
+        gate_threshold_db:
+          typeof r.mixer?.enhancer?.gate_threshold_db === "number"
+            ? r.mixer.enhancer.gate_threshold_db
+            : -40,
+        eq_low_db:
+          typeof r.mixer?.enhancer?.eq_low_db === "number"
+            ? r.mixer.enhancer.eq_low_db
+            : 0,
+        eq_mid_db:
+          typeof r.mixer?.enhancer?.eq_mid_db === "number"
+            ? r.mixer.enhancer.eq_mid_db
+            : 2,
+        eq_high_db:
+          typeof r.mixer?.enhancer?.eq_high_db === "number"
+            ? r.mixer.enhancer.eq_high_db
+            : 2,
+        compressor_enabled: r.mixer?.enhancer?.compressor_enabled !== false,
+      },
     },
     stream: {
       state: String(sl.state ?? "idle"),
@@ -587,6 +610,23 @@ export const useProduction = create<ProductionStore>()((set, get) => ({
       }
     } catch (e) {
       toast(`set_monitor_enabled failed: ${String(e)}`);
+      await get().refresh();
+    }
+  },
+
+  setEnhancerSettings: async (settings) => {
+    const { state } = get();
+    if (state) {
+      set({ state: { ...state, mixer: { ...state.mixer, enhancer: settings } } });
+    }
+    try {
+      const applied = await api.setEnhancerSettings(settings);
+      const cur = get().state;
+      if (cur) {
+        set({ state: { ...cur, mixer: { ...cur.mixer, enhancer: applied } } });
+      }
+    } catch (e) {
+      toast(`enhancer failed: ${String(e)}`);
       await get().refresh();
     }
   },

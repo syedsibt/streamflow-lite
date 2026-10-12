@@ -76,7 +76,6 @@ export default function SourcesPanel() {
   const [cameraDevice, setCameraDevice] = useState<string>("");
   const [cameraRes, setCameraRes] = useState<string>("720p");
   const [cameraFps, setCameraFps] = useState<string>("30");
-  const [cameraAudioDevice, setCameraAudioDevice] = useState<string>("");
   const [audioDevices, setAudioDevices] = useState<string[]>([]);
   const [audioDevice, setAudioDevice] = useState<string>("");
 
@@ -99,10 +98,9 @@ export default function SourcesPanel() {
     };
   }, [kind]);
 
-  // Load audio input devices when the audio_input OR camera kind is selected
-  // (cameras can capture audio alongside video).
+  // Load audio input devices when the audio_input kind is selected.
   useEffect(() => {
-    if (kind !== "audio_input" && kind !== "camera") return;
+    if (kind !== "audio_input") return;
     let cancelled = false;
     void api
       .listAudioDevices()
@@ -142,13 +140,14 @@ export default function SourcesPanel() {
         const res =
           CAMERA_RESOLUTIONS.find((r) => r.id === cameraRes) ??
           CAMERA_RESOLUTIONS[1];
+        // Audio auto-attaches on the backend (video in → audio in).
         return {
           camera: {
             device: cameraDevice || null,
             width: res.width,
             height: res.height,
             fps: cameraFps === "60" ? 60 : 30,
-            audio_device: cameraAudioDevice || null,
+            audio_device: null,
           },
         };
       }
@@ -352,18 +351,6 @@ export default function SourcesPanel() {
               >
                 <option value="30">30 fps</option>
                 <option value="60">60 fps</option>
-              </select>
-              <select
-                value={cameraAudioDevice}
-                onChange={(e) => setCameraAudioDevice(e.target.value)}
-                title="Camera audio input (optional) — captured with the video"
-              >
-                <option value="">No audio (video only)</option>
-                {audioDevices.map((d) => (
-                  <option key={d} value={d}>
-                    {d}
-                  </option>
-                ))}
               </select>
             </>
           )}

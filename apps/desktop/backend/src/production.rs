@@ -273,6 +273,21 @@ pub struct MixerView {
     pub meters: HashMap<String, f32>,
     /// True while local speaker monitoring is active.
     pub monitor_enabled: bool,
+    /// Audio enhancer (gate → EQ → compressor) settings.
+    pub enhancer: EnhancerView,
+}
+
+/// UI-facing audio-enhancer settings (mirror of
+/// `sf_audio::EnhancerSettings`; free offline DSP, no APIs).
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct EnhancerView {
+    pub enabled: bool,
+    pub gate_enabled: bool,
+    pub gate_threshold_db: f32,
+    pub eq_low_db: f32,
+    pub eq_mid_db: f32,
+    pub eq_high_db: f32,
+    pub compressor_enabled: bool,
 }
 
 // ---------------------------------------------------------------------------
@@ -841,6 +856,8 @@ impl Shell {
     /// `camera` | `screen` | `media` | `text`. Real kinds get an engine
     /// input and render through the real pipeline; pending kinds report
     /// `status: "pending"` and are skipped in the composite.
+    /// Adding a camera without an explicit audio device auto-attaches
+    /// audio (see `auto_camera_audio`).
     /// Lists available audio input devices (Windows DirectShow; empty elsewhere).
     pub fn list_audio_devices(&self) -> Vec<String> {
         #[cfg(windows)]
@@ -851,6 +868,26 @@ impl Shell {
         {
             Vec::new()
         }
+    }
+
+    /// Picks an audio device for a camera automatically: prefers one
+    /// whose name matches the camera/capture-card, else the first input.
+    /// Empty on platforms without audio capture.
+    pub fn auto_camera_audio(&self, camera_device: Option<&str>) -> Option<String> {
+        let devs = self.list_audio_devices();
+        if devs.is_empty() {
+            return None;
+        }
+        if let Some(cam) = camera_device {
+            let cam_l = cam.to_lowercase();
+            if let Some(m) = devs.iter().find(|d| {
+                let dl = d.to_lowercase();
+                dl.contains(&cam_l) || cam_l.contains(&dl)
+            }) {
+                return Some(m.clone());
+            }
+        }
+        devs.into_iter().next()
     }
 
     /// Lists available camera devices (Windows DirectShow; empty elsewhere).
@@ -879,7 +916,21 @@ impl Shell {
         height: u32,
         fps: u32,
     ) -> Result<SourceState, ShellError> {
-        let kind = parse_source_kind(kind, color, text, path, device, audio_device, width, height, fps)?;
+        let mut kind = parse_source_kind(kind, color, text, path, device, audio_device, width, height, fps)?;
+        // "Video input → audio auto input": a camera added without an
+        // explicit audio device automatically captures audio. Prefer an
+        // audio device matching the camera/capture-card name, else the
+        // first available input. No option to fiddle with — it just works.
+        if let SourceKind::Camera {
+            device: cam_dev,
+            audio_device: cam_audio,
+            ..
+        } = &mut kind
+        {
+            if cam_audio.is_none() {
+                *cam_audio = self.auto_camera_audio(cam_dev.as_deref());
+            }
+        }
         let id = Uuid::new_v4().to_string();
         // Open producers BEFORE the source is pushed, so a bad file or
         // missing camera fails cleanly without leaving a half-added source.
@@ -1253,6 +1304,7 @@ impl Shell {
                     })
                     .collect(),
                 monitor_enabled: self.audio_monitor.is_some(),
+                enhancer: self.enhancer_settings(),
             },
             stream_settings: self.stream_settings.clone(),
             stream_lifecycle: self.stream_lifecycle.clone(),

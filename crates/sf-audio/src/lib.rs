@@ -63,6 +63,9 @@
 
 use std::collections::HashMap;
 
+pub mod enhancer;
+pub use enhancer::{Enhancer, EnhancerSettings};
+
 /// Sample rate (Hz) every input must carry. Anything else is skipped for the
 /// block and counted in [`Mixer::dropped_blocks`].
 pub const TARGET_SAMPLE_RATE: u32 = 48_000;

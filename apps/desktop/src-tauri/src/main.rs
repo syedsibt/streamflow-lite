@@ -26,9 +26,9 @@ use std::time::Duration;
 use sf_filters::Filter;
 use sf_ipc::FilterTarget;
 use sf_ui_backend::{
-    AiResultView, CameraSourceInfo, ChannelStrip, EffectKindInfo, LookInfo, Macro, MacroAction,
-    MacroDispatchResult, ProdScene, ProductionStateView, Shell, ShellError, SlotView, SourceState,
-    TransitionView, UiEvent, VideoSettings,
+    AiResultView, CameraSourceInfo, ChannelStrip, EffectKindInfo, EnhancerView, LookInfo, Macro,
+    MacroAction, MacroDispatchResult, ProdScene, ProductionStateView, Shell, ShellError, SlotView,
+    SourceState, TransitionView, UiEvent, VideoSettings,
 };
 use tauri::{AppHandle, Emitter, Manager, State};
 
@@ -597,6 +597,14 @@ fn set_monitor_enabled(state: State<'_, AppState>, enabled: bool) -> CmdResult<b
     Ok(lock(&state)?.monitor_enabled())
 }
 
+/// Applies audio-enhancer settings (free offline DSP: gate → EQ → compressor).
+#[tauri::command(rename_all = "snake_case")]
+fn set_enhancer_settings(state: State<'_, AppState>, settings: EnhancerView) -> CmdResult<EnhancerView> {
+    let mut s = lock(&state)?;
+    s.set_enhancer_settings(settings);
+    Ok(s.enhancer_settings())
+}
+
 // ---------------------------------------------------------------------------
 // Production screens: streaming + recording (honest stubs)
 // ---------------------------------------------------------------------------
@@ -837,6 +845,7 @@ fn main() {
             mixer_set_master_gain,
             mixer_set_master_mute,
             set_monitor_enabled,
+            set_enhancer_settings,
             stream_set_settings,
             stream_start,
             stream_stop,

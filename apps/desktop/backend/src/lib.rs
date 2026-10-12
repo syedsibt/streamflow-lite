@@ -51,10 +51,10 @@ mod send_worker;
 /// Production state machine (scenes, sources, transitions, mixer, stream,
 /// record, macros) — all headless-testable, no tauri dependency.
 pub use production::{
-    transition_progress, CameraSourceInfo, ChannelStrip, Macro, MacroAction, MacroDispatchResult,
-    MixerView, ProdScene, ProductionStateView, RecordFormat, RecordLifecycle, RecordSettings,
-    SourceKind, SourceState, StreamLifecycle, StreamPlatform, StreamSettings, TransitionKind,
-    TransitionView, VideoSettings,
+    transition_progress, CameraSourceInfo, ChannelStrip, EnhancerView, Macro, MacroAction,
+    MacroDispatchResult, MixerView, ProdScene, ProductionStateView, RecordFormat, RecordLifecycle,
+    RecordSettings, SourceKind, SourceState, StreamLifecycle, StreamPlatform, StreamSettings,
+    TransitionKind, TransitionView, VideoSettings,
 };
 
 /// How often `preview_png` may re-render per input (spec has no preview rule;
@@ -488,6 +488,8 @@ pub struct Shell {
     text_cache: HashMap<(String, String, u32, u32), Vec<u8>>,
     /// Real audio mixer (sf-audio); fed by media-source audio chunks.
     audio_mixer: sf_audio::Mixer,
+    /// Free offline enhancer (gate → EQ → compressor) on the master mix.
+    audio_enhancer: sf_audio::Enhancer,
     /// Local speaker monitor (None = off). Opened on demand so a missing
     /// audio device can never break startup.
     audio_monitor: Option<audio_monitor::AudioMonitor>,
@@ -561,6 +563,7 @@ impl Shell {
             camera_formats: HashMap::new(),
             text_cache: HashMap::new(),
             audio_mixer: sf_audio::Mixer::new(),
+            audio_enhancer: sf_audio::Enhancer::new(48_000),
             audio_monitor: None,
             meter_values: HashMap::new(),
             meters_live: false,
@@ -616,6 +619,7 @@ impl Shell {
             camera_formats: HashMap::new(),
             text_cache: HashMap::new(),
             audio_mixer: sf_audio::Mixer::new(),
+            audio_enhancer: sf_audio::Enhancer::new(48_000),
             audio_monitor: None,
             meter_values: HashMap::new(),
             meters_live: false,

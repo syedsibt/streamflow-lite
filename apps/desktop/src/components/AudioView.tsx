@@ -2,6 +2,7 @@ import { useEffect, useMemo, useState } from "react";
 import { useProduction } from "../lib/productionStore";
 import { useStudio } from "../lib/store";
 import { api } from "../lib/ipc";
+import type { EnhancerSettings } from "../lib/types";
 
 /**
  * Dedicated Audio view: the complete audio control panel.
@@ -27,6 +28,7 @@ export default function AudioView() {
   const setMasterGain = useProduction((s) => s.setMasterGain);
   const setMasterMute = useProduction((s) => s.setMasterMute);
   const setMonitorEnabled = useProduction((s) => s.setMonitorEnabled);
+  const setEnhancerSettings = useProduction((s) => s.setEnhancerSettings);
 
   const [devices, setDevices] = useState<string[]>([]);
   const [device, setDevice] = useState<string>("");
@@ -116,6 +118,10 @@ export default function AudioView() {
     state?.scenes.find((sc) => sc.sources.some((s) => s.id === sourceId))?.id ?? null;
 
   if (!mixer) return null;
+
+  const enh: EnhancerSettings = mixer.enhancer;
+  const setEnh = (patch: Partial<EnhancerSettings>) =>
+    void setEnhancerSettings({ ...enh, ...patch });
 
   return (
     <div className="view audio-view">
@@ -245,6 +251,98 @@ export default function AudioView() {
               {mixer.monitor_enabled
                 ? "Monitoring the master mix on your speakers."
                 : "Speaker monitoring is off."}
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <div className="panel">
+        <div className="panel-head">
+          <span className="panel-title">Audio Enhancer</span>
+          <button
+            className={enh.enabled ? "icon-btn mute-on" : "icon-btn"}
+            onClick={() => setEnh({ enabled: !enh.enabled })}
+            title={enh.enabled ? "Bypass enhancer" : "Enable enhancer"}
+          >
+            {enh.enabled ? "ON" : "OFF"}
+          </button>
+        </div>
+        <div className="panel-body">
+          <div className="note" style={{ marginBottom: 8 }}>
+            Free offline DSP — noise gate → 3-band EQ → compressor. No cloud, no keys.
+          </div>
+          <div className={`mixer-strip ${enh.enabled ? "" : "disabled"}`}>
+            <div className="mixer-row">
+              <span className="mixer-name">Noise gate</span>
+              <button
+                className={enh.gate_enabled ? "icon-btn mute-on" : "icon-btn"}
+                onClick={() => setEnh({ gate_enabled: !enh.gate_enabled })}
+                title="Silence background hiss when nobody is speaking"
+              >
+                {enh.gate_enabled ? "ON" : "OFF"}
+              </button>
+            </div>
+            <div className="mixer-row">
+              <span className="note">Threshold</span>
+              <input
+                type="range"
+                min={-60}
+                max={0}
+                step={1}
+                value={enh.gate_threshold_db}
+                onChange={(e) => setEnh({ gate_threshold_db: parseFloat(e.target.value) })}
+                title="Gate threshold dB"
+              />
+              <span className="value">{Math.round(enh.gate_threshold_db)} dB</span>
+            </div>
+            <div className="mixer-row" style={{ marginTop: 8 }}>
+              <span className="mixer-name">EQ Low</span>
+              <input
+                type="range"
+                min={-12}
+                max={12}
+                step={0.5}
+                value={enh.eq_low_db}
+                onChange={(e) => setEnh({ eq_low_db: parseFloat(e.target.value) })}
+                title="Lowshelf 200 Hz"
+              />
+              <span className="value">{enh.eq_low_db.toFixed(1)} dB</span>
+            </div>
+            <div className="mixer-row">
+              <span className="mixer-name">EQ Mid</span>
+              <input
+                type="range"
+                min={-12}
+                max={12}
+                step={0.5}
+                value={enh.eq_mid_db}
+                onChange={(e) => setEnh({ eq_mid_db: parseFloat(e.target.value) })}
+                title="Peaking 1 kHz — voice clarity"
+              />
+              <span className="value">{enh.eq_mid_db.toFixed(1)} dB</span>
+            </div>
+            <div className="mixer-row">
+              <span className="mixer-name">EQ High</span>
+              <input
+                type="range"
+                min={-12}
+                max={12}
+                step={0.5}
+                value={enh.eq_high_db}
+                onChange={(e) => setEnh({ eq_high_db: parseFloat(e.target.value) })}
+                title="Highshelf 6 kHz"
+              />
+              <span className="value">{enh.eq_high_db.toFixed(1)} dB</span>
+            </div>
+            <div className="mixer-row" style={{ marginTop: 8 }}>
+              <span className="mixer-name">Compressor</span>
+              <button
+                className={enh.compressor_enabled ? "icon-btn mute-on" : "icon-btn"}
+                onClick={() => setEnh({ compressor_enabled: !enh.compressor_enabled })}
+                title="Gentle 3:1 levelling (−18 dB threshold)"
+              >
+                {enh.compressor_enabled ? "ON" : "OFF"}
+              </button>
             </div>
           </div>
         </div>

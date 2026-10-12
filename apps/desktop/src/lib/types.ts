@@ -293,12 +293,23 @@ export interface MixerChannelView {
   mute: boolean;
 }
 
+export interface EnhancerSettings {
+  enabled: boolean;
+  gate_enabled: boolean;
+  gate_threshold_db: number;
+  eq_low_db: number;
+  eq_mid_db: number;
+  eq_high_db: number;
+  compressor_enabled: boolean;
+}
+
 export interface MixerView {
   channels: MixerChannelView[];
   master: { gain: number; mute: boolean };
   meters_live: boolean;
   meters: Record<string, number>; // per-source peak, keyed by source id
   monitor_enabled: boolean;
+  enhancer: EnhancerSettings;
 }
 
 export interface StreamStateView {

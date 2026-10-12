@@ -54,7 +54,7 @@ use sf_output::{
     redact_url, ContainerFormat, RealTransport, ReconnectPolicy, Recorder, StreamTarget, Streamer,
 };
 
-use super::production::{transition_progress, RecordFormat, RecordRuntime, StreamLifecycle};
+use super::production::{transition_progress, EnhancerView, RecordFormat, RecordRuntime, StreamLifecycle};
 use crate::production::SourceKind;
 use super::{Shell, ShellError};
 use crate::production::crossfade;
@@ -480,6 +480,33 @@ impl Shell {
         self.audio_monitor.is_some()
     }
 
+    /// Current enhancer settings for the UI.
+    pub fn enhancer_settings(&self) -> EnhancerView {
+        let s = self.audio_enhancer.settings();
+        EnhancerView {
+            enabled: s.enabled,
+            gate_enabled: s.gate_enabled,
+            gate_threshold_db: s.gate_threshold_db,
+            eq_low_db: s.eq_low_db,
+            eq_mid_db: s.eq_mid_db,
+            eq_high_db: s.eq_high_db,
+            compressor_enabled: s.compressor_enabled,
+        }
+    }
+
+    /// Applies enhancer settings from the UI (clamped to sane ranges).
+    pub fn set_enhancer_settings(&mut self, v: EnhancerView) {
+        self.audio_enhancer.set_settings(sf_audio::EnhancerSettings {
+            enabled: v.enabled,
+            gate_enabled: v.gate_enabled,
+            gate_threshold_db: v.gate_threshold_db.clamp(-60.0, 0.0),
+            eq_low_db: v.eq_low_db.clamp(-12.0, 12.0),
+            eq_mid_db: v.eq_mid_db.clamp(-12.0, 12.0),
+            eq_high_db: v.eq_high_db.clamp(-12.0, 12.0),
+            compressor_enabled: v.compressor_enabled,
+        });
+    }
+
     /// True when any open media producer has an audio stream.
     fn has_audio_sources(&self) -> bool {
         if self
@@ -584,7 +611,10 @@ impl Shell {
         if !mixed.samples.is_empty() {
             self.meters_live = true;
         }
-        mixed.samples
+        let mut out = mixed.samples;
+        // Free offline enhancer (gate → EQ → compressor) on the master mix.
+        self.audio_enhancer.process(&mut out);
+        out
     }
 
     // ------------------------------------------------------------------
