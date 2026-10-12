@@ -466,8 +466,15 @@ impl Shell {
             .media_producers
             .get_mut(source_id)
             .ok_or_else(|| ShellError::UnknownSource(source_id.to_string()))?;
-        prod.set_paused(paused);
-        Ok(prod.is_paused())
+        match &mut prod.0 {
+            ProducerKind::Media(p) => {
+                p.set_paused(paused);
+                Ok(p.is_paused())
+            }
+            _ => Err(ShellError::Capture(
+                "pause is only available for media file sources".into(),
+            )),
+        }
     }
 
     /// Enable/disable local speaker monitoring of the master mix.
@@ -637,6 +644,23 @@ impl Shell {
 
     /// Raw RGBA program frame: live crossfade during an auto transition,
     /// otherwise the program scene composite. Mirrors `program_frame_png`.
+    /// Renders the preview scene at monitor size and caches it for the UI
+    /// monitors. Called by the media tick every tick so the preview
+    /// monitor stays as fresh as the program monitor without re-rendering
+    /// (and re-pulling cameras) on every UI poll — a major source of
+    /// perceived capture latency.
+    fn refresh_preview_monitor(&mut self) {
+        let preview_id = self.preview_scene_id.clone();
+        if preview_id == self.program_scene_id || preview_id.is_empty() {
+            return;
+        }
+        if let Ok(f) =
+            self.render_scene_frame(&preview_id, crate::MONITOR_W, crate::MONITOR_H)
+        {
+            self.set_preview_monitor_frame(f);
+        }
+    }
+
     pub(crate) fn program_frame_raw(
         &mut self,
         width: u32,
@@ -1212,6 +1236,8 @@ impl Shell {
             ) {
                 self.set_monitor_frame(f);
             }
+            // Keep the preview-scene monitor as fresh as the program one.
+            self.refresh_preview_monitor();
             self.perf_stages_us = [0, t.elapsed().as_micros() as u64, 0, 0];
             // Track perf even when idle so the panel shows live values.
             let tick_us = tick_start.elapsed().as_micros() as u64;
@@ -1257,6 +1283,8 @@ impl Shell {
         // Refresh the live program monitor from the frame this tick already
         // rendered (downscaled) — the UI serves this instead of re-rendering.
         self.set_monitor_frame(frame);
+        // Same for the preview-scene monitor.
+        self.refresh_preview_monitor();
         let tick_us = tick_start.elapsed().as_micros() as u64;
         self.perf_mark_tick(tick_us);
         self.perf_mark_frame();

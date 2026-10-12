@@ -114,7 +114,16 @@ impl Shell {
     /// fresh. The monitor commands serve this instead of re-rendering the
     /// scene (no mutex stall, no duplicate camera pull).
     pub(crate) fn monitor_jpeg(&self) -> Option<Vec<u8>> {
-        let m = self.monitor_frame.as_ref()?;
+        Self::monitor_frame_jpeg(&self.monitor_frame)
+    }
+
+    /// JPEG bytes for the live preview-scene monitor, when cached fresh.
+    pub(crate) fn preview_monitor_jpeg(&self) -> Option<Vec<u8>> {
+        Self::monitor_frame_jpeg(&self.preview_monitor_frame)
+    }
+
+    fn monitor_frame_jpeg(m: &Option<MonitorFrame>) -> Option<Vec<u8>> {
+        let m = m.as_ref()?;
         if m.at.elapsed() > MONITOR_FRESH {
             return None;
         }
@@ -127,6 +136,32 @@ impl Shell {
             82,
         )
         .ok()
+    }
+
+    /// Stores a preview-scene frame as the live monitor frame, downscaling
+    /// to monitor size when needed. Called by the media tick every tick.
+    pub(crate) fn set_preview_monitor_frame(&mut self, frame: Frame) {
+        let (pixels, w, h) = if frame.width == MONITOR_W && frame.height == MONITOR_H {
+            (frame.pixels, frame.width, frame.height)
+        } else {
+            (
+                downscale_bilinear(
+                    &frame.pixels,
+                    frame.width,
+                    frame.height,
+                    MONITOR_W,
+                    MONITOR_H,
+                ),
+                MONITOR_W,
+                MONITOR_H,
+            )
+        };
+        self.preview_monitor_frame = Some(MonitorFrame {
+            width: w,
+            height: h,
+            pixels,
+            at: Instant::now(),
+        });
     }
 }
 
@@ -443,6 +478,10 @@ pub struct Shell {
     /// of re-rendering the scene from scratch (which used to run at 2 Hz
     /// and stole the shell mutex from the media tick on every poll).
     monitor_frame: Option<MonitorFrame>,
+    /// Preview-scene monitor frame, refreshed by the media tick alongside
+    /// the program monitor. The UI serves this instead of re-rendering the
+    /// preview scene (and re-pulling cameras) on every poll.
+    preview_monitor_frame: Option<MonitorFrame>,
     // --- production state machine (see `production` module) ---
     /// Production scenes.
     scenes: Vec<production::ProdScene>,
@@ -544,6 +583,7 @@ impl Shell {
             last_frame: HashMap::new(),
             preview_cache: HashMap::new(),
             monitor_frame: None,
+            preview_monitor_frame: None,
             scenes: Vec::new(),
             preview_scene_id: String::new(),
             program_scene_id: String::new(),
@@ -600,6 +640,7 @@ impl Shell {
             last_frame: HashMap::new(),
             preview_cache: HashMap::new(),
             monitor_frame: None,
+            preview_monitor_frame: None,
             scenes: Vec::new(),
             preview_scene_id: String::new(),
             program_scene_id: String::new(),

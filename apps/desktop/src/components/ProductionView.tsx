@@ -30,7 +30,10 @@ export default function ProductionView() {
     void init();
     // Monitors at ~10 Hz: the program monitor is served from the media
     // tick's cached frame (no re-render), preview/multiview render on demand.
-    const t1 = setInterval(() => void pollMonitors(), 100);
+    // Monitors follow the media tick (~30fps): both program and preview
+    // are served from the tick's cached JPEGs, so polling faster than the
+    // tick only burns CPU. 33ms keeps perceived capture latency minimal.
+    const t1 = setInterval(() => void pollMonitors(), 33);
     const t2 = setInterval(() => void pollMultiview(), 2000);
     const t3 = setInterval(() => void refresh(), 2000);
     return () => {

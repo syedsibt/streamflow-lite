@@ -220,8 +220,6 @@ fn parse_dshow_devices(buf: &str, kind_tag: &str) -> Vec<String> {
 ///
 /// A live source: [`next_frame`](FrameProducer::next_frame) returns
 /// `Ok(None)` when no frame is ready yet and never reports end-of-stream.
-/// Reads are bounded by [`READ_TIMEOUT_US`]: if the device stalls, the
-/// interrupt callback aborts the read instead of blocking forever.
 pub struct DshowProducer {
     demux: DemuxDecoder,
     info: StreamInfo,
@@ -246,10 +244,11 @@ pub struct DshowProducer {
 }
 
 /// Max time to wait for a frame from a dshow device before giving up
-/// on that tick (25ms). The media tick runs every 33.3ms; a longer timeout
-/// would stall it. When no frame is ready the consumer repeats the last
+/// on that tick (10ms). The media tick runs every 33.3ms and must never
+/// wait on a live source — a longer timeout shows up directly as capture
+/// latency. When no frame is ready the consumer repeats the last
 /// frame (latest-frame-wins) and the next tick tries again.
-const READ_TIMEOUT_US: u64 = 25_000;
+const READ_TIMEOUT_US: u64 = 10_000;
 
 /// Timeout for drain reads after the first frame (3ms): packets already
 /// queued in dshow return instantly; an empty queue aborts almost at once

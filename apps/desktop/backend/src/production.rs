@@ -1246,6 +1246,14 @@ impl Shell {
                 return Ok(jpg);
             }
         }
+        // The preview scene monitor is refreshed by the media tick every
+        // tick — serve it from the cache instead of re-rendering (and
+        // re-pulling cameras) on every poll.
+        if scene_id == self.preview_scene_id {
+            if let Some(jpg) = self.preview_monitor_jpeg() {
+                return Ok(jpg);
+            }
+        }
         let frame = self.render_scene_frame(scene_id, crate::MONITOR_W, crate::MONITOR_H)?;
         crate::encode_jpeg(&frame, 82)
     }
