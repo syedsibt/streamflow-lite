@@ -329,7 +329,7 @@ mod tests {
                 "-v", "error", "-re",
                 "-f", "lavfi", "-i", "testsrc=size=320x240:rate=30",
                 "-c:v", codec, "-q:v", "5", "-g", "15", "-bf", "0",
-                "-f", "nut", &format!("tcp://127.0.0.1:{port}?listen=1"),
+                "-f", "nut", &format!("tcp://127.0.0.1:{port}?listen=1&tcp_nodelay=1"),
             ])
             .stdout(Stdio::null())
             .stderr(Stdio::null())
@@ -344,7 +344,9 @@ mod tests {
     fn open_live(port: u16) -> LiveVideo {
         // Let the sender start (process spawn + first PAT/PMT).
         std::thread::sleep(Duration::from_millis(600));
-        let url = format!("tcp://127.0.0.1:{port}");
+        // tcp_nodelay: without it Windows' delayed-ACK/Nagle interplay holds
+        // small frames back ~200 ms in the *test transport*.
+        let url = format!("tcp://127.0.0.1:{port}?tcp_nodelay=1");
         let (live, _codec) = LiveVideo::open(
             "test",
             Some("nut"),
@@ -385,11 +387,12 @@ mod tests {
             let advanced = f.pts_us - b;
             assert!(
                 advanced > 2_700_000,
-                "{codec}: after a 3 s stall the frame is only {advanced} µs newer — backlog!"
+                "{codec}: after a 3 s stall the frame is only {advanced} us newer (backlog?) stats {:?}",
+                live.stats()
             );
         }
         let age_ms = (crate::clock::now_us() - f.captured_at_us) / 1000;
-        assert!(age_ms < 150, "{codec}: frame is {age_ms} ms old");
+        assert!(age_ms < 150, "{codec}: frame is {age_ms} ms old, stats {:?}", live.stats());
         let st = live.stats();
         assert!(st.frames_dropped > 60, "{codec}: stale frames must be dropped, stats {st:?}");
         assert!(st.capture_fps > 20.0, "{codec}: capture fps {}", st.capture_fps);

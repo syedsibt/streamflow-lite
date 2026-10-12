@@ -8,6 +8,11 @@ use std::process::Command;
 
 use sf_ui_backend::{RecordLifecycle, Shell, StreamLifecycle};
 
+/// Platform temp path (Windows has no /tmp).
+fn tmp(name: &str) -> String {
+    std::env::temp_dir().join(name).to_string_lossy().into_owned()
+}
+
 fn shell() -> Shell {
     Shell::new().expect("headless engine must open (lavapipe)")
 }
@@ -57,7 +62,7 @@ fn scene_with_pattern(s: &mut Shell, name: &str) -> String {
 fn record_produces_real_mp4() {
     let mut s = shell();
     scene_with_pattern(&mut s, "Rec");
-    let out = "/tmp/sf-be-record.mp4";
+    let out = &tmp("sf-be-record.mp4");
     let _ = std::fs::remove_file(out);
     s.record_set_settings(out, "mp4", "High").unwrap();
     s.record_start().expect("record_start");
@@ -132,7 +137,9 @@ fn stream_start_unreachable_fails_cleanly_without_key_leak() {
     .expect("async start must not fail synchronously");
     // Poll the worker until it reports the (fast-failing) result.
     let mut lifecycle = s.production_state().stream_lifecycle;
-    for _ in 0..200 {
+    // Up to 20 s: Windows reports a refused localhost connection only after
+    // its SYN retries (~2 s per attempt).
+    for _ in 0..800 {
         s.stream_drain_worker();
         lifecycle = s.production_state().stream_lifecycle;
         if matches!(lifecycle, StreamLifecycle::Error { .. }) {
@@ -157,7 +164,7 @@ fn stream_start_unreachable_fails_cleanly_without_key_leak() {
 
 #[test]
 fn media_source_renders_and_meters_go_live() {
-    let media = "/tmp/sf-be-media.mp4";
+    let media = &tmp("sf-be-media.mp4");
     make_test_media(media);
     let mut s = shell();
     let sc = s.scene_create("Media").id;
@@ -193,7 +200,7 @@ fn media_source_bad_path_fails_cleanly() {
             "clip",
             [0, 0, 0],
             None,
-            Some("/tmp/does-not-exist.mp4"),
+            Some(tmp("does-not-exist.mp4").as_str()),
             None,
             None,
             0,
@@ -239,6 +246,7 @@ fn program_monitor_serves_live_jpeg_from_tick_cache() {
 }
 
 #[test]
+#[cfg_attr(windows, ignore = "adds fake device names; on Windows these open real DirectShow devices")]
 fn source_audio_device_labels() {
     let mut s = shell();
     let sc = s.scene_create("S").id;
@@ -366,11 +374,11 @@ fn free_port() -> u16 {
 #[test]
 fn stream_and_record_share_one_encoder_and_follow_wall_clock() {
     use std::time::{Duration, Instant};
-    let media = "/tmp/sf-e2e-media.mp4";
+    let media = &tmp("sf-e2e-media.mp4");
     make_test_media_len(media, 12, "1280x720");
     let port = free_port();
-    let received = format!("/tmp/sf-e2e-rtmp-{port}.flv");
-    let rec_path = "/tmp/sf-e2e-record.mp4";
+    let received = tmp(&format!("sf-e2e-rtmp-{port}.flv"));
+    let rec_path = &tmp("sf-e2e-record.mp4");
     let _ = std::fs::remove_file(&received);
     let _ = std::fs::remove_file(rec_path);
     let mut server = Command::new("ffmpeg")
@@ -528,7 +536,7 @@ fn latency_bench() {
     use std::time::{Duration, Instant};
     let secs: u64 = std::env::var("SF_BENCH_SECS").ok().and_then(|v| v.parse().ok()).unwrap_or(20);
     let enc = std::env::var("SF_BENCH_ENCODER").unwrap_or_else(|_| "libx264".into());
-    let media = "/tmp/sf-bench-media.mp4";
+    let media = &tmp("sf-bench-media.mp4");
     if !Path::new(media).exists() {
         make_test_media_len(media, 60, "1920x1080");
     }

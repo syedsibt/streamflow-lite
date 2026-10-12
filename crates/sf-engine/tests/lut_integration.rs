@@ -31,7 +31,7 @@ fn gen_lut_bin() -> PathBuf {
         .parent()
         .and_then(Path::parent)
         .expect("target/<profile>/deps layout")
-        .join("gen-lut")
+        .join(format!("gen-lut{}", std::env::consts::EXE_SUFFIX))
 }
 
 /// 64x64 RGBA gradient: r = x*4, g = y*4, b = (x+y)*2, a = 255.
