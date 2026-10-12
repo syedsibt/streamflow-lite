@@ -39,6 +39,9 @@ interface ProductionStore {
   recordFormat: string;
   recordQuality: string;
   recordError: string | null;
+  // Media playback pause state, keyed by source id (frontend mirror of
+  // the backend producer state; refresh() does not reset it).
+  mediaPaused: Record<string, boolean>;
 
   init: () => Promise<void>;
   dispose: () => void;
@@ -50,6 +53,7 @@ interface ProductionStore {
   sceneDelete: (scene_id: string) => Promise<void>;
   sceneDuplicate: (scene_id: string) => Promise<void>;
   sourceAdd: (scene_id: string, kind: SourceKind, name: string) => Promise<void>;
+  mediaSetPaused: (source_id: string, paused: boolean) => Promise<void>;
   sourceRemove: (scene_id: string, source_id: string) => Promise<void>;
   sourceReorder: (scene_id: string, order: string[]) => Promise<void>;
   sourceSetVisible: (
@@ -292,6 +296,7 @@ export const useProduction = create<ProductionStore>()((set, get) => ({
   recordFormat: "mp4",
   recordQuality: "high",
   recordError: null,
+  mediaPaused: {},
 
   init: async () => {
     if (!isTauri) return; // placeholder mode in plain browsers
@@ -447,6 +452,20 @@ export const useProduction = create<ProductionStore>()((set, get) => ({
     } catch (e) {
       toast(`source_set_visible failed: ${String(e)}`);
       await get().refresh();
+    }
+  },
+
+  mediaSetPaused: async (source_id, paused) => {
+    // Optimistic.
+    set((s) => ({ mediaPaused: { ...s.mediaPaused, [source_id]: paused } }));
+    try {
+      const actual = await api.mediaSetPaused(source_id, paused);
+      set((s) => ({ mediaPaused: { ...s.mediaPaused, [source_id]: actual } }));
+    } catch (e) {
+      toast(`media pause failed: ${String(e)}`);
+      set((s) => ({
+        mediaPaused: { ...s.mediaPaused, [source_id]: !paused },
+      }));
     }
   },
 

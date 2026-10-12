@@ -68,6 +68,42 @@ pub const AV_H: u32 = 360;
 /// See [`AV_W`].
 pub const AV_FRAME_US: i64 = 33_333;
 
+/// Hard timeout for DirectShow device opens. FFmpeg's interrupt callback
+/// is NOT consulted while DirectShow builds its COM filter graph, so a
+/// wedged driver (or a device held exclusive by another app) can block
+/// `avformat_open_input` forever — holding the shell Mutex and freezing
+/// the whole app ("Not Responding"). Opening on a dedicated thread bounds
+/// the damage: on timeout the thread is abandoned (it holds no shell
+/// locks) and the user gets a clean error instead of a dead app.
+const DEVICE_OPEN_TIMEOUT: Duration = Duration::from_secs(8);
+
+/// Runs a device `open` on a dedicated thread with a hard timeout.
+/// Also converts an FFmpeg panic into a clean error.
+fn open_device<T, F>(label: &str, open: F) -> Result<T, ShellError>
+where
+    T: Send + 'static,
+    F: FnOnce() -> Result<T, CaptureError> + Send + 'static,
+{
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::Builder::new()
+        .name(format!("sf-open-{label}"))
+        .spawn(move || {
+            let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(open));
+            let _ = tx.send(r);
+        })
+        .map_err(|e| ShellError::Capture(format!("{label}: cannot spawn open thread: {e}")))?;
+    match rx.recv_timeout(DEVICE_OPEN_TIMEOUT) {
+        Ok(Ok(Ok(prod))) => Ok(prod),
+        Ok(Ok(Err(e))) => Err(ShellError::Capture(format!("{label}: {e}"))),
+        Ok(Err(_)) => Err(ShellError::Capture(format!(
+            "{label}: the capture backend crashed while opening the device"
+        ))),
+        Err(_) => Err(ShellError::Capture(format!(
+            "{label}: timed out — the device is not responding (it may be in use by another app, or its driver is wedged)"
+        ))),
+    }
+}
+
 /// An active recording session: encoders + muxer + clocks.
 pub(crate) struct ActiveRecording {
     video_enc: VideoEncoder,
@@ -297,11 +333,11 @@ impl Shell {
         height: u32,
         fps: u32,
     ) -> Result<(), ShellError> {
-        // Guard against a panic in the FFmpeg/dshow open path taking down
-        // the whole app: convert it into a clean capture error instead.
+        // Timeout-guarded (see `open_device`): a wedged camera driver
+        // must never freeze the app.
         let device_owned = device.map(|d| d.to_string());
         let audio_owned = audio_device.map(|d| d.to_string());
-        let opened = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let prod: sf_capture::dshow::DshowProducer = open_device("camera", move || {
             match device_owned.as_deref() {
                 Some(d) => sf_capture::dshow::DshowProducer::open_with_audio(
                     d,
@@ -312,19 +348,7 @@ impl Shell {
                 ),
                 None => sf_capture::dshow::DshowProducer::open_default(width, height, fps),
             }
-        }));
-        let prod = match opened {
-            Ok(Ok(p)) => p,
-            Ok(Err(e)) => {
-                return Err(ShellError::Capture(format!("cannot open camera: {e}")))
-            }
-            Err(_) => {
-                return Err(ShellError::Capture(
-                    "cannot open camera: the capture backend crashed while opening the device"
-                        .into(),
-                ))
-            }
-        };
+        })?;
         // Remember what the camera actually negotiated (codec/res/fps) for
         // diagnostics — shown in the UI, not just what was requested.
         self.camera_formats
@@ -341,21 +365,9 @@ impl Shell {
     /// cleanly.
     #[cfg(windows)]
     pub(crate) fn open_screen_producer(&mut self, source_id: &str) -> Result<(), ShellError> {
-        let opened = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            sf_capture::gdigrab::ScreenProducer::open(30)
-        }));
-        let prod = match opened {
-            Ok(Ok(p)) => p,
-            Ok(Err(e)) => {
-                return Err(ShellError::Capture(format!("cannot open screen capture: {e}")))
-            }
-            Err(_) => {
-                return Err(ShellError::Capture(
-                    "cannot open screen capture: the capture backend crashed while opening the device"
-                        .into(),
-                ))
-            }
-        };
+        // Timeout-guarded like the other device opens (see `open_device`).
+        let prod: sf_capture::gdigrab::ScreenProducer =
+            open_device("screen capture", || sf_capture::gdigrab::ScreenProducer::open(30))?;
         self.media_producers.insert(
             source_id.to_string(),
             SendProducer(ProducerKind::Screen(prod)),
@@ -389,30 +401,20 @@ impl Shell {
     /// Opens a DirectShow audio-input producer (microphone/line-in,
     /// Windows only). Called from `source_add` before the source is
     /// pushed, so a missing device fails cleanly.
+    ///
+    /// The open runs on a timeout-guarded thread (see `open_device`): a
+    /// wedged audio driver must never freeze the app.
     #[cfg(windows)]
     pub(crate) fn open_audio_producer(
         &mut self,
         source_id: &str,
         device: Option<&str>,
     ) -> Result<(), ShellError> {
-        // Guard against a panic in the FFmpeg/dshow open path taking down
-        // the whole app: convert it into a clean capture error instead.
         let device_owned = device.map(|d| d.to_string());
-        let opened = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            sf_capture::audio_in::AudioInputProducer::open(device_owned.as_deref())
-        }));
-        let prod = match opened {
-            Ok(Ok(p)) => p,
-            Ok(Err(e)) => {
-                return Err(ShellError::Capture(format!("cannot open audio input: {e}")))
-            }
-            Err(_) => {
-                return Err(ShellError::Capture(
-                    "cannot open audio input: the capture backend crashed while opening the device"
-                        .into(),
-                ))
-            }
-        };
+        let prod: sf_capture::audio_in::AudioInputProducer =
+            open_device("audio input", move || {
+                sf_capture::audio_in::AudioInputProducer::open(device_owned.as_deref())
+            })?;
         self.audio_producers.insert(source_id.to_string(), prod);
         Ok(())
     }
@@ -454,6 +456,18 @@ impl Shell {
                 .get(source_id)
                 .map(|(_, _, px)| px.clone()),
         }
+    }
+
+    /// Pause/resume a media source's playback. While paused the video
+    /// freezes on the last frame and its audio goes silent. Returns the
+    /// new paused state.
+    pub fn media_set_paused(&mut self, source_id: &str, paused: bool) -> Result<bool, ShellError> {
+        let prod = self
+            .media_producers
+            .get_mut(source_id)
+            .ok_or_else(|| ShellError::UnknownSource(source_id.to_string()))?;
+        prod.set_paused(paused);
+        Ok(prod.is_paused())
     }
 
     /// Enable/disable local speaker monitoring of the master mix.

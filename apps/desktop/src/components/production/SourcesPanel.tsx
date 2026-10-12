@@ -66,6 +66,8 @@ export default function SourcesPanel() {
   const sourceRemove = useProduction((s) => s.sourceRemove);
   const sourceReorder = useProduction((s) => s.sourceReorder);
   const sourceSetVisible = useProduction((s) => s.sourceSetVisible);
+  const mediaPaused = useProduction((s) => s.mediaPaused);
+  const mediaSetPaused = useProduction((s) => s.mediaSetPaused);
 
   const [kind, setKind] = useState<KindKey>("test_pattern");
   const [name, setName] = useState("");
@@ -233,6 +235,17 @@ export default function SourcesPanel() {
               </button>
               <span className="source-name">{src.name}</span>
               {src.kind === "camera" && <CameraFormatBadge sourceId={src.id} />}
+              {src.kind === "media" && (
+                <button
+                  className="icon-btn"
+                  title={mediaPaused[src.id] ? "Play" : "Pause"}
+                  onClick={() =>
+                    void mediaSetPaused(src.id, !mediaPaused[src.id])
+                  }
+                >
+                  {mediaPaused[src.id] ? "▶" : "⏸"}
+                </button>
+              )}
               {isPendingCaptureSource(src) && (
                 <span className="pending-badge" title="This source kind has no capture backend yet">
                   pending capture backend

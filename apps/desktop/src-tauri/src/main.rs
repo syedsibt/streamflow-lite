@@ -414,6 +414,18 @@ fn video_settings_set(state: State<'_, AppState>, settings: VideoSettings) -> Cm
     lock(&state)?.video_settings_set(settings).map_err(ue)
 }
 
+/// Pauses/resumes a media source's playback; returns the new paused state.
+#[tauri::command(rename_all = "snake_case")]
+fn media_set_paused(
+    state: State<'_, AppState>,
+    source_id: String,
+    paused: bool,
+) -> CmdResult<bool> {
+    lock(&state)?
+        .media_set_paused(&source_id, paused)
+        .map_err(ue)
+}
+
 /// Reconfigures a camera source live (device/resolution/fps) and returns
 /// what the camera actually negotiated.
 #[tauri::command(rename_all = "snake_case")]
@@ -828,6 +840,7 @@ fn main() {
             camera_reconfigure,
             camera_sources,
             list_audio_devices,
+            media_set_paused,
             perf_stats,
             perf_stages,
             stream_encoder_name,

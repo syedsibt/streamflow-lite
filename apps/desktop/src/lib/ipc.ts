@@ -185,6 +185,9 @@ export const api = {
   sourceSetVisible: (scene_id: string, source_id: string, visible: boolean) =>
     cmd<void>("source_set_visible", { scene_id, source_id, visible }),
 
+  mediaSetPaused: (source_id: string, paused: boolean) =>
+    cmd<boolean>("media_set_paused", { source_id, paused }),
+
   productionState: () => cmd<unknown>("production_state"),
   productionSetPreview: (scene_id: string) =>
     cmd<void>("production_set_preview", { scene_id }),

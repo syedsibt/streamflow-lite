@@ -16,7 +16,9 @@ import type { EnhancerSettings } from "../lib/types";
  * until actual audio flows — never faked.
  */
 
-const AUDIO_KINDS = new Set(["audio_input", "camera", "media"]);
+/// Backend serializes kinds externally-tagged ("AudioInput" -> "audioinput"
+/// after lowercase; "Camera" -> "camera", "Media" -> "media").
+const AUDIO_KINDS = new Set(["audioinput", "camera", "media"]);
 
 export default function AudioView() {
   const state = useProduction((s) => s.state);
@@ -143,7 +145,13 @@ export default function AudioView() {
               <div key={src.id} className="mixer-strip audio-strip">
                 <div className="mixer-name" title={src.id}>
                   {src.name}
-                  <span className="kind-tag">{src.kind}</span>
+                  <span className="kind-tag">
+                    {src.kind === "audioinput"
+                      ? "mic"
+                      : src.kind === "camera"
+                        ? "camera"
+                        : "media"}
+                  </span>
                 </div>
                 {devLabels[src.id] && (
                   <div className="note" title="Audio device">
