@@ -335,17 +335,18 @@ impl Shell {
     ) -> Result<(), ShellError> {
         // Timeout-guarded (see `open_device`): a wedged camera driver
         // must never freeze the app.
+        //
+        // Video and audio open as SEPARATE dshow graphs (like OBS's
+        // separate video/audio sources). A combined `video=X:audio=Y`
+        // context lets the audio packet flood starve video packets in the
+        // drain loop — the capture delay then grows without bound (the
+        // "one minute late" bug).
         let device_owned = device.map(|d| d.to_string());
         let audio_owned = audio_device.map(|d| d.to_string());
         let prod: sf_capture::dshow::DshowProducer = open_device("camera", move || {
             match device_owned.as_deref() {
-                Some(d) => sf_capture::dshow::DshowProducer::open_with_audio(
-                    d,
-                    audio_owned.as_deref(),
-                    width,
-                    height,
-                    fps,
-                ),
+                // Video-only; audio (if any) gets its own graph below.
+                Some(d) => sf_capture::dshow::DshowProducer::open(d, width, height, fps),
                 None => sf_capture::dshow::DshowProducer::open_default(width, height, fps),
             }
         })?;
@@ -357,6 +358,18 @@ impl Shell {
             source_id.to_string(),
             SendProducer(ProducerKind::Camera(prod)),
         );
+        // Separate audio graph (OBS parity): never share the video's dshow
+        // context.
+        if let Some(a) = audio_owned {
+            if !a.is_empty() {
+                let audio_prod: sf_capture::audio_in::AudioInputProducer =
+                    open_device("camera audio", move || {
+                        sf_capture::audio_in::AudioInputProducer::open(Some(a.as_str()))
+                    })?;
+                self.audio_producers
+                    .insert(source_id.to_string(), audio_prod);
+            }
+        }
         Ok(())
     }
 
