@@ -69,6 +69,13 @@ jobs:
           $passed = ($results | ForEach-Object { if ($_ -match '(\d+) passed') { [int]$Matches[1] } else { 0 } } | Measure-Object -Sum).Sum
           Write-Host "::notice title=cargo test summary::exit $code; $passed passed; $($failed.Count) failed/error lines"
           $failed | Select-Object -First 9 | ForEach-Object { Write-Host "::warning title=cargo test::$_" }
+          # Panic messages (the line after "panicked at"), skipping the
+          # expected no-GPU failures, as notices.
+          $lines = Get-Content test.log
+          $msgs = for ($i = 0; $i -lt $lines.Count - 1; $i++) {
+            if ($lines[$i] -match "panicked at") { "$($lines[$i]) -> $($lines[$i + 1])" }
+          }
+          $msgs | Where-Object { $_ -notmatch "adapter|GPU|lavapipe|headless engine" } | Select-Object -First 9 | ForEach-Object { Write-Host "::notice title=panic::$_" }
           Get-Content test.log -Tail 40
           exit $code
         continue-on-error: true
