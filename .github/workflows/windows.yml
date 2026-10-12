@@ -58,8 +58,19 @@ jobs:
           Get-ChildItem "C:\ffmpeg\lib\avcodec.lib"
 
       - name: Cargo test (workspace)
-        run: cargo test --workspace
         # GPU tests need a real GPU; the runner has none. Non-blocking.
+        # Results are surfaced as annotations (visible on the run page and
+        # via the API) so failures are visible without downloading logs.
+        run: |
+          cmd /c "cargo test --workspace --no-fail-fast > test.log 2>&1"
+          $code = $LASTEXITCODE
+          $results = Select-String -Path test.log -Pattern '^test result:' | ForEach-Object { $_.Line }
+          $failed = @(Select-String -Path test.log -Pattern '^test .* FAILED$|^error(\[|:)' | ForEach-Object { $_.Line })
+          $passed = ($results | ForEach-Object { if ($_ -match '(\d+) passed') { [int]$Matches[1] } else { 0 } } | Measure-Object -Sum).Sum
+          Write-Host "::notice title=cargo test summary::exit $code; $passed passed; $($failed.Count) failed/error lines"
+          $failed | Select-Object -First 9 | ForEach-Object { Write-Host "::warning title=cargo test::$_" }
+          Get-Content test.log -Tail 40
+          exit $code
         continue-on-error: true
 
       - name: Stage FFmpeg DLLs + wire into bundle
