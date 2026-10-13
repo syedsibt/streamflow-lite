@@ -427,6 +427,7 @@ fn stream_and_record_share_one_encoder_and_follow_wall_clock() {
     let mut next = start;
     let mut live_at: Option<Instant> = None;
     let mut rec_started = false;
+    let mut rec_at: Option<Instant> = None;
     let mut ticks = 0u32;
     let mut lagged = 0u64;
     let mut stalled = false;
@@ -448,6 +449,7 @@ fn stream_and_record_share_one_encoder_and_follow_wall_clock() {
             }
             if !rec_started && live_elapsed > Duration::from_secs(2) {
                 rec_started = true;
+                rec_at = Some(next);
                 s.record_start().expect("record_start while streaming");
             }
         }
@@ -466,7 +468,8 @@ fn stream_and_record_share_one_encoder_and_follow_wall_clock() {
     }
     let live_at = live_at.expect("stream never went live");
     let wall_live = next.duration_since(live_at).as_secs_f64();
-    let rec_wall = wall_live - 2.0;
+    // Media time the recording covers: from the tick it joined to the end.
+    let rec_wall = next.duration_since(rec_at.expect("recording started")).as_secs_f64();
     let diag = s.diagnostics();
     eprintln!(
         "e2e: ticks={ticks} lagged={lagged} encoder={:?} render_fps={} stages ms: capture={:.1} render={:.1} gpu={:.1} audio={:.1} encode={:.1} latency={:?}",

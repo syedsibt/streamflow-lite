@@ -326,9 +326,14 @@ mod tests {
         // NUT over TCP (the sender listens; we connect like opening a device).
         Command::new("ffmpeg")
             .args([
-                "-v", "error", "-re",
+                // Strict real-time pacing: no initial burst (FFmpeg 6.1's
+                // default sends the first 0.5 s at once — frames "before
+                // their time", which no physical device can do), and no
+                // x264 lookahead.
+                "-v", "error", "-re", "-readrate_initial_burst", "0",
                 "-f", "lavfi", "-i", "testsrc=size=320x240:rate=30",
                 "-c:v", codec, "-q:v", "5", "-g", "15", "-bf", "0",
+                "-tune", "zerolatency",
                 "-f", "nut", &format!("tcp://127.0.0.1:{port}?listen=1&tcp_nodelay=1"),
             ])
             .stdout(Stdio::null())
