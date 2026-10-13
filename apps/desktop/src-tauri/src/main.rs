@@ -37,10 +37,21 @@ struct AppState(Mutex<Shell>);
 type CmdResult<T> = Result<T, String>;
 
 fn lock<'a>(state: &'a State<'a, AppState>) -> CmdResult<std::sync::MutexGuard<'a, Shell>> {
-    state
-        .0
-        .lock()
-        .map_err(|e| format!("shell lock poisoned: {e}"))
+    Ok(lock_shell(&state.0))
+}
+
+/// Locks the engine, recovering from poisoning: a panic in one command (it
+/// is recorded and shown in Diagnostics) must not take every later command
+/// down with "shell lock poisoned".
+fn lock_shell(m: &std::sync::Mutex<Shell>) -> std::sync::MutexGuard<'_, Shell> {
+    match m.lock() {
+        Ok(g) => g,
+        Err(poisoned) => {
+            sf_ui_backend::health::record("engine lock was poisoned by an earlier panic; recovered");
+            m.clear_poison();
+            poisoned.into_inner()
+        }
+    }
 }
 
 fn ue(e: ShellError) -> String {
@@ -859,6 +870,13 @@ fn main() {
             Shell::new().expect("engine must open a GPU adapter (headless: lavapipe)"),
         )))
         .setup(|app| {
+            // Record every panic (Diagnostics shows the last one; the log
+            // is in the app's log folder) — never a silent dead engine.
+            let log = app.path().app_log_dir().ok().map(|d| {
+                let _ = std::fs::create_dir_all(&d);
+                d.join("streamflow-errors.log")
+            });
+            sf_ui_backend::health::install_panic_hook(log);
             // Media pipeline: master tick at the Video panel's output fps
             // (30 → 33.3 ms, 60 → 16.7 ms). Renders one program frame and
             // advances record/stream encoders. Runs on its own thread so UI
@@ -882,18 +900,18 @@ fn main() {
                         // and the audio block length follow the wall clock
                         // even when a tick runs late.
                         let scheduled = sf_ui_backend::media_clock_us(next_deadline);
-                        let interval_us =
-                            if let Ok(mut s) = media_handle.state::<AppState>().0.lock() {
-                                if missed_pending > 0 {
-                                    s.perf_mark_lagged(missed_pending);
-                                    missed_pending = 0;
-                                }
-                                // Never panics; failures degrade to Error states.
-                                s.av_tick_at(scheduled);
-                                s.frame_interval_us()
-                            } else {
-                                33_333
-                            };
+                        let interval_us = {
+                            let mut s = lock_shell(&media_handle.state::<AppState>().0);
+                            if missed_pending > 0 {
+                                s.perf_mark_lagged(missed_pending);
+                                missed_pending = 0;
+                            }
+                            // A panic inside one tick is contained (and
+                            // recorded) while the lock is held, so it never
+                            // poisons the engine or kills this thread.
+                            let _ = sf_ui_backend::health::contain(|| s.av_tick_at(scheduled));
+                            s.frame_interval_us()
+                        };
                         let interval_us = interval_us.max(1);
                         let interval = Duration::from_micros(interval_us);
                         next_deadline += interval;
@@ -918,19 +936,18 @@ fn main() {
             let handle = app.handle().clone();
             std::thread::spawn(move || loop {
                 std::thread::sleep(Duration::from_millis(66));
-                let events = handle
-                    .state::<AppState>()
-                    .0
-                    .lock()
-                    .map(|mut s| {
-                        // Wall-clock transition progress; emits
-                        // `production.transition_progress` / `transition_done`.
-                        // AV work lives on the media thread above — this loop
-                        // only owns UI-facing state.
+                let events = {
+                    let mut s = lock_shell(&handle.state::<AppState>().0);
+                    // Wall-clock transition progress; emits
+                    // `production.transition_progress` / `transition_done`.
+                    // AV work lives on the media thread above — this loop
+                    // only owns UI-facing state.
+                    sf_ui_backend::health::contain(|| {
                         s.transition_tick();
                         s.drain_events()
                     })
-                    .unwrap_or_default();
+                    .unwrap_or_default()
+                };
                 for e in &events {
                     forward(&handle, e);
                 }

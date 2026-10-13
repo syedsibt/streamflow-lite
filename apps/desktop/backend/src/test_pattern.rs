@@ -30,7 +30,7 @@ impl TestPatternCache {
     /// The test signal at `w`×`h` for wall-clock time `now` and output
     /// frame rate `fps`.
     pub(crate) fn frame(&mut self, w: u32, h: u32, fps: u32, now: SystemTime) -> Vec<u8> {
-        let (w, h) = (w.max(16), h.max(16));
+        let (w, h) = (w.max(1), h.max(1));
         let base = match &self.base {
             Some((bw, bh, px)) if *bw == w && *bh == h => px.clone(),
             _ => {
@@ -420,6 +420,14 @@ mod tests {
         // Same time → identical frame (deterministic, no hidden state).
         let a2 = c.frame(w, h, 30, UNIX_EPOCH + Duration::from_millis(100));
         assert_eq!(a, a2);
+    }
+
+    #[test]
+    fn any_size_returns_exact_buffer() {
+        let mut c = TestPatternCache::default();
+        for (w, h) in [(1, 1), (3, 2), (15, 9), (17, 1), (1, 40)] {
+            assert_eq!(c.frame(w, h, 30, SystemTime::now()).len(), (w * h * 4) as usize);
+        }
     }
 
     #[test]

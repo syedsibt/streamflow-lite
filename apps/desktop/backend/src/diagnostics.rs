@@ -16,141 +16,9 @@ use serde::Serialize;
 use crate::production::{SourceKind, StreamLifecycle};
 use crate::Shell;
 
-/// Real process CPU / memory sampling.
-pub(crate) struct SysSampler {
-    last_wall: std::time::Instant,
-    last_cpu_s: f64,
-    last: SysStats,
-    cores: usize,
-}
-
-#[derive(Clone, Copy, Debug, Default, Serialize)]
-pub struct SysStats {
-    /// Process CPU, % of the whole machine (all cores = 100 %).
-    pub cpu_percent: f32,
-    /// Resident memory, MB.
-    pub ram_mb: f32,
-    /// Logical cores.
-    pub cores: usize,
-}
-
-impl SysSampler {
-    pub(crate) fn new() -> Self {
-        Self {
-            last_wall: std::time::Instant::now(),
-            last_cpu_s: process_cpu_seconds().unwrap_or(0.0),
-            last: SysStats::default(),
-            cores: std::thread::available_parallelism()
-                .map(|n| n.get())
-                .unwrap_or(1),
-        }
-    }
-
-    /// Current stats; re-measured at most every 500 ms.
-    pub(crate) fn sample(&mut self) -> SysStats {
-        let now = std::time::Instant::now();
-        let dt = now.duration_since(self.last_wall).as_secs_f64();
-        if dt >= 0.5 {
-            if let Some(cpu) = process_cpu_seconds() {
-                let pct = (cpu - self.last_cpu_s) / (dt * self.cores as f64) * 100.0;
-                self.last.cpu_percent = pct.clamp(0.0, 100.0) as f32;
-                self.last_cpu_s = cpu;
-            }
-            self.last.ram_mb = process_rss_bytes().unwrap_or(0) as f32 / (1024.0 * 1024.0);
-            self.last.cores = self.cores;
-            self.last_wall = now;
-        }
-        self.last
-    }
-}
-
-#[cfg(target_os = "linux")]
-fn process_cpu_seconds() -> Option<f64> {
-    let stat = std::fs::read_to_string("/proc/self/stat").ok()?;
-    // Fields after the parenthesised comm; utime/stime are fields 14/15.
-    let rest = &stat[stat.rfind(')')? + 2..];
-    let f: Vec<&str> = rest.split_whitespace().collect();
-    let utime: f64 = f.get(11)?.parse().ok()?;
-    let stime: f64 = f.get(12)?.parse().ok()?;
-    Some((utime + stime) / 100.0) // USER_HZ is 100 on Linux
-}
-
-#[cfg(target_os = "linux")]
-fn process_rss_bytes() -> Option<u64> {
-    let statm = std::fs::read_to_string("/proc/self/statm").ok()?;
-    let pages: u64 = statm.split_whitespace().nth(1)?.parse().ok()?;
-    Some(pages * 4096)
-}
-
-#[cfg(windows)]
-mod win {
-    #[repr(C)]
-    #[derive(Default, Clone, Copy)]
-    pub struct FileTime {
-        pub low: u32,
-        pub high: u32,
-    }
-    #[repr(C)]
-    #[derive(Default)]
-    pub struct ProcessMemoryCounters {
-        pub cb: u32,
-        pub page_fault_count: u32,
-        pub peak_working_set_size: usize,
-        pub working_set_size: usize,
-        pub quota_peak_paged_pool_usage: usize,
-        pub quota_paged_pool_usage: usize,
-        pub quota_peak_non_paged_pool_usage: usize,
-        pub quota_non_paged_pool_usage: usize,
-        pub pagefile_usage: usize,
-        pub peak_pagefile_usage: usize,
-    }
-    #[link(name = "kernel32")]
-    extern "system" {
-        pub fn GetCurrentProcess() -> isize;
-        pub fn GetProcessTimes(
-            h: isize,
-            creation: *mut FileTime,
-            exit: *mut FileTime,
-            kernel: *mut FileTime,
-            user: *mut FileTime,
-        ) -> i32;
-        pub fn K32GetProcessMemoryInfo(h: isize, c: *mut ProcessMemoryCounters, cb: u32) -> i32;
-    }
-}
-
-#[cfg(windows)]
-fn process_cpu_seconds() -> Option<f64> {
-    let (mut c, mut e, mut k, mut u) = Default::default();
-    // SAFETY: plain Win32 call on the current-process pseudo handle with
-    // valid out-pointers.
-    let ok = unsafe { win::GetProcessTimes(win::GetCurrentProcess(), &mut c, &mut e, &mut k, &mut u) };
-    if ok == 0 {
-        return None;
-    }
-    let t = |f: win::FileTime| ((f.high as u64) << 32 | f.low as u64) as f64 / 1e7;
-    Some(t(k) + t(u))
-}
-
-#[cfg(windows)]
-fn process_rss_bytes() -> Option<u64> {
-    let mut pmc = win::ProcessMemoryCounters {
-        cb: std::mem::size_of::<win::ProcessMemoryCounters>() as u32,
-        ..Default::default()
-    };
-    // SAFETY: `pmc.cb` is set to the struct size as the API requires.
-    let ok = unsafe { win::K32GetProcessMemoryInfo(win::GetCurrentProcess(), &mut pmc, pmc.cb) };
-    (ok != 0).then_some(pmc.working_set_size as u64)
-}
-
-#[cfg(not(any(windows, target_os = "linux")))]
-fn process_cpu_seconds() -> Option<f64> {
-    None
-}
-
-#[cfg(not(any(windows, target_os = "linux")))]
-fn process_rss_bytes() -> Option<u64> {
-    None
-}
+pub use crate::sysmon::SysStats;
+#[cfg(test)]
+use crate::sysmon::{process_cpu_seconds, SysSampler};
 
 /// One video source.
 #[derive(Clone, Debug, Serialize)]
@@ -257,11 +125,21 @@ pub struct DiagnosticsView {
     pub av_auto: bool,
     pub av_offset_ms: i32,
     pub system: SysStats,
+    /// Contained panics / recovered failures since start, and the last one.
+    pub internal_errors: u64,
+    pub last_internal_error: Option<String>,
+    /// GPU validation/runtime errors since start, the last one, and the
+    /// adapter in use (a `Cpu` type = software rendering).
+    pub gpu_errors: u64,
+    pub last_gpu_error: Option<String>,
+    pub gpu_adapter: Option<String>,
 }
 
 impl Shell {
     /// Full diagnostics snapshot (cheap: reads counters, renders nothing).
     pub fn diagnostics(&mut self) -> DiagnosticsView {
+        let (internal_errors, last_internal_error) = crate::health::status();
+        let (gpu_errors, last_gpu_error, gpu_adapter) = sf_engine::gpu_status();
         let now = std::time::Instant::now();
         let (render_fps, ..) = {
             let cutoff = now - std::time::Duration::from_secs(1);
@@ -404,7 +282,12 @@ impl Shell {
             color_active: self.program_color_active(),
             av_auto: self.av_sync.auto,
             av_offset_ms: self.av_sync.offset_ms,
-            system: self.sys.sample(),
+            system: self.sys.latest(),
+            internal_errors,
+            last_internal_error,
+            gpu_errors,
+            last_gpu_error,
+            gpu_adapter,
         }
     }
 
@@ -451,5 +334,11 @@ mod tests {
         eprintln!("{st:?} raw={:?}", process_cpu_seconds());
         assert!(st.cpu_percent > 5.0, "{st:?}");
         assert!(st.ram_mb > 1.0);
+        #[cfg(target_os = "linux")]
+        {
+            assert!(st.system_cpu_percent.is_some(), "{st:?}");
+            assert!(st.mem_total_mb.unwrap_or(0.0) > st.mem_used_mb.unwrap_or(0.0));
+            assert!(st.gpu_percent.is_none() && st.gpu_note.is_some(), "no fake GPU value");
+        }
     }
 }

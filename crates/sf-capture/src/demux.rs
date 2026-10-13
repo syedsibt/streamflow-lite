@@ -86,7 +86,7 @@ pub(crate) struct DemuxDecoder {
     video_decoder: ff::decoder::Video,
     audio_decoder: Option<ff::decoder::Audio>,
     scaler: ff::software::scaling::Context,
-    resampler: Option<ff::software::resampling::Context>,
+    resampler: Option<super::audio_norm::AudioNormalizer>,
     video_tb: (i32, i32),
     audio_tb: (i32, i32),
     video_queue: VecDeque<CapturedFrame>,
@@ -185,19 +185,7 @@ impl DemuxDecoder {
                     .decoder()
                     .audio()
                     .map_err(|e| CaptureError::OpenFailed(format!("audio decoder open: {e}")))?;
-                // Normalize: some decoders need an explicit channel layout.
-                if dec.channel_layout().channels() == 0 {
-                    let _ = dec.set_channel_layout(ff::channel_layout::ChannelLayout::STEREO);
-                }
-                let rs = ff::software::resampling::Context::get(
-                    dec.format(),
-                    dec.channel_layout(),
-                    dec.rate(),
-                    ff::util::format::sample::Sample::F32(ff::util::format::sample::Type::Packed),
-                    ff::channel_layout::ChannelLayout::STEREO,
-                    super::media::AUDIO_SAMPLE_RATE,
-                )
-                .map_err(|e| CaptureError::OpenFailed(format!("swresample setup: {e}")))?;
+                let rs = super::audio_norm::AudioNormalizer::default();
                 (
                     Some(idx),
                     Some(dec),
@@ -612,20 +600,8 @@ impl DemuxDecoder {
                         )))
                     }
                 }
-                // Upper bound on resampled output samples for this input frame.
-                let max_out = decoded.samples() as usize * 2 + 1024;
-                let mut out = ff::util::frame::audio::Audio::new(
-                    ff::util::format::sample::Sample::F32(ff::util::format::sample::Type::Packed),
-                    max_out,
-                    ff::channel_layout::ChannelLayout::STEREO,
-                );
-                rs.run(&decoded, &mut out)
-                    .map_err(|e| CaptureError::ReadFailed(format!("swresample run: {e}")))?;
-                let n = out.samples() as usize * super::media::AUDIO_CHANNELS as usize;
-                let bytes = out.data(0);
-                let floats: &[f32] = unsafe {
-                    std::slice::from_raw_parts(bytes.as_ptr() as *const f32, n.min(bytes.len() / 4))
-                };
+                let floats = rs.convert(&decoded)?;
+                let frames_out = (floats.len() / super::media::AUDIO_CHANNELS as usize) as u64;
                 // PTS fallback: running sample count → µs at the normalized rate.
                 let fallback_us = samples_out * 1_000_000 / super::media::AUDIO_SAMPLE_RATE as u64;
                 let pts_us = pts_to_us(
@@ -634,8 +610,8 @@ impl DemuxDecoder {
                     self.audio_tb.1,
                     fallback_us as i64,
                 );
-                samples_out += out.samples() as u64;
-                produced.push((floats.to_vec(), pts_us, out.samples() as u64));
+                samples_out += frames_out;
+                produced.push((floats, pts_us, frames_out));
             }
         }
         for (samples, pts_us, frames) in produced {

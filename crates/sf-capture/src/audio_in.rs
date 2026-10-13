@@ -48,12 +48,14 @@ pub struct AudioInputProducer {
     ictx: ff::format::context::Input,
     audio_stream: usize,
     decoder: ff::decoder::Audio,
-    resampler: ff::software::resampling::Context,
+    resampler: super::audio_norm::AudioNormalizer,
     audio_tb: (i32, i32),
     queue: VecDeque<DecodedAudio>,
     samples_out: u64,
     device_name: String,
     clock: ClockMapper,
+    /// The input ended; queued chunks are still handed out first.
+    ended: bool,
 }
 
 // SAFETY: FFmpeg contexts have no thread affinity; the producer is owned
@@ -108,18 +110,9 @@ impl AudioInputProducer {
             .decoder()
             .audio()
             .map_err(|e| CaptureError::OpenFailed(format!("audio decoder open: {e}")))?;
-        if decoder.channel_layout().channels() == 0 {
-            let _ = decoder.set_channel_layout(ff::channel_layout::ChannelLayout::STEREO);
-        }
-        let resampler = ff::software::resampling::Context::get(
-            decoder.format(),
-            decoder.channel_layout(),
-            decoder.rate(),
-            ff::util::format::sample::Sample::F32(ff::util::format::sample::Type::Packed),
-            ff::channel_layout::ChannelLayout::STEREO,
-            AUDIO_SAMPLE_RATE,
-        )
-        .map_err(|e| CaptureError::OpenFailed(format!("swresample setup: {e}")))?;
+        // Normalised per decoded frame (see `audio_norm`): never trust the
+        // header's channel layout for a live device.
+        let resampler = super::audio_norm::AudioNormalizer::default();
         Ok(Self {
             ictx,
             audio_stream: audio_index,
@@ -130,6 +123,7 @@ impl AudioInputProducer {
             samples_out: 0,
             device_name,
             clock: ClockMapper::new(),
+            ended: false,
         })
     }
 
@@ -146,13 +140,19 @@ impl AudioInputProducer {
         if let Some(c) = self.queue.pop_front() {
             return Ok(Some(c));
         }
+        if self.ended {
+            return Err(CaptureError::EndOfStream);
+        }
         for _ in 0..MAX_PACKETS_PER_CALL {
             let mut pkt = ff::Packet::empty();
             match pkt.read(&mut self.ictx) {
                 Ok(()) => {}
                 Err(Error::Other { errno }) if errno == EAGAIN => break,
                 Err(Error::Exit) => break,
-                Err(Error::Eof) => return Err(CaptureError::EndOfStream),
+                Err(Error::Eof) => {
+                    self.ended = true;
+                    break;
+                }
                 Err(e) => return Err(CaptureError::ReadFailed(format!("audio read: {e}"))),
             }
             if pkt.stream() != self.audio_stream {
@@ -164,7 +164,10 @@ impl AudioInputProducer {
                 .map_err(|e| CaptureError::ReadFailed(format!("audio send_packet: {e}")))?;
             self.drain_decoder(read_at)?;
         }
-        Ok(self.queue.pop_front())
+        match self.queue.pop_front() {
+            None if self.ended => Err(CaptureError::EndOfStream),
+            c => Ok(c),
+        }
     }
 
     fn drain_decoder(&mut self, read_at: i64) -> Result<(), CaptureError> {
@@ -180,33 +183,21 @@ impl AudioInputProducer {
                     )))
                 }
             }
-            let max_out = decoded.samples() as usize * 2 + 1024;
-            let mut out = ff::util::frame::audio::Audio::new(
-                ff::util::format::sample::Sample::F32(ff::util::format::sample::Type::Packed),
-                max_out,
-                ff::channel_layout::ChannelLayout::STEREO,
-            );
-            self.resampler
-                .run(&decoded, &mut out)
-                .map_err(|e| CaptureError::ReadFailed(format!("swresample run: {e}")))?;
-            let n = out.samples() as usize * AUDIO_CHANNELS as usize;
-            let bytes = out.data(0);
-            let floats: &[f32] = unsafe {
-                std::slice::from_raw_parts(bytes.as_ptr() as *const f32, n.min(bytes.len() / 4))
-            };
+            let floats = self.resampler.convert(&decoded)?;
+            let frames_out = (floats.len() / AUDIO_CHANNELS as usize) as u64;
             let pts_us = pts_to_us(
                 decoded.pts(),
                 self.audio_tb.0,
                 self.audio_tb.1,
                 (self.samples_out * 1_000_000 / AUDIO_SAMPLE_RATE as u64) as i64,
             );
-            self.samples_out += out.samples() as u64;
+            self.samples_out += frames_out;
             let captured_at_us = self.clock.map(pts_us, read_at);
             if self.queue.len() >= MAX_QUEUE {
                 self.queue.pop_front();
             }
             self.queue.push_back(DecodedAudio {
-                samples: floats.to_vec(),
+                samples: floats,
                 channels: AUDIO_CHANNELS,
                 sample_rate: AUDIO_SAMPLE_RATE,
                 pts_us,
@@ -214,5 +205,68 @@ impl AudioInputProducer {
             });
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Raw PCM with only a channel count (no layout) — what a DirectShow
+    /// microphone delivers. Every chunk must normalize to 48 kHz stereo.
+    fn decode_raw(channels: u32, rate: u32, fmt: &str) -> Result<Vec<f32>, CaptureError> {
+        let dir = std::env::temp_dir();
+        let path = dir.join(format!("sf-audio-{channels}ch-{rate}-{fmt}.raw"));
+        let st = std::process::Command::new("ffmpeg")
+            .args(["-y", "-loglevel", "error", "-f", "lavfi", "-i", &format!("sine=frequency=440:sample_rate={rate}:duration=1")])
+            .args(["-ac", &channels.to_string(), "-f", fmt])
+            .arg(&path)
+            .status()
+            .expect("ffmpeg");
+        assert!(st.success());
+        super::super::demux::ensure_init();
+        let ch = channels.to_string();
+        let sr = rate.to_string();
+        let ictx = super::super::live::open_input(
+            Some(fmt),
+            path.to_str().unwrap(),
+            // Channel count only, no layout — like a dshow microphone.
+            &[("channels", ch.as_str()), ("sample_rate", sr.as_str())],
+            std::time::Duration::from_secs(5),
+        )?;
+        let mut p = AudioInputProducer::from_input(ictx, "test".into())?;
+        let mut all: Vec<f32> = Vec::new();
+        loop {
+            match p.next_audio() {
+                Ok(Some(c)) => {
+                    assert_eq!(c.channels, 2);
+                    assert_eq!(c.sample_rate, AUDIO_SAMPLE_RATE);
+                    all.extend_from_slice(&c.samples);
+                }
+                Ok(None) => continue,
+                Err(CaptureError::EndOfStream) => break,
+                Err(e) => return Err(e),
+            }
+        }
+        Ok(all)
+    }
+
+    #[test]
+    fn mono_and_stereo_mics_normalize() {
+        for (ch, rate, fmt) in [(1, 48000, "s16le"), (1, 44100, "s16le"), (2, 44100, "s16le"), (1, 16000, "f32le")] {
+            let pcm = decode_raw(ch, rate, fmt).unwrap_or_else(|e| panic!("{ch} ch {rate} Hz {fmt}: {e}"));
+            let frames = pcm.len() / 2;
+            assert!(frames > 4000, "{ch} ch {rate} Hz {fmt}: only {frames} frames");
+            let left: Vec<f32> = pcm.iter().step_by(2).copied().collect();
+            let right: Vec<f32> = pcm.iter().skip(1).step_by(2).copied().collect();
+            let peak = left.iter().fold(0f32, |m, v| m.max(v.abs()));
+            assert!(peak > 0.05, "{ch} ch {rate} Hz {fmt}: silent (peak {peak})");
+            let diff = left.iter().zip(&right).fold(0f32, |m, (l, r)| m.max((l - r).abs()));
+            assert!(diff < 1e-3, "mono/stereo source must reach both channels equally");
+            // 440 Hz at 48 kHz: 880 zero crossings per second.
+            let zc = left.windows(2).filter(|w| (w[0] < 0.0) != (w[1] < 0.0)).count() as f64;
+            let hz = zc / 2.0 / (frames as f64 / 48_000.0);
+            assert!((hz - 440.0).abs() < 15.0, "{ch} ch {rate} Hz {fmt}: pitch {hz:.0} Hz after resampling");
+        }
     }
 }

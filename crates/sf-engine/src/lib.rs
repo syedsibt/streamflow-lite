@@ -23,6 +23,8 @@ use sf_filterfx::EffectPass;
 use sf_filters::{resolve_grade, EffectKind, EffectParams, Filter, LookRegistry, MaskRef};
 use sf_render::lut::CubeFile;
 use sf_render::{CompositePass, GradePass, RenderContext, RenderError, ScalePass};
+/// GPU error count, last GPU error, adapter description (for diagnostics).
+pub use sf_render::gpu_status;
 use sf_scopes::{ScopeFrame, ScopeKind, ScopeParams, ScopePass, SCOPE_INTERVAL_MICROS};
 use sf_state::State;
 
@@ -548,6 +550,7 @@ impl Engine {
         let scale_pass = self.scale_pass.as_ref().ok_or(EngineError::UnknownInput(
             "GPU scale not available".into(),
         ))?;
+        self.ctx.check_size(dw, dh).map_err(EngineError::Render)?;
         // Upload source.
         let src_tex = self.ctx.upload_rgba8(sw, sh, pixels).map_err(EngineError::Render)?;
         let src_view = src_tex.create_view(&wgpu::TextureViewDescriptor::default());

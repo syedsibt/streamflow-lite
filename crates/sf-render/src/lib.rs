@@ -18,7 +18,7 @@ pub mod grade_pass;
 pub mod scale_pass;
 
 pub use composite_pass::CompositePass;
-pub use context::RenderContext;
+pub use context::{gpu_status, RenderContext};
 pub use error::RenderError;
 pub use grade_pass::GradePass;
 pub use scale_pass::ScalePass;

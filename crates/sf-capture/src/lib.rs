@@ -227,6 +227,7 @@ pub(crate) mod dshow_rate;
 pub mod dshow;
 
 pub mod audio_in;
+mod audio_norm;
 
 #[cfg(any(windows, sf_wincheck))]
 pub mod gdigrab;

@@ -12,6 +12,20 @@
 
 use crate::error::RenderError;
 
+static GPU_ERRORS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static LAST_GPU_ERROR: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
+static ADAPTER: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
+
+/// GPU validation/runtime errors since start, the last message, and the
+/// adapter in use (name, backend, type — e.g. a software `Cpu` adapter).
+pub fn gpu_status() -> (u64, Option<String>, Option<String>) {
+    (
+        GPU_ERRORS.load(std::sync::atomic::Ordering::Relaxed),
+        LAST_GPU_ERROR.lock().ok().and_then(|l| l.clone()),
+        ADAPTER.lock().ok().and_then(|a| a.clone()),
+    )
+}
+
 /// Headless wgpu device + queue pair, plus texture upload/download helpers.
 pub struct RenderContext {
     device: wgpu::Device,
@@ -46,7 +60,33 @@ impl RenderContext {
             None,
         ))
         .map_err(|e| RenderError::DeviceRequest(e.to_string()))?;
+        // wgpu's default handler PANICS on any validation error, which (in
+        // the app) unwinds while the engine lock is held and poisons it —
+        // every later command then fails. Record the error instead; the
+        // operation that caused it returns an error / a blank frame.
+        device.on_uncaptured_error(Box::new(|e| {
+            let msg = e.to_string();
+            eprintln!("GPU error: {msg}");
+            GPU_ERRORS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            if let Ok(mut last) = LAST_GPU_ERROR.lock() {
+                *last = Some(msg.chars().take(400).collect());
+            }
+        }));
+        let info = adapter.get_info();
+        if let Ok(mut a) = ADAPTER.lock() {
+            *a = Some(format!("{} ({:?}, {:?})", info.name, info.backend, info.device_type));
+        }
         Ok(Self { device, queue })
+    }
+
+    /// Fails (instead of a wgpu validation error) for sizes the device
+    /// cannot create.
+    pub fn check_size(&self, width: u32, height: u32) -> Result<(), RenderError> {
+        let max = self.device.limits().max_texture_dimension_2d;
+        if width == 0 || height == 0 || width > max || height > max {
+            return Err(RenderError::TextureSize(width, height, max));
+        }
+        Ok(())
     }
 
     /// The wgpu device.
@@ -77,6 +117,7 @@ impl RenderContext {
         if pixels.len() != (width as usize) * (height as usize) * 4 {
             return Err(RenderError::SizeMismatch);
         }
+        self.check_size(width, height)?;
         let tex = self.device.create_texture(&wgpu::TextureDescriptor {
             label: Some("sf-render upload rgba8"),
             size: wgpu::Extent3d {

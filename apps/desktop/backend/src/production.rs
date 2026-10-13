@@ -308,8 +308,8 @@ pub(crate) fn placement(t: &SourceTransform, canvas_w: u32, canvas_h: u32, src_w
             }
         }
     }
-    let scale_w = (cw / (r - l)).clamp(1.0, 8192.0);
-    let scale_h = (ch / (b - tp)).clamp(1.0, 8192.0);
+    let scale_w = (cw / (r - l)).clamp(1.0, 4096.0);
+    let scale_h = (ch / (b - tp)).clamp(1.0, 4096.0);
     Placement {
         cx: cx.round() as i64,
         cy: cy.round() as i64,

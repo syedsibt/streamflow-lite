@@ -48,6 +48,8 @@ mod audio_monitor;
 mod av_backends;
 mod color_library;
 mod diagnostics;
+pub mod health;
+mod sysmon;
 mod platforms;
 mod production;
 mod send_worker;
@@ -594,7 +596,7 @@ pub struct Shell {
     /// Smoothed age of the program's main live picture at render, µs.
     last_program_video_age_us: Option<i64>,
     /// Real process CPU / memory sampler.
-    sys: diagnostics::SysSampler,
+    sys: sysmon::SysMonitor,
     /// Color Studio live tap: the input the Color Studio is watching and
     /// when it last asked. While watched, `render_scene_frame` hands the
     /// exact graded frame it composited (and the raw frame, for
@@ -690,7 +692,7 @@ impl Shell {
             perf_stages_us: [0; 4],
             perf_gpu_us_accum: 0,
             last_program_video_age_us: None,
-            sys: diagnostics::SysSampler::new(),
+            sys: sysmon::SysMonitor::start(),
             studio_watch: None,
             studio_tap: None,
             data_dir: color_library::default_data_dir(),
@@ -1473,7 +1475,7 @@ impl Shell {
         let fps = self.perf_frame_times.len() as f32;
         let render_ms = self.perf_last_tick_us as f32 / 1000.0;
         // Real process CPU (all threads, normalized to the machine).
-        let cpu_pct = self.sys.sample().cpu_percent;
+        let cpu_pct = self.sys.latest().cpu_percent;
         let kbps = self.upload_kbps(now);
         (
             fps,

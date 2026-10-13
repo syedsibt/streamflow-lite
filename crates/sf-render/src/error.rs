@@ -12,6 +12,9 @@ pub enum RenderError {
     /// A texture did not have the expected size.
     #[error("texture size mismatch")]
     SizeMismatch,
+    /// A texture size the device cannot create (0 or above its limit).
+    #[error("texture size {0}x{1} not supported by the GPU (max {2})")]
+    TextureSize(u32, u32, u32),
     /// Mapping a download buffer failed.
     #[error("buffer map failed")]
     MapFailed,
