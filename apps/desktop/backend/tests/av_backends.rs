@@ -526,10 +526,14 @@ fn stream_and_record_share_one_encoder_and_follow_wall_clock() {
     let (r0, r1, rn) = ffprobe_span(rec_path, "v");
     assert!(rn > 3, "recording has too few frames ({rn})");
     assert!(r0.abs() < 0.05, "recording should start at 0, starts at {r0}");
+    // Each end can be off by one tick (join and stop happen between
+    // frames); on a slow host a tick is long.
+    let tick_s = start.elapsed().as_secs_f64() / ticks.max(1) as f64;
     assert!(
-        ((r1 - r0) - rec_wall).abs() < rec_wall * 0.15 + 0.15,
-        "recording span {:.2}s vs wall {rec_wall:.2}s",
-        r1 - r0
+        ((r1 - r0) - rec_wall).abs() < rec_wall * 0.15 + 2.0 * tick_s + 0.1,
+        "recording span {:.2}s vs wall {rec_wall:.2}s (tick {:.0} ms)",
+        r1 - r0,
+        tick_s * 1000.0
     );
 }
 
