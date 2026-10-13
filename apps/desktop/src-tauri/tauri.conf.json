@@ -27,9 +27,11 @@
       "icons/icon.icns",
       "icons/icon.ico"
     ],
-    "targets": "all"
+    "targets": "all",
+    "publisher": "Soft Trump (Syed Sibt)",
+    "copyright": "\u00a9 2026 Soft Trump (Syed Sibt)"
   },
   "identifier": "com.streamflow.lite",
   "productName": "StreamFlow Lite",
-  "version": "0.1.23"
+  "version": "0.1.24"
 }
