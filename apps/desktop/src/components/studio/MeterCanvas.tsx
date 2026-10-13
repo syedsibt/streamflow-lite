@@ -76,6 +76,9 @@ export default function MeterCanvas({
       }
     };
     draw(-120, -120);
+    // Skip identical redraws (silence, a held level): the canvas is only
+    // touched when what it shows changes.
+    let lastKey = "";
     return subscribeMeters((m) => {
       const ch = channel === "master" ? { peak: m.master_peak, rms: m.master_rms } : m.channels.find((c) => c.id === channel);
       const peakDb = toDb(ch?.peak ?? 0);
@@ -87,6 +90,9 @@ export default function MeterCanvas({
         clipped.current = true;
         clipRef.current?.classList.add("on");
       }
+      const key = `${Math.round(Math.max(peakDb, -61) * 2)}|${Math.round(Math.max(smooth.current, -61) * 2)}|${Math.round(Math.max(hold.current.value, -61) * 2)}`;
+      if (key === lastKey) return;
+      lastKey = key;
       draw(peakDb, smooth.current);
       const el = ref.current;
       if (el) el.title = `${title ?? ""}${title ? " · " : ""}peak ${peakDb > -100 ? peakDb.toFixed(1) : "−∞"} dBFS · hold ${hold.current.value > -100 ? hold.current.value.toFixed(1) : "−∞"} dBFS`;

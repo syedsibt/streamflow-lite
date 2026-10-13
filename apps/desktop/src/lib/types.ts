@@ -328,7 +328,20 @@ export interface CameraSourceInfo {
   width: number;
   height: number;
   fps: number;
+  /** Requested device format (null = automatic). */
+  format: string | null;
   negotiated: string | null;
+}
+
+/** One output mode a camera reports (format, size range, fps range). */
+export interface CameraMode {
+  format: string;
+  min_width: number;
+  min_height: number;
+  max_width: number;
+  max_height: number;
+  min_fps: number;
+  max_fps: number;
 }
 
 /** Video input/output settings (Video menu panel) — mirrors the backend. */
@@ -397,14 +410,107 @@ export interface MixerChannelView {
   pan: number; // -1 (left) … 1 (right)
   solo: boolean; // local monitor only
   trim_db: number; // -20 … 20
+  fx: FxSettings;
+}
+
+/**
+ * One channel's effects chain (backend `sf_audio::FxSettings`). Each effect
+ * has its own switch; `enabled` bypasses the whole chain. Order:
+ * polarity → mono → low cut → high cut → AI noise removal → gate → EQ →
+ * de-esser → compressor → limiter → delay.
+ */
+export interface FxSettings {
+  enabled: boolean;
+  invert_polarity: boolean;
+  mono: boolean;
+  highpass_enabled: boolean;
+  highpass_hz: number;
+  lowpass_enabled: boolean;
+  lowpass_hz: number;
+  denoise_enabled: boolean;
+  denoise_strength: number;
+  gate_enabled: boolean;
+  gate_threshold_db: number;
+  gate_release_ms: number;
+  eq_enabled: boolean;
+  eq_low_db: number;
+  eq_mid_db: number;
+  eq_high_db: number;
+  eq_mid_hz: number;
+  deesser_enabled: boolean;
+  deesser_hz: number;
+  deesser_threshold_db: number;
+  deesser_max_db: number;
+  compressor_enabled: boolean;
+  comp_threshold_db: number;
+  comp_ratio: number;
+  comp_attack_ms: number;
+  comp_release_ms: number;
+  comp_makeup_db: number;
+  limiter_enabled: boolean;
+  limiter_ceiling_db: number;
+  limiter_release_ms: number;
+  delay_enabled: boolean;
+  delay_ms: number;
+}
+
+/** Everything off — mirrors `FxSettings::default()`. */
+export const FX_OFF: FxSettings = {
+  enabled: true,
+  invert_polarity: false,
+  mono: false,
+  highpass_enabled: false,
+  highpass_hz: 80,
+  lowpass_enabled: false,
+  lowpass_hz: 16000,
+  denoise_enabled: false,
+  denoise_strength: 1,
+  gate_enabled: false,
+  gate_threshold_db: -40,
+  gate_release_ms: 120,
+  eq_enabled: false,
+  eq_low_db: 0,
+  eq_mid_db: 0,
+  eq_high_db: 0,
+  eq_mid_hz: 1000,
+  deesser_enabled: false,
+  deesser_hz: 6000,
+  deesser_threshold_db: -30,
+  deesser_max_db: 6,
+  compressor_enabled: false,
+  comp_threshold_db: -18,
+  comp_ratio: 3,
+  comp_attack_ms: 10,
+  comp_release_ms: 100,
+  comp_makeup_db: 0,
+  limiter_enabled: false,
+  limiter_ceiling_db: -1,
+  limiter_release_ms: 50,
+  delay_enabled: false,
+  delay_ms: 0,
+};
+
+/** Voice chain — mirrors `FxSettings::voice()`. */
+export const FX_VOICE: FxSettings = { ...FX_OFF, denoise_enabled: true, gate_enabled: true, eq_enabled: true, eq_mid_db: 2, eq_high_db: 2, compressor_enabled: true };
+
+/** Live readings of one effects chain. */
+export interface FxStats {
+  vad: number;
+  comp_reduction_db: number;
+  limiter_reduction_db: number;
+  deesser_reduction_db: number;
+  gate_closed: boolean;
+  latency_ms: number;
+  process_us: number;
 }
 
 /** Live meters (backend `AudioMetersView`): peak since last read + RMS, linear. */
 export interface AudioMeters {
-  channels: { id: string; peak: number; rms: number; has_signal_path: boolean }[];
+  channels: { id: string; peak: number; rms: number; has_signal_path: boolean; fx?: FxStats | null }[];
   master_peak: number;
   master_rms: number;
   solo_active: boolean;
+  master_fx?: FxStats | null;
 }
 
 export interface EnhancerSettings {
@@ -447,7 +553,9 @@ export interface AvSync {
 
 export interface MixerView {
   channels: MixerChannelView[];
-  master: { gain: number; mute: boolean };
+  master: { gain: number; mute: boolean; fx: FxSettings };
+  fx_stats: Record<string, FxStats>;
+  master_fx_stats: FxStats | null;
   meters_live: boolean;
   meters: Record<string, number>; // per-source peak, keyed by source id
   monitor_enabled: boolean;

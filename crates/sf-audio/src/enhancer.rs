@@ -74,7 +74,7 @@ pub struct EnhancerStats {
 
 /// RBJ cookbook biquad (Direct Form I).
 #[derive(Clone, Copy, Debug)]
-struct Biquad {
+pub(crate) struct Biquad {
     b0: f32,
     b1: f32,
     b2: f32,
@@ -87,7 +87,7 @@ struct Biquad {
 }
 
 impl Biquad {
-    fn passthrough() -> Self {
+    pub(crate) fn passthrough() -> Self {
         Self {
             b0: 1.0,
             b1: 0.0,
@@ -101,7 +101,7 @@ impl Biquad {
         }
     }
 
-    fn lowshelf(freq: f32, gain_db: f32, rate: f32) -> Self {
+    pub(crate) fn lowshelf(freq: f32, gain_db: f32, rate: f32) -> Self {
         let a = 10f32.powf(gain_db / 40.0);
         let w0 = 2.0 * std::f32::consts::PI * freq / rate;
         // Shelf slope S = 1.
@@ -119,7 +119,7 @@ impl Biquad {
         Self::from_coefs(b0, b1, b2, a0, a1, a2)
     }
 
-    fn highshelf(freq: f32, gain_db: f32, rate: f32) -> Self {
+    pub(crate) fn highshelf(freq: f32, gain_db: f32, rate: f32) -> Self {
         let a = 10f32.powf(gain_db / 40.0);
         let w0 = 2.0 * std::f32::consts::PI * freq / rate;
         let alpha = w0.sin() / 2.0;
@@ -136,7 +136,7 @@ impl Biquad {
         Self::from_coefs(b0, b1, b2, a0, a1, a2)
     }
 
-    fn peaking(freq: f32, gain_db: f32, q: f32, rate: f32) -> Self {
+    pub(crate) fn peaking(freq: f32, gain_db: f32, q: f32, rate: f32) -> Self {
         let a = 10f32.powf(gain_db / 40.0);
         let w0 = 2.0 * std::f32::consts::PI * freq / rate;
         let alpha = w0.sin() / (2.0 * q);
@@ -152,7 +152,7 @@ impl Biquad {
         Self::from_coefs(b0, b1, b2, a0, a1, a2)
     }
 
-    fn from_coefs(b0: f32, b1: f32, b2: f32, a0: f32, a1: f32, a2: f32) -> Self {
+    pub(crate) fn from_coefs(b0: f32, b1: f32, b2: f32, a0: f32, a1: f32, a2: f32) -> Self {
         Self {
             b0: b0 / a0,
             b1: b1 / a0,
@@ -166,8 +166,33 @@ impl Biquad {
         }
     }
 
+    /// New coefficients, filter memory kept (no click on a live retune).
+    pub(crate) fn retuned(mut self, old: &Biquad) -> Self {
+        self.x1 = old.x1;
+        self.x2 = old.x2;
+        self.y1 = old.y1;
+        self.y2 = old.y2;
+        self
+    }
+
+    /// RBJ 2nd-order high-pass (Butterworth Q = 0.707).
+    pub(crate) fn highpass(freq: f32, rate: f32) -> Self {
+        let w0 = 2.0 * std::f32::consts::PI * freq / rate;
+        let alpha = w0.sin() / (2.0 * std::f32::consts::FRAC_1_SQRT_2);
+        let cw = w0.cos();
+        Self::from_coefs((1.0 + cw) / 2.0, -(1.0 + cw), (1.0 + cw) / 2.0, 1.0 + alpha, -2.0 * cw, 1.0 - alpha)
+    }
+
+    /// RBJ 2nd-order low-pass (Butterworth Q = 0.707).
+    pub(crate) fn lowpass(freq: f32, rate: f32) -> Self {
+        let w0 = 2.0 * std::f32::consts::PI * freq / rate;
+        let alpha = w0.sin() / (2.0 * std::f32::consts::FRAC_1_SQRT_2);
+        let cw = w0.cos();
+        Self::from_coefs((1.0 - cw) / 2.0, 1.0 - cw, (1.0 - cw) / 2.0, 1.0 + alpha, -2.0 * cw, 1.0 - alpha)
+    }
+
     #[inline]
-    fn process(&mut self, x: f32) -> f32 {
+    pub(crate) fn process(&mut self, x: f32) -> f32 {
         let y = self.b0 * x + self.b1 * self.x1 + self.b2 * self.x2
             - self.a1 * self.y1
             - self.a2 * self.y2;

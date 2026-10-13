@@ -3,6 +3,7 @@ import TopBar, { type StepId } from "./components/TopBar";
 import StatusBar from "./components/StatusBar";
 import DiagnosticsSheet from "./components/DiagnosticsSheet";
 import Toasts from "./components/Toasts";
+import ErrorBoundary from "./components/ErrorBoundary";
 import Workspace from "./components/studio/Workspace";
 import ColorView from "./components/views/ColorView";
 import { useProduction } from "./lib/productionStore";
@@ -58,14 +59,16 @@ export default function App() {
             <div className="boot-title">{isTauri ? "Starting the engine…" : "StreamFlow runs inside the desktop app"}</div>
             <div className="boot-hint">{isTauri ? "Opening the GPU and audio devices." : "Open it with the StreamFlow desktop application."}</div>
           </div>
-        ) : step === "production" ? (
-          <Workspace onOpenColorPage={() => setStep("color")} />
         ) : (
-          <ColorView />
+          <ErrorBoundary label={step === "production" ? "Production" : "Color grading"} resetKey={step}>
+            {step === "production" ? <Workspace onOpenColorPage={() => setStep("color")} /> : <ColorView />}
+          </ErrorBoundary>
         )}
       </main>
       <StatusBar onOpen={() => setDiagOpen(true)} />
-      <DiagnosticsSheet open={diagOpen} onClose={() => setDiagOpen(false)} />
+      <ErrorBoundary label="Diagnostics">
+        <DiagnosticsSheet open={diagOpen} onClose={() => setDiagOpen(false)} />
+      </ErrorBoundary>
       <Toasts />
     </div>
   );

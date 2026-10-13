@@ -594,6 +594,29 @@ fn video_settings_defaults_and_roundtrip() {
 }
 
 #[test]
+fn every_output_resolution_is_accepted_and_renders() {
+    let mut s = shell();
+    let scene = s.production_state().program_scene_id;
+    add_pattern(&mut s, &scene, "Bars");
+    for (w, h) in [(640, 360), (854, 480), (960, 540), (1280, 720), (1920, 1080), (2560, 1440)] {
+        let mut v = s.video_settings_get();
+        v.output_width = w;
+        v.output_height = h;
+        v.bitrate_kbps = 2500;
+        s.video_settings_set(v).unwrap_or_else(|e| panic!("{w}x{h}: {e}"));
+        let back = s.video_settings_get();
+        assert_eq!((back.output_width, back.output_height), (w, h));
+        let png = s.program_frame_png(w, h).expect("program renders at the output size");
+        assert!(png.len() > 100);
+    }
+    // Custom bitrate anywhere in range.
+    let mut v = s.video_settings_get();
+    v.bitrate_kbps = 12_345;
+    s.video_settings_set(v).unwrap();
+    assert_eq!(s.video_settings_get().bitrate_kbps, 12_345);
+}
+
+#[test]
 fn video_settings_rejects_bad_values() {
     let mut s = shell();
     let d = s.video_settings_get();
@@ -859,4 +882,84 @@ fn lightweight_paths_keep_results_correct() {
     s.av_tick();
     assert_eq!(s.resource_report().into_iter().find(|c| c.name == "program monitor frame").unwrap().entries, 1, "watched → rendered by the tick");
     assert_eq!(s.monitor_set_display_width(5000), (1280, 720));
+}
+
+// ---------------------------------------------------------------------------
+// Mixer effects
+// ---------------------------------------------------------------------------
+
+#[test]
+fn mixer_effects_per_channel_and_master() {
+    let mut s = shell();
+    let scene = empty_scene(&mut s);
+    let id = s
+        .source_add(&scene, "color", "Blue", [0, 0, 255], None, None, None, None, 0, 0, 0)
+        .unwrap()
+        .id;
+    // Non-voice sources start with every effect off (zero cost).
+    let st = s.production_state();
+    let ch = &st.mixer.channels[&id];
+    assert!(!ch.fx.any_active());
+    // Master starts with the −1 dB limiter.
+    assert!(st.mixer.master.fx.limiter_enabled);
+
+    let mut fx = ch.fx.clone();
+    fx.compressor_enabled = true;
+    fx.comp_ratio = 99.0; // clamped
+    fx.highpass_enabled = true;
+    let back = s.mixer_set_fx(&id, fx).unwrap();
+    assert!(back.fx.compressor_enabled && back.fx.highpass_enabled);
+    assert_eq!(back.fx.comp_ratio, 20.0);
+    assert!(s.mixer_set_fx("nope", sf_ui_backend::FxSettings::default()).is_err());
+
+    let mut m = s.production_state().mixer.master.fx.clone();
+    m.limiter_enabled = false;
+    m.eq_enabled = true;
+    m.eq_low_db = 3.0;
+    let mb = s.mixer_set_master_fx(m);
+    assert!(!mb.fx.limiter_enabled && mb.fx.eq_enabled);
+
+    // Duplicating a source copies its effects.
+    let dup = s.source_duplicate(&scene, &id).unwrap().id;
+    assert!(s.production_state().mixer.channels[&dup].fx.compressor_enabled);
+}
+
+// ---------------------------------------------------------------------------
+// Static scenes: rendered once, not every frame
+// ---------------------------------------------------------------------------
+
+#[test]
+fn static_scene_is_rendered_once_until_it_changes() {
+    let mut s = shell();
+    let scene = empty_scene(&mut s);
+    s.source_add(&scene, "color", "Blue", [0, 0, 255], None, None, None, None, 0, 0, 0).unwrap();
+    s.production_set_program(&scene).unwrap();
+    let _ = s.monitor_snapshot(&scene).unwrap(); // the UI is watching
+    s.av_tick();
+    let a = s.monitor_snapshot(&scene).unwrap().seq;
+    s.av_tick();
+    s.av_tick();
+    let b = s.monitor_snapshot(&scene).unwrap().seq;
+    assert_eq!(a, b, "nothing changed: no new monitor frame");
+
+    // An edit (new text layer) gives exactly a new picture.
+    s.source_add(&scene, "text", "Title", [255, 255, 255], Some("Hello"), None, None, None, 0, 0, 0).unwrap();
+    s.av_tick();
+    let c = s.monitor_snapshot(&scene).unwrap().seq;
+    assert!(c > b, "edit must re-render");
+
+    // Something that moves (test signal) renders every tick.
+    add_pattern(&mut s, &scene, "Bars");
+    s.av_tick();
+    let d = s.monitor_snapshot(&scene).unwrap().seq;
+    s.av_tick();
+    let e = s.monitor_snapshot(&scene).unwrap().seq;
+    assert!(e > d, "moving scene re-renders");
+
+    // A static preview scene is served from cache (same seq).
+    let pv = empty_scene(&mut s);
+    s.source_add(&pv, "color", "Red", [255, 0, 0], None, None, None, None, 0, 0, 0).unwrap();
+    let p1 = s.monitor_snapshot(&pv).unwrap().seq;
+    let p2 = s.monitor_snapshot(&pv).unwrap().seq;
+    assert_eq!(p1, p2);
 }

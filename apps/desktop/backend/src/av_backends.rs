@@ -483,6 +483,7 @@ impl Shell {
     /// Video and audio open as SEPARATE dshow graphs (like OBS's separate
     /// video/audio sources), each with its own non-blocking capture thread.
     #[cfg(any(windows, sf_wincheck))]
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn open_camera_producer(
         &mut self,
         source_id: &str,
@@ -491,14 +492,20 @@ impl Shell {
         width: u32,
         height: u32,
         fps: u32,
+        format: Option<&str>,
     ) -> Result<(), ShellError> {
         let device_owned = device.map(|d| d.to_string());
         let audio_owned = audio_device.map(|d| d.to_string());
+        let format_owned = format.map(|f| f.to_string());
         let prod: sf_capture::dshow::DshowProducer = open_device("camera", move || {
-            match device_owned.as_deref() {
-                Some(d) => sf_capture::dshow::DshowProducer::open(d, width, height, fps),
-                None => sf_capture::dshow::DshowProducer::open_default(width, height, fps),
-            }
+            let dev = match device_owned {
+                Some(d) => d,
+                None => sf_capture::dshow::list_devices()?
+                    .into_iter()
+                    .next()
+                    .ok_or_else(|| CaptureError::DeviceNotFound("no DirectShow cameras found".into()))?,
+            };
+            sf_capture::dshow::DshowProducer::open_format(&dev, width, height, fps, format_owned.as_deref())
         })?;
         self.camera_formats
             .insert(source_id.to_string(), prod.negotiated_format().to_string());
@@ -864,8 +871,29 @@ impl Shell {
             ai_denoise: v.ai_denoise,
             ai_strength: num(v.ai_strength, 0.0, 1.0, 1.0),
         };
-        for e in self.voice_enhancers.values_mut() {
-            e.set_settings(settings.clone());
+        // Applied to every voice channel's own effects (the mixer's
+        // per-channel settings are the source of truth).
+        let voice_ids: Vec<String> = self
+            .scenes
+            .iter()
+            .flat_map(|sc| sc.sources.iter())
+            .filter(|s| matches!(s.kind, SourceKind::AudioInput { .. } | SourceKind::Camera { .. }))
+            .map(|s| s.id.clone())
+            .collect();
+        for id in voice_ids {
+            if let Some(strip) = self.mixer.channels.get_mut(&id) {
+                let fx = &mut strip.fx;
+                fx.enabled = settings.enabled;
+                fx.denoise_enabled = settings.ai_denoise;
+                fx.denoise_strength = settings.ai_strength;
+                fx.gate_enabled = settings.gate_enabled;
+                fx.gate_threshold_db = settings.gate_threshold_db;
+                fx.eq_enabled = true;
+                fx.eq_low_db = settings.eq_low_db;
+                fx.eq_mid_db = settings.eq_mid_db;
+                fx.eq_high_db = settings.eq_high_db;
+                fx.compressor_enabled = settings.compressor_enabled;
+            }
         }
         self.enhancer_settings = settings;
     }
@@ -891,7 +919,7 @@ impl Shell {
             .iter()
             .map(|(id, inp)| {
                 let e = self
-                    .voice_enhancers
+                    .channel_fx
                     .get(id)
                     .map(|e| e.stats())
                     .unwrap_or_default();
@@ -906,7 +934,7 @@ impl Shell {
                     id.clone(),
                     VoiceStatsView {
                         vad: e.vad,
-                        gain_reduction_db: e.gain_reduction_db,
+                        gain_reduction_db: e.comp_reduction_db,
                         gate_closed: e.gate_closed,
                         latency_ms: e.latency_ms,
                         process_us: e.process_us,
@@ -965,7 +993,7 @@ impl Shell {
         self.audio_mixer.set_master_gain(self.mixer.master.gain);
         self.audio_mixer.set_master_mute(self.mixer.master.mute);
         self.audio_bus.retain(&ids);
-        self.voice_enhancers.retain(|k, _| live_ids.contains(k));
+        self.channel_fx.retain(|k, _| ids.contains(k));
 
         if ids.is_empty() || frames == 0 {
             return vec![0.0; frames * 2];
@@ -1004,18 +1032,24 @@ impl Shell {
                 let target_age = self.audio_target_age_us(id);
                 self.audio_bus
                     .pull_aligned(id, frames, &mut block, tick_us, target_age);
-                let settings = &self.enhancer_settings;
-                let enh = self.voice_enhancers.entry(id.clone()).or_insert_with(|| {
-                    let mut e = sf_audio::Enhancer::new(48_000);
-                    e.set_settings(settings.clone());
-                    e
-                });
-                enh.process(&mut block);
             } else {
                 self.audio_bus.pull(id, frames, &mut block);
             }
+            // Channel order: trim → effects → balance → fader (in the mixer).
             if let Some(strip) = self.mixer.channels.get(id) {
-                crate::production::apply_trim_pan(&mut block, strip.trim_db, strip.pan);
+                crate::production::apply_trim_pan(&mut block, strip.trim_db, 0.0);
+                if strip.fx.any_active() || self.channel_fx.get(id).is_some_and(|c| c.holds_latency()) {
+                    let chain = self
+                        .channel_fx
+                        .entry(id.clone())
+                        .or_insert_with(|| sf_audio::FxChain::new(strip.fx.clone()));
+                    chain.set_settings(strip.fx.clone());
+                    chain.process(&mut block);
+                } else {
+                    // Every effect off and no latency to keep: free the chain.
+                    self.channel_fx.remove(id);
+                }
+                crate::production::apply_trim_pan(&mut block, 0.0, strip.pan);
             }
             blocks.push((id.clone(), block));
         }
@@ -1047,7 +1081,9 @@ impl Shell {
             .iter()
             .map(|(id, b)| (id.as_str(), AudioFrame::new(b, 2, 48_000)))
             .collect();
-        let mixed = self.audio_mixer.mix(&frames_in);
+        self.master_fx.set_settings(self.mixer.master.fx.clone());
+        let master_fx = &mut self.master_fx;
+        let mixed = self.audio_mixer.mix_with(&frames_in, &mut |bus: &mut [f32]| master_fx.process(bus));
         for m in &mixed.per_source {
             self.meter_values.insert(m.id.clone(), m.peak);
             let e = self.meter_hold.entry(m.id.clone()).or_insert((0.0, 0.0));
@@ -1606,12 +1642,28 @@ impl Shell {
         // other page): don't render a picture no one will see. A UI request
         // renders on demand, and the next tick resumes rendering.
         let needed = encoding || self.monitor_watched() || self.transition.is_some() || self.studio_watch_active();
-        let frame = if needed {
-            self.program_frame_raw(w, h)
+        // A static program scene (colour / image / text, ungraded) whose
+        // content did not change: the monitor keeps its frame (same seq, so
+        // the UI fetches and decodes nothing) and, with no encoder running,
+        // nothing is rendered at all.
+        let key = if needed {
+            let pg = self.program_scene_id.clone();
+            self.scene_static_key(&pg, w, h)
         } else {
+            None
+        };
+        let unchanged = key.is_some()
+            && key == self.static_program_key
+            && (self.monitor_frame.is_some() || self.monitor_pending.is_some());
+        self.static_program_key = key;
+        let frame = if !needed {
             self.monitor_frame = None;
             self.monitor_pending = None;
             Err(ShellError::NoFrame("not rendered: no output and no viewer".into()))
+        } else if unchanged && !encoding {
+            Err(ShellError::NoFrame("unchanged static scene".into()))
+        } else {
+            self.program_frame_raw(w, h)
         };
         let render_us = t.elapsed().as_micros() as u64;
 
@@ -1638,13 +1690,15 @@ impl Shell {
                     self.output_tick(&frame, &audio, tick_us);
                 }
                 let encode_us = t.elapsed().as_micros() as u64;
-                self.set_monitor_frame(frame);
+                if !unchanged {
+                    self.set_monitor_frame(frame);
+                }
                 // The UI shows one output (program). A separate preview
                 // scene is only rendered when a host asks for it
                 // (`monitor_snapshot`) — never every tick.
                 self.perf_stages_us = [capture_us, render_us, audio_us, encode_us];
             }
-            Err(_) if !needed => {
+            Err(_) if !needed || unchanged => {
                 self.perf_stages_us = [capture_us, 0, audio_us, 0];
             }
             Err(_) => {

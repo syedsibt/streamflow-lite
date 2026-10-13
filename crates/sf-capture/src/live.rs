@@ -76,6 +76,10 @@ struct Shared {
     /// False while nothing shows this source: packets are read and dropped
     /// (the device never backs up) but nothing is decoded or converted.
     active: AtomicBool,
+    /// While inactive, keep reading (and dropping) packets. Needed for
+    /// devices that queue frames (cameras); a grab-on-read input (desktop
+    /// capture) sets it false and is not touched at all while unseen.
+    drain_idle: AtomicBool,
     stats: Mutex<LiveVideoStats>,
 }
 
@@ -97,6 +101,7 @@ impl LiveVideo {
             latest: Mutex::new(None),
             stop: AtomicBool::new(false),
             active: AtomicBool::new(true),
+            drain_idle: AtomicBool::new(true),
             stats: Mutex::new(LiveVideoStats::default()),
         });
         let sh = Arc::clone(&shared);
@@ -122,6 +127,11 @@ impl LiveVideo {
                 *l = None;
             }
         }
+    }
+
+    /// See `Shared::drain_idle`.
+    pub fn set_drain_when_idle(&self, drain: bool) {
+        self.shared.drain_idle.store(drain, Ordering::Relaxed);
     }
 
     /// Newest captured frame since the last call (`None` if none arrived).
@@ -165,13 +175,23 @@ impl LiveVideo {
             .streams()
             .best(ffmpeg_next::media::Type::Video)
             .and_then(|s| {
-                ffmpeg_next::codec::context::Context::from_parameters(s.parameters())
+                let dec = ffmpeg_next::codec::context::Context::from_parameters(s.parameters())
                     .ok()?
                     .decoder()
                     .video()
-                    .ok()?
-                    .codec()
-                    .map(|c| c.name().to_string())
+                    .ok()?;
+                let name = dec.codec().map(|c| c.name().to_string())?;
+                if name != "rawvideo" {
+                    return Some(name);
+                }
+                // Raw: the pixel format is the useful part (yuyv422, nv12…).
+                let pix: ffmpeg_next::ffi::AVPixelFormat = dec.format().into();
+                let p = unsafe { ffmpeg_next::ffi::av_get_pix_fmt_name(pix) };
+                if p.is_null() {
+                    Some(name)
+                } else {
+                    Some(unsafe { std::ffi::CStr::from_ptr(p) }.to_string_lossy().into_owned())
+                }
             })
             .unwrap_or_else(|| "unknown".into());
         let demux = DemuxDecoder::from_input(ictx, 33_333)?;
@@ -333,6 +353,18 @@ fn run_capture(demux: &mut DemuxDecoder, sh: &Arc<Shared>) {
     let mut convert_ms = 0f32;
     while !sh.stop.load(Ordering::Relaxed) {
         let decode = sh.active.load(Ordering::Relaxed);
+        if !decode && !sh.drain_idle.load(Ordering::Relaxed) {
+            // Unseen grab-on-read input: no capture work at all.
+            if let Ok(mut s) = sh.stats.lock() {
+                s.capture_fps = 0.0;
+                s.device_fps = 0.0;
+                s.last_error = None;
+            }
+            publish_times.clear();
+            packet_times.clear();
+            std::thread::sleep(Duration::from_millis(30));
+            continue;
+        }
         let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| demux.drain_live_mode(decode)))
             .unwrap_or_else(|_| Err(CaptureError::ReadFailed("capture backend panicked".into())));
         let now = crate::clock::now_us();
@@ -362,6 +394,12 @@ fn run_capture(demux: &mut DemuxDecoder, sh: &Arc<Shared>) {
                     packet_times.pop_front();
                 }
                 if let Ok(mut s) = sh.stats.lock() {
+                    // A pass that read video fine clears an old read error
+                    // (otherwise an unseen source, which publishes nothing,
+                    // kept showing a one-off error forever).
+                    if d.video_packets > 0 && published.is_none() && !decode {
+                        s.last_error = None;
+                    }
                     s.frames_dropped += d.dropped as u64;
                     s.decode_errors += d.decode_errors as u64;
                     s.capture_fps = publish_times.len() as f32;

@@ -12,6 +12,9 @@ let timer: ReturnType<typeof setTimeout> | null = null;
 let inFlight = false;
 export let latestMeters: AudioMeters | null = null;
 
+/** Polls since the last non-silent reading (slows the poll when nothing plays). */
+let silentPolls = 0;
+
 async function tick() {
   timer = null;
   if (listeners.size === 0) return;
@@ -19,14 +22,19 @@ async function tick() {
     inFlight = true;
     try {
       latestMeters = await api.audioMeters();
-      listeners.forEach((l) => l(latestMeters!));
+      const m = latestMeters;
+      const loud = m.master_peak > 1e-5 || m.channels.some((c) => c.peak > 1e-5);
+      silentPolls = loud ? 0 : silentPolls + 1;
+      listeners.forEach((l) => l(m));
     } catch {
       /* engine busy; next tick retries */
     } finally {
       inFlight = false;
     }
   }
-  timer = setTimeout(() => void tick(), 40);
+  // 25 Hz while there is sound; after 2 s of silence 4 Hz (meters read
+  // −∞ anyway) — the first sound brings 25 Hz back within 250 ms.
+  timer = setTimeout(() => void tick(), silentPolls > 50 ? 250 : 40);
 }
 
 export function subscribeMeters(l: Listener): () => void {

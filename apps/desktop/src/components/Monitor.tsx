@@ -14,14 +14,20 @@ export function useMonitorPolling() {
   useEffect(() => {
     let stop = false;
     let timer: ReturnType<typeof setTimeout> | null = null;
+    let still = 0;
     const loop = async () => {
       if (stop) return;
-      if (!document.hidden) await pollMonitor();
+      if (!document.hidden) {
+        const fresh = await pollMonitor();
+        still = fresh ? 0 : still + 1;
+      }
       // Under sustained load (engine missing frames) the monitor drops to
       // 15 fps first — preview smoothness gives way before the stream.
+      // A still picture (≈1 s without a new frame) is checked 10×/s.
       const d = useProduction.getState().diag;
       const behind = d ? d.render_fps < d.target_fps * 0.85 : false;
-      if (!stop) timer = setTimeout(() => void loop(), behind ? 66 : 33);
+      const wait = still > 30 ? 100 : behind ? 66 : 33;
+      if (!stop) timer = setTimeout(() => void loop(), wait);
     };
     void loop();
     return () => {

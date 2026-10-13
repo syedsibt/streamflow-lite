@@ -78,6 +78,10 @@ pub enum SourceKind {
         /// (`video=X:audio=Y`); its audio flows to the mixer like any
         /// audio input. None = video only.
         audio_device: Option<String>,
+        /// Device format to ask for first (`mjpeg`, `h264`, `yuyv422`,
+        /// `nv12`…; None = automatic: MJPEG, then raw).
+        #[serde(default)]
+        format: Option<String>,
     },
     /// Microphone / line-in audio input (Windows DirectShow audio;
     /// `device` selects which, None = first available). Audio-only:
@@ -565,6 +569,10 @@ pub struct ChannelStrip {
     /// Input trim in dB (`-20..=20`), before the fader.
     #[serde(default)]
     pub trim_db: f32,
+    /// Effects chain of this channel (each effect switchable). Runs after
+    /// the trim, before balance and the fader.
+    #[serde(default)]
+    pub fx: sf_audio::FxSettings,
 }
 
 impl Default for ChannelStrip {
@@ -575,6 +583,19 @@ impl Default for ChannelStrip {
             pan: 0.0,
             solo: false,
             trim_db: 0.0,
+            fx: sf_audio::FxSettings::default(),
+        }
+    }
+}
+
+impl ChannelStrip {
+    /// Strip for a new source: voice sources (microphones, cameras with
+    /// audio) start with the voice chain, everything else with no effects.
+    pub fn for_kind(kind: &SourceKind) -> Self {
+        let voice = matches!(kind, SourceKind::AudioInput { .. } | SourceKind::Camera { .. });
+        Self {
+            fx: if voice { sf_audio::FxSettings::voice() } else { sf_audio::FxSettings::default() },
+            ..Self::default()
         }
     }
 }
@@ -602,6 +623,8 @@ pub struct AudioMetersView {
     pub master_rms: f32,
     /// True while any channel is soloed (monitor = solo bus).
     pub solo_active: bool,
+    /// Live readings of the master effects.
+    pub master_fx: sf_audio::FxStats,
 }
 
 #[derive(Clone, Debug, Default, Serialize)]
@@ -613,15 +636,29 @@ pub struct ChannelMeterView {
     pub rms: f32,
     /// The channel has an audio stream (live input or file with audio).
     pub has_signal_path: bool,
+    /// Live readings of the channel's effects (None = no effect running).
+    pub fx: Option<sf_audio::FxStats>,
 }
 
 /// Mixer state: master strip + one strip per source id.
-#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct MixerState {
     /// Master strip.
     pub master: ChannelStrip,
     /// Per-source strips keyed by source id.
     pub channels: HashMap<String, ChannelStrip>,
+}
+
+impl Default for MixerState {
+    fn default() -> Self {
+        Self {
+            master: ChannelStrip {
+                fx: sf_audio::FxSettings::master(),
+                ..ChannelStrip::default()
+            },
+            channels: HashMap::new(),
+        }
+    }
 }
 
 /// UI-facing mixer snapshot. Meters are real once audio flows: `meters_live`
@@ -648,6 +685,12 @@ pub struct MixerView {
     /// A/V sync settings.
     #[serde(default)]
     pub av_sync: AvSyncView,
+    /// Live effects readings per source (gain reduction, gate, latency).
+    #[serde(default)]
+    pub fx_stats: HashMap<String, sf_audio::FxStats>,
+    /// Live effects readings of the master bus.
+    #[serde(default)]
+    pub master_fx_stats: sf_audio::FxStats,
 }
 
 /// UI-facing voice-enhancer settings (mirror of
@@ -783,9 +826,9 @@ impl fmt::Debug for StreamSettings {
 /// camera source is added (and the target of "Apply" for live reconfigure).
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct VideoSettings {
-    /// Program output width (1280 | 1920).
+    /// Program output width (see `VIDEO_OUTPUT_SIZES`: 640 … 2560).
     pub output_width: u32,
-    /// Program output height (720 | 1080).
+    /// Program output height (360 … 1440).
     pub output_height: u32,
     /// Program output fps (30 | 60). Also sets the media-tick cadence.
     pub output_fps: u32,
@@ -821,10 +864,33 @@ impl Default for VideoSettings {
 }
 
 /// Allowed values for the Video panel dropdowns (also the validation set).
-pub const VIDEO_OUTPUT_SIZES: [(u32, u32); 2] = [(1280, 720), (1920, 1080)];
-pub const VIDEO_CAMERA_SIZES: [(u32, u32); 3] =
-    [(854, 480), (1280, 720), (1920, 1080)];
+/// Output (stream + recording) sizes: 360p … 1440p, all 16:9 with even
+/// dimensions (H.264 needs even sizes).
+pub const VIDEO_OUTPUT_SIZES: [(u32, u32); 6] = [
+    (640, 360),
+    (854, 480),
+    (960, 540),
+    (1280, 720),
+    (1920, 1080),
+    (2560, 1440),
+];
+/// Default camera request sizes (a camera's own mode list is offered per
+/// device; see `camera_modes`).
+pub const VIDEO_CAMERA_SIZES: [(u32, u32); 8] = [
+    (640, 360),
+    (640, 480),
+    (854, 480),
+    (960, 540),
+    (1280, 720),
+    (1920, 1080),
+    (2560, 1440),
+    (3840, 2160),
+];
 pub const VIDEO_FPS_OPTIONS: [u32; 2] = [30, 60];
+/// Camera input frame rates that can be requested.
+pub const CAMERA_FPS_OPTIONS: [u32; 6] = [15, 24, 25, 30, 50, 60];
+/// Stream/record bitrate range, kbps.
+pub const BITRATE_RANGE_KBPS: (u32, u32) = (300, 60_000);
 pub const VIDEO_ENCODER_OPTIONS: [&str; 5] =
     ["auto", "h264_amf", "h264_nvenc", "h264_qsv", "libx264"];
 
@@ -1221,9 +1287,8 @@ impl Shell {
             if let Some(input_id) = &input_id {
                 self.engine.state_mut().add_input(input_id, &s.name);
             }
-            self.mixer
-                .channels
-                .insert(new_id.clone(), ChannelStrip::default());
+            let strip = self.mixer.channels.get(&s.id).cloned().unwrap_or_else(|| ChannelStrip::for_kind(&s.kind));
+            self.mixer.channels.insert(new_id.clone(), strip);
             dup.sources.push(SourceState {
                 id: new_id,
                 name: s.name.clone(),
@@ -1346,6 +1411,7 @@ fn parse_source_kind(
             height,
             fps,
             audio_device: audio_device.map(|d| d.to_string()),
+            format: None,
         }),
         "screen" => Ok(SourceKind::Screen),
         "audio_input" => Ok(SourceKind::AudioInput {
@@ -1467,6 +1533,7 @@ impl Shell {
             height,
             fps,
             audio_device,
+            format,
         } = &kind
         {
             let (w, h) = if *width > 0 && *height > 0 {
@@ -1474,9 +1541,9 @@ impl Shell {
             } else {
                 (1280, 720)
             };
-            let f = if *fps == 30 || *fps == 60 { *fps } else { 30 };
+            let f = camera_fps_or_default(*fps);
             if shared.is_none() {
-                self.open_camera_producer(&id, device.as_deref(), audio_device.as_deref(), w, h, f)?;
+                self.open_camera_producer(&id, device.as_deref(), audio_device.as_deref(), w, h, f, format.as_deref())?;
             }
         }
         #[cfg(any(windows, sf_wincheck))]
@@ -1514,7 +1581,8 @@ impl Shell {
         if let Some(input_id) = &input_id {
             self.engine.state_mut().add_input(input_id, name);
         }
-        self.mixer.channels.insert(id, ChannelStrip::default());
+        let strip = ChannelStrip::for_kind(&source.kind);
+        self.mixer.channels.insert(id, strip);
         self.events.push_back(UiEvent::SourceChanged {
             scene_id: scene_id.to_string(),
         });
@@ -1578,7 +1646,7 @@ impl Shell {
             // Dropping the LiveInput signals its capture thread to stop
             // (never joins: a wedged driver can't hang this command).
             self.audio_inputs.remove(id);
-            self.voice_enhancers.remove(id);
+            self.channel_fx.remove(id);
             self.audio_bus.remove(id);
             self.source_frames.remove(id);
             self.resized_frames.retain(|(rid, _, _), _| rid != id);
@@ -1754,7 +1822,11 @@ impl Shell {
                 n.filters = filters;
             }
         }
-        self.mixer.channels.insert(id, ChannelStrip::default());
+        let strip = ChannelStrip {
+            fx: self.mixer.channels.get(&orig.id).map(|c| c.fx.clone()).unwrap_or_else(|| ChannelStrip::for_kind(&orig.kind).fx),
+            ..ChannelStrip::default()
+        };
+        self.mixer.channels.insert(id, strip);
         self.find_scene_mut(scene_id).expect("scene exists").sources.push(dup.clone());
         self.events.push_back(UiEvent::SourceChanged { scene_id: scene_id.to_string() });
         Ok(dup)
@@ -2113,6 +2185,37 @@ impl Shell {
         })
     }
 
+    /// Content key of a scene whose picture cannot change by itself: only
+    /// colour, image and text layers, all ungraded, no transition, no Color
+    /// page watching. `None` = something moves (camera, screen, file, test
+    /// signal, grade, transition) — render every frame. The key covers every
+    /// layer's full settings (kind, text, colour, placement, order,
+    /// visibility) and the render size, so any edit gives a new key.
+    pub(crate) fn scene_static_key(&self, scene_id: &str, w: u32, h: u32) -> Option<u64> {
+        use std::hash::{Hash, Hasher};
+        if self.transition.is_some() || self.studio_watch_active() {
+            return None;
+        }
+        let scene = self.find_scene(scene_id)?;
+        let mut hs = std::collections::hash_map::DefaultHasher::new();
+        scene_id.hash(&mut hs);
+        (w, h).hash(&mut hs);
+        for s in &scene.sources {
+            if !s.visible || !s.kind.is_real() || matches!(s.kind, SourceKind::AudioInput { .. }) {
+                continue;
+            }
+            if !matches!(s.kind, SourceKind::Color { .. } | SourceKind::Image { .. } | SourceKind::Text { .. }) {
+                return None;
+            }
+            let input = s.input_id.as_ref()?;
+            if !self.engine.grade_is_passthrough(input) {
+                return None;
+            }
+            format!("{s:?}").hash(&mut hs);
+        }
+        Some(hs.finish())
+    }
+
     /// PNG bytes for a scene's composite (the adapter wraps this in a PNG
     /// data URL for the `scene_preview_png` command).
     pub fn scene_render_png(
@@ -2192,6 +2295,8 @@ impl Shell {
                 enhancer: self.enhancer_settings(),
                 voice: self.voice_stats(),
                 av_sync: self.av_sync.clone(),
+                fx_stats: self.channel_fx.iter().map(|(id, c)| (id.clone(), c.stats())).collect(),
+                master_fx_stats: self.master_fx.stats(),
             },
             stream_settings: self.stream_settings.clone(),
             stream_lifecycle: self.stream_lifecycle.clone(),
@@ -2370,7 +2475,7 @@ impl Shell {
             .keys()
             .map(|id| {
                 let (peak, rms) = self.meter_hold.get(id).copied().unwrap_or((0.0, 0.0));
-                ChannelMeterView { id: id.clone(), peak, rms, has_signal_path: paths.contains(id) }
+                ChannelMeterView { id: id.clone(), peak, rms, has_signal_path: paths.contains(id), fx: self.channel_fx.get(id).map(|c| c.stats()) }
             })
             .collect();
         channels.sort_by(|a, b| a.id.cmp(&b.id));
@@ -2382,6 +2487,7 @@ impl Shell {
             master_peak,
             master_rms,
             solo_active: self.mixer.channels.values().any(|c| c.solo),
+            master_fx: self.master_fx.stats(),
         }
     }
 
@@ -2412,6 +2518,23 @@ impl Shell {
     /// Mutes/unmutes the master.
     pub fn mixer_set_master_mute(&mut self, mute: bool) -> ChannelStrip {
         self.mixer.master.mute = mute;
+        self.events.push_back(UiEvent::MixerChanged);
+        self.mixer.master.clone()
+    }
+
+    /// Replaces a channel's effects settings (values are clamped). Applies
+    /// on the next audio block, without clicks.
+    pub fn mixer_set_fx(&mut self, source_id: &str, fx: sf_audio::FxSettings) -> Result<ChannelStrip, ShellError> {
+        let strip = self.mixer.channels.get_mut(source_id).ok_or_else(|| ShellError::UnknownSource(source_id.to_string()))?;
+        strip.fx = fx.sanitized();
+        let strip = strip.clone();
+        self.events.push_back(UiEvent::MixerChanged);
+        Ok(strip)
+    }
+
+    /// Replaces the master bus effects settings (values are clamped).
+    pub fn mixer_set_master_fx(&mut self, fx: sf_audio::FxSettings) -> ChannelStrip {
+        self.mixer.master.fx = fx.sanitized();
         self.events.push_back(UiEvent::MixerChanged);
         self.mixer.master.clone()
     }
@@ -2470,8 +2593,20 @@ pub struct CameraSourceInfo {
     pub height: u32,
     /// Configured capture fps.
     pub fps: u32,
+    /// Requested device format (None = automatic).
+    #[serde(default)]
+    pub format: Option<String>,
     /// What the camera actually negotiated (None = not opened / pending).
     pub negotiated: Option<String>,
+}
+
+/// Camera fps to request: any of [`CAMERA_FPS_OPTIONS`], else 30.
+pub(crate) fn camera_fps_or_default(fps: u32) -> u32 {
+    if CAMERA_FPS_OPTIONS.contains(&fps) {
+        fps
+    } else {
+        30
+    }
 }
 
 impl Shell {
@@ -2492,6 +2627,7 @@ impl Shell {
                     width,
                     height,
                     fps,
+                    format,
                     ..
                 } => Some(CameraSourceInfo {
                     id: s.id.clone(),
@@ -2500,7 +2636,8 @@ impl Shell {
                     width: *width,
                     height: *height,
                     fps: *fps,
-                    negotiated: self.camera_formats.get(&s.id).cloned(),
+                    format: format.clone(),
+                    negotiated: self.camera_formats.get(self.frame_owner(&s.id)).cloned(),
                 }),
                 _ => None,
             })
@@ -2529,10 +2666,10 @@ impl Shell {
                 s.encoder
             )));
         }
-        if !(500..=50_000).contains(&s.bitrate_kbps) {
+        if !(BITRATE_RANGE_KBPS.0..=BITRATE_RANGE_KBPS.1).contains(&s.bitrate_kbps) {
             return Err(ShellError::InvalidSetting(format!(
-                "bitrate {} kbps out of range (500-50000)",
-                s.bitrate_kbps
+                "bitrate {} kbps out of range ({}-{})",
+                s.bitrate_kbps, BITRATE_RANGE_KBPS.0, BITRATE_RANGE_KBPS.1
             )));
         }
         if !VIDEO_CAMERA_SIZES.contains(&(s.camera_width, s.camera_height)) {
@@ -2541,7 +2678,7 @@ impl Shell {
                 s.camera_width, s.camera_height
             )));
         }
-        if !VIDEO_FPS_OPTIONS.contains(&s.camera_fps) {
+        if !CAMERA_FPS_OPTIONS.contains(&s.camera_fps) {
             return Err(ShellError::InvalidSetting(format!(
                 "unsupported camera fps {}",
                 s.camera_fps
@@ -2581,6 +2718,33 @@ impl Shell {
         fps: u32,
         audio_device: Option<String>,
     ) -> Result<String, ShellError> {
+        let format = self
+            .scenes
+            .iter()
+            .flat_map(|sc| sc.sources.iter())
+            .find(|s| s.id == source_id)
+            .and_then(|s| match &s.kind {
+                SourceKind::Camera { format, .. } => format.clone(),
+                _ => None,
+            });
+        self.camera_configure(source_id, device, width, height, fps, format, audio_device)
+    }
+
+    /// [`Self::camera_reconfigure`] that also picks the device format
+    /// (`None` = automatic). The old capture is stopped before the new one
+    /// opens, so a device never runs twice.
+    #[allow(clippy::too_many_arguments)]
+    pub fn camera_configure(
+        &mut self,
+        source_id: &str,
+        device: Option<String>,
+        width: u32,
+        height: u32,
+        fps: u32,
+        format: Option<String>,
+        audio_device: Option<String>,
+    ) -> Result<String, ShellError> {
+        let format = format.filter(|f| !f.is_empty() && f != "auto");
         let scene_idx = self
             .scenes
             .iter()
@@ -2614,6 +2778,7 @@ impl Shell {
                 height,
                 fps,
                 audio_device: existing_audio.clone(),
+                format: format.clone(),
             };
         }
         // A shared scene item reconfigures the shared capture (same physical
@@ -2646,7 +2811,7 @@ impl Shell {
             } else {
                 (1280, 720)
             };
-            let f = if fps == 30 || fps == 60 { fps } else { 30 };
+            let f = camera_fps_or_default(fps);
             self.open_camera_producer(
                 source_id,
                 device.as_deref(),
@@ -2654,6 +2819,7 @@ impl Shell {
                 w,
                 h,
                 f,
+                format.as_deref(),
             )?;
         }
         Ok(self

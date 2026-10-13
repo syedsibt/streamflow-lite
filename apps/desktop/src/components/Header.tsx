@@ -11,7 +11,7 @@ export default function Header() {
   const resetSection = useStudio((s) => s.resetSection);
   // Real production sources (camera/media) with engine input ids — the
   // Color Studio target list. Filters/grades apply to the selected input.
-  const scenes = useProduction((s) => s.state?.scenes ?? []);
+  const scenes = useProduction((s) => s.state?.scenes) ?? [];
   const realSources = scenes.flatMap((sc) =>
     sc.sources
       .filter((src) => src.input_id)

@@ -80,11 +80,13 @@ use std::collections::HashMap;
 
 pub mod bus;
 pub mod denoise;
+pub mod effects;
 pub mod enhancer;
 pub mod live_input;
 pub mod rnnoise;
 pub use bus::{AudioBus, AudioTimeline, BusConfig, SampleClock, SourceBusStats, ALIGN_TOLERANCE_US, MAX_ALIGN_DELAY_US};
 pub use denoise::NoiseSuppressor;
+pub use effects::{FxChain, FxSettings, FxStats};
 pub use enhancer::{Enhancer, EnhancerSettings, EnhancerStats};
 pub use live_input::{LiveInput, LiveStatus, TimedChunk};
 
@@ -302,6 +304,13 @@ impl Mixer {
     /// silence; non-conforming frames are skipped and counted in
     /// `dropped_blocks`.
     pub fn mix(&mut self, inputs: &[(&str, AudioFrame)]) -> MixedOutput {
+        self.mix_with(inputs, &mut |_: &mut [f32]| {})
+    }
+
+    /// [`Mixer::mix`] with a program-bus processor (master effects) run at
+    /// insert point #2 — after the master fader, before the clip ceiling
+    /// and the output meter, so the meter shows what is really sent.
+    pub fn mix_with(&mut self, inputs: &[(&str, AudioFrame)], bus_fx: &mut dyn FnMut(&mut [f32])) -> MixedOutput {
         let block_len = inputs
             .iter()
             .filter(|(_, f)| f.conforms())
@@ -381,11 +390,19 @@ impl Mixer {
         } else {
             self.master_gain
         };
+        if mg != 1.0 {
+            for s in out.iter_mut() {
+                *s *= mg;
+            }
+        }
+        if !self.master_mute && block_len > 0 {
+            bus_fx(&mut out);
+        }
         let (mut mix_peak, mut mix_sq) = (0.0f32, 0.0f64);
         for s in out.iter_mut() {
             // Soft-clip: hard clamp at ±1.0 (0 dBFS). Linear below the
             // ceiling, predictable at it; never wraps, never NaNs.
-            let c = (*s * mg).clamp(-CLIP_CEILING, CLIP_CEILING);
+            let c = (*s).clamp(-CLIP_CEILING, CLIP_CEILING);
             *s = c;
             let a = c.abs();
             if a > mix_peak {

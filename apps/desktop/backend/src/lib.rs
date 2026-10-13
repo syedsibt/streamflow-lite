@@ -64,6 +64,48 @@ pub fn enumerate_cameras() -> Result<Vec<String>, String> {
     }
 }
 
+/// One output mode a camera advertises (UI view of [`sf_capture::CameraMode`]).
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize, PartialEq)]
+pub struct CameraModeView {
+    /// `mjpeg`, `h264`, or a raw pixel format (`yuyv422`, `nv12`…).
+    pub format: String,
+    pub min_width: u32,
+    pub min_height: u32,
+    pub max_width: u32,
+    pub max_height: u32,
+    pub min_fps: f32,
+    pub max_fps: f32,
+}
+
+/// The modes a camera / capture card reports (format, size, frame-rate
+/// range), largest first — enumerated WITHOUT the engine lock. Empty when
+/// the device reports none or this platform has no camera backend.
+pub fn enumerate_camera_modes(device: &str) -> Result<Vec<CameraModeView>, String> {
+    #[cfg(any(windows, sf_wincheck))]
+    {
+        sf_capture::dshow::list_device_modes(device)
+            .map(|v| {
+                v.into_iter()
+                    .map(|m| CameraModeView {
+                        format: m.format,
+                        min_width: m.min_width,
+                        min_height: m.min_height,
+                        max_width: m.max_width,
+                        max_height: m.max_height,
+                        min_fps: m.min_fps,
+                        max_fps: m.max_fps,
+                    })
+                    .collect()
+            })
+            .map_err(|e| format!("cannot read the modes of '{device}': {e}"))
+    }
+    #[cfg(not(any(windows, sf_wincheck)))]
+    {
+        let _ = device;
+        Ok(Vec::new())
+    }
+}
+
 /// Audio input devices (see [`enumerate_cameras`]).
 pub fn enumerate_audio_devices() -> Result<Vec<String>, String> {
     #[cfg(any(windows, sf_wincheck))]
@@ -92,6 +134,7 @@ pub fn media_clock_us(t: Instant) -> i64 {
 /// Production state machine (scenes, sources, transitions, mixer, stream,
 /// record, macros) — all headless-testable, no tauri dependency.
 pub use color_library::{encode_preview_jpeg, ColorPresetInfo, LutInfo, PreviewMode};
+pub use sf_audio::{FxSettings, FxStats};
 pub use production::{
     transition_progress, AudioMetersView, ChannelMeterView, AvSyncView, FitMode, SourceTransform, CameraSourceInfo, ChannelStrip, EnhancerView, Macro, MacroAction,
     MacroDispatchResult, MixerView, ProdScene, ProductionStateView, RecordFormat, RecordLifecycle,
@@ -214,8 +257,18 @@ impl Shell {
             }
         }
         let (mw, mh) = self.monitor_size;
+        // A static scene (nothing moving) is rendered once; later polls get
+        // the same frame (same seq → the UI transfers and decodes nothing).
+        let key = self.scene_static_key(scene_id, mw, mh);
+        if let (Some(k), Some((sid, ck, m))) = (key, &self.static_monitor) {
+            if sid == scene_id && *ck == k {
+                return Ok(m.clone());
+            }
+        }
         let frame = self.render_scene_frame(scene_id, mw, mh)?;
-        Ok(self.to_monitor(frame))
+        let m = self.to_monitor(frame);
+        self.static_monitor = key.map(|k| (scene_id.to_string(), k, m.clone()));
+        Ok(m)
     }
 }
 
@@ -555,6 +608,12 @@ pub struct Shell {
     monitor_requested_at: Option<Instant>,
     /// Increments on every monitor frame (lets the UI skip unchanged ones).
     monitor_seq: u64,
+    /// Content key of the last program picture when the program scene is
+    /// static (colour / image / text only, no grade): while it holds, the
+    /// tick renders nothing new for the monitor and the UI receives nothing.
+    static_program_key: Option<u64>,
+    /// Last on-demand scene monitor (preview scene) with its content key.
+    static_monitor: Option<(String, u64, MonitorFrame)>,
     // --- production state machine (see `production` module) ---
     /// Production scenes.
     scenes: Vec<production::ProdScene>,
@@ -625,12 +684,14 @@ pub struct Shell {
     audio_timeline: sf_audio::AudioTimeline,
     /// A/V sync settings (auto alignment + manual offset).
     av_sync: production::AvSyncView,
-    /// Voice enhancer settings (AI denoise → gate → EQ → compressor),
-    /// shared by every voice source.
+    /// Legacy "voice enhancer" view (older UI command): applied to every
+    /// voice channel's effects when set.
     enhancer_settings: sf_audio::EnhancerSettings,
-    /// One stateful enhancer per live voice source (mic / camera audio),
-    /// applied PRE-fader. Media files are never processed.
-    voice_enhancers: HashMap<String, sf_audio::Enhancer>,
+    /// One stateful effects chain per audio channel that has an effect on
+    /// (`ChannelStrip::fx`); channels with every effect off have none.
+    channel_fx: HashMap<String, sf_audio::FxChain>,
+    /// Effects chain of the master (program) bus.
+    master_fx: sf_audio::FxChain,
     /// Local speaker monitor (None = off). Opened on demand so a missing
     /// audio device can never break startup.
     audio_monitor: Option<audio_monitor::AudioMonitor>,
@@ -735,6 +796,8 @@ impl Shell {
             monitor_requested_at: None,
             monitor_size: (MONITOR_W, MONITOR_H),
             monitor_seq: 0,
+            static_program_key: None,
+            static_monitor: None,
             scenes: Vec::new(),
             preview_scene_id: String::new(),
             program_scene_id: String::new(),
@@ -764,7 +827,8 @@ impl Shell {
             audio_timeline: sf_audio::AudioTimeline::new(),
             av_sync: production::AvSyncView::default(),
             enhancer_settings: sf_audio::EnhancerSettings::default(),
-            voice_enhancers: HashMap::new(),
+            channel_fx: HashMap::new(),
+            master_fx: sf_audio::FxChain::new(sf_audio::FxSettings::master()),
             audio_monitor: None,
             meter_values: HashMap::new(),
             meter_hold: HashMap::new(),

@@ -1,0 +1,81 @@
+# StreamFlow Lite — Linux QA.
+# Fast feedback before a Windows build:
+#  * ui:   type-check + build the React UI, then drive it in Chromium against
+#          a mock backend (apps/desktop/qa) and upload screenshots + report.
+#  * rust: unit tests of the audio and capture crates, a type-check of the
+#          Windows-only code paths (--cfg sf_wincheck), and the backend tests
+#          on the lavapipe software GPU.
+name: Linux QA
+
+on:
+  workflow_dispatch:
+
+jobs:
+  ui:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+          cache-dependency-path: apps/desktop/package-lock.json
+      - name: Install
+        working-directory: apps/desktop
+        run: npm ci
+      - name: Type-check + build
+        working-directory: apps/desktop
+        run: npm run build
+      - name: Playwright (Chromium)
+        working-directory: apps/desktop
+        run: |
+          npm i --no-save playwright@1.48.2
+          npx playwright install --with-deps chromium
+      - name: UI checks + screenshots
+        working-directory: apps/desktop
+        run: node qa/shots.mjs
+      - name: Upload screenshots
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: qa-screenshots
+          path: apps/desktop/qa-out
+
+  rust:
+    runs-on: ubuntu-24.04
+    env:
+      CARGO_TERM_COLOR: never
+      VK_ICD_FILENAMES: /usr/share/vulkan/icd.d/lvp_icd.x86_64.json
+    steps:
+      - uses: actions/checkout@v4
+      - name: System libraries (FFmpeg 6.1, lavapipe, ALSA)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends pkg-config clang libclang-dev \
+            libavcodec-dev libavformat-dev libavutil-dev libswscale-dev libswresample-dev \
+            libavdevice-dev libavfilter-dev mesa-vulkan-drivers libvulkan1 libasound2-dev ffmpeg
+          ls /usr/share/vulkan/icd.d/
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: sf-audio tests
+        run: cargo test -p sf-audio
+      - name: sf-capture tests (camera modes parser)
+        run: cargo test -p sf-capture --lib camera_modes
+      - name: Windows code paths type-check
+        run: RUSTFLAGS="--cfg sf_wincheck" cargo check -p sf-ui-backend --tests
+      - name: Backend tests (lavapipe)
+        run: |
+          cargo build -p gen-lut
+          set +e
+          cargo test -p sf-ui-backend --no-fail-fast > backend-test.log 2>&1
+          code=$?
+          grep -E "^test .* FAILED$|^test result|panicked at|^error" backend-test.log | head -150 || true
+          tail -30 backend-test.log
+          exit $code
+      - name: Upload test log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: backend-test-log
+          path: backend-test.log
+          if-no-files-found: ignore

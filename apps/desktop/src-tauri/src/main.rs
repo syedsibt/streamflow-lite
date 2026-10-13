@@ -529,6 +529,30 @@ fn camera_reconfigure(
         .map_err(ue)
 }
 
+/// Reopens a camera with device / size / fps / device format (None =
+/// automatic). Returns what the camera actually delivers.
+#[tauri::command(async, rename_all = "snake_case")]
+fn camera_configure(
+    state: State<'_, AppState>,
+    source_id: String,
+    device: Option<String>,
+    width: u32,
+    height: u32,
+    fps: u32,
+    format: Option<String>,
+    audio_device: Option<String>,
+) -> CmdResult<String> {
+    lock(&state)?
+        .camera_configure(&source_id, device, width, height, fps, format, audio_device)
+        .map_err(ue)
+}
+
+/// Modes (format, size, fps range) a camera reports. No engine lock.
+#[tauri::command(async, rename_all = "snake_case")]
+fn camera_modes(device: String) -> CmdResult<Vec<sf_ui_backend::CameraModeView>> {
+    sf_ui_backend::enumerate_camera_modes(&device)
+}
+
 /// All camera sources with live config + negotiated format (Video panel).
 #[tauri::command(async, rename_all = "snake_case")]
 fn camera_sources(state: State<'_, AppState>) -> CmdResult<Vec<CameraSourceInfo>> {
@@ -794,6 +818,18 @@ fn mixer_set_master_mute(state: State<'_, AppState>, mute: bool) -> CmdResult<Ch
     Ok(lock(&state)?.mixer_set_master_mute(mute))
 }
 
+/// Replaces one channel's effects (each effect has its own on/off).
+#[tauri::command(async, rename_all = "snake_case")]
+fn mixer_set_fx(state: State<'_, AppState>, source_id: String, fx: sf_ui_backend::FxSettings) -> CmdResult<ChannelStrip> {
+    lock(&state)?.mixer_set_fx(&source_id, fx).map_err(ue)
+}
+
+/// Replaces the master (program) bus effects.
+#[tauri::command(async, rename_all = "snake_case")]
+fn mixer_set_master_fx(state: State<'_, AppState>, fx: sf_ui_backend::FxSettings) -> CmdResult<ChannelStrip> {
+    Ok(lock(&state)?.mixer_set_master_fx(fx))
+}
+
 /// Enables/disables local speaker monitoring of the master mix.
 #[tauri::command(async, rename_all = "snake_case")]
 fn set_monitor_enabled(state: State<'_, AppState>, enabled: bool) -> CmdResult<bool> {
@@ -1057,6 +1093,8 @@ fn main() {
             video_settings_get,
             video_settings_set,
             camera_reconfigure,
+            camera_configure,
+            camera_modes,
             camera_sources,
             list_audio_devices,
             media_set_paused,
@@ -1090,6 +1128,8 @@ fn main() {
             source_duplicate,
             mixer_set_master_gain,
             mixer_set_master_mute,
+            mixer_set_fx,
+            mixer_set_master_fx,
             set_monitor_enabled,
             set_enhancer_settings,
             stream_set_settings,

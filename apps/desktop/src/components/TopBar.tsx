@@ -1,4 +1,8 @@
+import { useState } from "react";
 import { useProduction } from "../lib/productionStore";
+import ErrorBoundary from "./ErrorBoundary";
+import { Glyph } from "./ui";
+import VideoInputDialog from "./VideoInput";
 
 export type StepId = "production" | "color";
 
@@ -26,6 +30,8 @@ export default function TopBar({ step, setStep, onDiagnostics }: { step: StepId;
   const recOn = rec === "recording" || rec === "paused";
   const sys = diag?.system;
   const fpsLow = diag ? diag.render_fps < diag.target_fps * 0.9 : false;
+  const [videoInput, setVideoInput] = useState(false);
+  const cams = useProduction((s) => s.state?.scenes.some((sc) => sc.sources.some((x) => x.kind === "camera")) ?? false);
 
   return (
     <header className="topbar">
@@ -42,6 +48,15 @@ export default function TopBar({ step, setStep, onDiagnostics }: { step: StepId;
           </button>
         ))}
       </nav>
+      <button type="button" className={"vi-btn" + (cams ? "" : " dim")} onClick={() => setVideoInput(true)} title="Video input: what your camera / capture card captures (size, frame rate, format) — separate from the stream output">
+        <Glyph name="video" size={15} />
+        Video input
+      </button>
+      {videoInput && (
+        <ErrorBoundary label="Video input">
+          <VideoInputDialog onClose={() => setVideoInput(false)} />
+        </ErrorBoundary>
+      )}
       <div className="onair">
         <button
           type="button"

@@ -83,8 +83,21 @@ pub fn list_audio_devices() -> Result<Vec<String>, CaptureError> {
     Ok(parse_dshow_devices(&list_devices_raw()?, "(audio)"))
 }
 
+/// The output modes (format, size, frame-rate range) a camera or capture
+/// card advertises, largest first. Empty when the driver reports none.
+pub fn list_device_modes(device: &str) -> Result<Vec<crate::CameraMode>, CaptureError> {
+    let log = dshow_log(&format!("video={device}"), "list_options", "true")?;
+    Ok(crate::camera_modes::parse_dshow_options(&log))
+}
+
 /// Run the dshow device listing and return the raw captured log.
 fn list_devices_raw() -> Result<String, CaptureError> {
+    dshow_log("dummy", "list_devices", "1")
+}
+
+/// Open the dshow input with one listing option (which makes FFmpeg print
+/// what was asked and fail the open) and return the captured log.
+fn dshow_log(url: &str, key: &str, value: &str) -> Result<String, CaptureError> {
     ensure_init();
     let _guard = ENUM_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let fmt_name = CString::new("dshow").unwrap();
@@ -96,13 +109,13 @@ fn list_devices_raw() -> Result<String, CaptureError> {
     }
     LOG_CAPTURE.lock().unwrap_or_else(|e| e.into_inner()).clear();
     unsafe { ff::ffi::av_log_set_callback(Some(log_capture_cb)) };
-    let url = CString::new("dummy").unwrap();
+    let url = CString::new(url).map_err(|_| CaptureError::OpenFailed("device name contains NUL".into()))?;
     let mut dict: *mut ff::ffi::AVDictionary = ptr::null_mut();
-    let key = CString::new("list_devices").unwrap();
-    let val = CString::new("1").unwrap();
+    let key = CString::new(key).expect("static key");
+    let val = CString::new(value).expect("static value");
     unsafe { ff::ffi::av_dict_set(&mut dict, key.as_ptr(), val.as_ptr(), 0) };
     let mut ctx: *mut ff::ffi::AVFormatContext = ptr::null_mut();
-    // `list_devices` always "fails" the open — that is expected.
+    // A listing option always "fails" the open — that is expected.
     let _ = unsafe {
         ff::ffi::avformat_open_input(
             &mut ctx,
@@ -184,6 +197,14 @@ impl DshowProducer {
     /// negotiated (some virtual cameras / capture cards reject explicit
     /// options).
     pub fn open(device: &str, width: u32, height: u32, fps: u32) -> Result<Self, CaptureError> {
+        Self::open_format(device, width, height, fps, None)
+    }
+
+    /// [`Self::open`] asking for one device format first (`"mjpeg"`,
+    /// `"h264"`, or a raw pixel format such as `"yuyv422"` / `"nv12"`, as
+    /// listed by [`list_device_modes`]). If the device refuses it, the usual
+    /// order is tried and the negotiated text says what was not available.
+    pub fn open_format(device: &str, width: u32, height: u32, fps: u32, format: Option<&str>) -> Result<Self, CaptureError> {
         ensure_init();
         let size = format!("{width}x{height}");
         let rate = fps.to_string();
@@ -197,9 +218,16 @@ impl DshowProducer {
         // Compressed MJPEG first: USB cameras deliver 1080p at full rate
         // only as MJPEG (raw YUY2 1080p exceeds USB 2 bandwidth and is
         // typically limited to ~5 fps or not offered at all).
-        let mut attempts: Vec<(&str, Vec<(&str, &str)>)> = vec![
-            ("mjpeg", vec![("vcodec", "mjpeg"), ("video_size", &size), ("framerate", &rate_ceil)]),
-        ];
+        let mut attempts: Vec<(&str, Vec<(&str, &str)>)> = Vec::new();
+        if let Some(f) = format.filter(|f| !f.is_empty() && *f != "auto") {
+            let key = if matches!(f, "mjpeg" | "h264" | "hevc") { "vcodec" } else { "pixel_format" };
+            attempts.push((f, vec![(key, f), ("video_size", &size), ("framerate", &rate_ceil)]));
+            if rate_ceil != rate {
+                attempts.push((f, vec![(key, f), ("video_size", &size), ("framerate", &rate)]));
+            }
+            attempts.push((f, vec![(key, f), ("video_size", &size)]));
+        }
+        attempts.push(("mjpeg", vec![("vcodec", "mjpeg"), ("video_size", &size), ("framerate", &rate_ceil)]));
         if rate_ceil != rate {
             attempts.push(("mjpeg", vec![("vcodec", "mjpeg"), ("video_size", &size), ("framerate", &rate)]));
         }

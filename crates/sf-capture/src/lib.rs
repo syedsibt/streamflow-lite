@@ -228,6 +228,8 @@ pub mod dshow;
 
 pub mod audio_in;
 mod audio_norm;
+pub mod camera_modes;
+pub use camera_modes::CameraMode;
 pub mod still_image;
 
 #[cfg(any(windows, sf_wincheck))]

@@ -45,6 +45,9 @@ impl ScreenProducer {
             &[("framerate", fps.as_str()), ("draw_mouse", "1")],
             OPEN_TIMEOUT,
         )?;
+        // The desktop is grabbed on each read (no device queue): while no
+        // scene shows it, don't grab at all.
+        live.set_drain_when_idle(false);
         let info = live.stream_info();
         Ok(Self { live, info })
     }

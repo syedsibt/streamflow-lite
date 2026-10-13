@@ -1,6 +1,7 @@
 import { useEffect, useRef, useState } from "react";
 import { useProduction } from "../../lib/productionStore";
 import AddSourceDialog from "./AddSourceDialog";
+import ErrorBoundary from "../ErrorBoundary";
 import Mixer from "./Mixer";
 import { useMonitorPolling } from "../Monitor";
 import Monitors from "./Monitors";
@@ -118,21 +119,26 @@ export default function Workspace({ onOpenColorPage }: { onOpenColorPage: () => 
             </section>
           )}
           <section className="panel mixer-panel" aria-label="Audio mixer">
-            <h2>Audio mixer</h2>
-            <Mixer />
+            <ErrorBoundary label="Audio mixer">
+              <Mixer />
+            </ErrorBoundary>
           </section>
           <section className="panel props-panel" aria-label="Properties">
-            <PropertiesPanel
-              onOpenColorPage={onOpenColorPage}
-              extra={[
-                ...(foldScenes ? [{ id: "scenes", label: "Scenes", node: <ScenesPanel /> }] : []),
-                ...(foldOutput ? [{ id: "output", label: "Output", node: <OutputPanel /> }] : []),
-              ]}
-            />
+            <ErrorBoundary label="Properties">
+              <PropertiesPanel
+                onOpenColorPage={onOpenColorPage}
+                extra={[
+                  ...(foldScenes ? [{ id: "scenes", label: "Scenes", node: <ScenesPanel /> }] : []),
+                  ...(foldOutput ? [{ id: "output", label: "Output", node: <OutputPanel /> }] : []),
+                ]}
+              />
+            </ErrorBoundary>
           </section>
           {!foldOutput && (
             <section className="panel output-panel" aria-label="Output">
-              <OutputPanel />
+              <ErrorBoundary label="Output">
+                <OutputPanel />
+              </ErrorBoundary>
             </section>
           )}
         </div>

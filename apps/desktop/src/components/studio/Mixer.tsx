@@ -2,6 +2,14 @@ import { useEffect, useMemo, useState } from "react";
 import { api } from "../../lib/ipc";
 import { errText, useProduction } from "../../lib/productionStore";
 import MeterCanvas from "./MeterCanvas";
+import { FxDialog } from "./AudioFx";
+import type { FxSettings } from "../../lib/types";
+
+/** Number of effects switched on (0 when the chain is bypassed). */
+export function fxCount(fx: FxSettings | undefined): number {
+  if (!fx || !fx.enabled) return 0;
+  return [fx.highpass_enabled, fx.lowpass_enabled, fx.denoise_enabled, fx.gate_enabled, fx.eq_enabled, fx.deesser_enabled, fx.compressor_enabled, fx.limiter_enabled, fx.delay_enabled, fx.invert_polarity || fx.mono].filter(Boolean).length;
+}
 import { subscribeMeters } from "./meters";
 
 /** Source ids that currently have an audio stream (from the live meters). */
@@ -47,6 +55,7 @@ export default function Mixer() {
   const [adding, setAdding] = useState(false);
   const [mics, setMics] = useState<string[] | null>(null);
   const [micErr, setMicErr] = useState<string | null>(null);
+  const [fxFor, setFxFor] = useState<string | null>(null);
 
   const mixer = state?.mixer;
   const strips = useMemo(() => {
@@ -78,7 +87,15 @@ export default function Mixer() {
   const anySolo = mixer.channels.some((c) => c.solo);
 
   return (
+    <>
+    <div className="panel-head">
+      <h2>Audio mixer</h2>
+      <button type="button" className="tool" onClick={() => setFxFor(strips.find((s) => mixer.channels.some((c) => c.source_id === s.id))?.id ?? "master")} title="Effects of every channel and the master, each with its own on/off">
+        Audio settings
+      </button>
+    </div>
     <div className="mixer">
+      {fxFor && <FxDialog initial={fxFor} channels={strips.filter((s) => mixer.channels.some((c) => c.source_id === s.id)).map((s) => ({ id: s.id, name: s.name }))} onClose={() => setFxFor(null)} />}
       <div className="mixer-chs">
         {strips.length === 0 && (
           <div className="panel-empty">
@@ -153,6 +170,9 @@ export default function Mixer() {
                 />
                 <output>{ch.pan === 0 ? "C" : ch.pan < 0 ? `L${Math.round(-ch.pan * 100)}` : `R${Math.round(ch.pan * 100)}`}</output>
               </label>
+              <button type="button" className={"sq fx" + (fxCount(ch.fx) ? " on" : "")} onClick={() => setFxFor(s.id)} title="Audio settings: noise removal, gate, EQ, compressor, limiter…">
+                FX{fxCount(ch.fx) ? ` · ${fxCount(ch.fx)}` : ""}
+              </button>
               <div className="ch-buttons">
                 <button type="button" className={"sq mute" + (ch.mute ? " on" : "")} aria-pressed={ch.mute} onClick={() => void setMute(s.id, !ch.mute)} title="Mute (stream and recording)">
                   Mute
@@ -215,6 +235,9 @@ export default function Mixer() {
           />
         </div>
         <div className="ch-db">{fmtDb(gainToDb(mixer.master.gain))} dB</div>
+        <button type="button" className={"sq fx" + (fxCount(mixer.master.fx) ? " on" : "")} onClick={() => setFxFor("master")} title="Master effects: limiter, compressor, EQ">
+          FX{fxCount(mixer.master.fx) ? ` · ${fxCount(mixer.master.fx)}` : ""}
+        </button>
         <div className="ch-buttons">
           <button type="button" className={"sq mute" + (mixer.master.mute ? " on" : "")} aria-pressed={mixer.master.mute} onClick={() => void setMasterMute(!mixer.master.mute)}>
             Mute
@@ -231,5 +254,6 @@ export default function Mixer() {
         </div>
       </div>
     </div>
+    </>
   );
 }

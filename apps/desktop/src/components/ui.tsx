@@ -188,7 +188,7 @@ export function Field({ label, children, hint }: { label: string; children: Reac
 }
 
 /** Simple monochrome glyphs (no emoji, no icon font). */
-export type GlyphName = "camera" | "screen" | "media" | "mic" | "text" | "color" | "pattern" | "capture" | "image" | "eye" | "eyeoff" | "lock" | "unlock" | "window" | "browser" | "network";
+export type GlyphName = "camera" | "screen" | "media" | "mic" | "text" | "color" | "pattern" | "capture" | "image" | "eye" | "eyeoff" | "lock" | "unlock" | "window" | "browser" | "network" | "trash" | "grip" | "sliders" | "video";
 
 export function Glyph({ name, size = 18 }: { name: GlyphName; size?: number }) {
   const p: Record<string, string> = {
@@ -208,6 +208,10 @@ export function Glyph({ name, size = 18 }: { name: GlyphName; size?: number }) {
     window: "M3 5h18v14H3z M3 9h18",
     browser: "M12 3a9 9 0 1 0 0 18 9 9 0 0 0 0-18 M3 12h18 M12 3c3 3 3 15 0 18 M12 3c-3 3-3 15 0 18",
     network: "M5 12a7 7 0 0 1 14 0 M8 12a4 4 0 0 1 8 0 M12 12v8",
+    trash: "M4 7h16 M9 7V4h6v3 M6 7l1 13h10l1-13 M10 11v6 M14 11v6",
+    grip: "M9 6h.01 M15 6h.01 M9 12h.01 M15 12h.01 M9 18h.01 M15 18h.01",
+    sliders: "M4 7h10 M18 7h2 M4 17h4 M12 17h8 M14 5v4 M8 15v4",
+    video: "M3 7h12v10H3z M15 10l6-3v10l-6-3",
   };
   return (
     <svg viewBox="0 0 24 24" width={size} height={size} fill="none" stroke="currentColor" strokeWidth="1.7" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">

@@ -34,6 +34,8 @@ import type {
   Diagnostics,
   PlatformInfo,
   AvSync,
+  FxSettings,
+  CameraMode,
 } from "./types";
 
 declare global {
@@ -132,6 +134,15 @@ export const api = {
   scenePreviewJpg: (scene_id: string) => cmd<ArrayBuffer>("scene_preview_jpg", { scene_id }),
   /** Tell the engine how wide (device px) the monitors are drawn. */
   monitorSetDisplayWidth: (width: number) => cmd<[number, number]>("monitor_set_display_width", { width }),
+  /** One channel's effects chain. */
+  mixerSetFx: (source_id: string, fx: FxSettings) => cmd<unknown>("mixer_set_fx", { source_id, fx }),
+  /** Master (program) bus effects. */
+  mixerSetMasterFx: (fx: FxSettings) => cmd<unknown>("mixer_set_master_fx", { fx }),
+  /** Modes a camera reports (format, size, fps range); empty = not reported. */
+  cameraModes: (device: string) => cmd<CameraMode[]>("camera_modes", { device }),
+  /** Reopen a camera with size / fps / device format (null = automatic). */
+  cameraConfigure: (a: { source_id: string; device: string | null; width: number; height: number; fps: number; format: string | null; audio_device: string | null }) =>
+    cmd<string>("camera_configure", a),
 
   sourceAdd: (scene_id: string, kind: SourceKind, name: string) => {
     // The backend takes flat args (kind as a snake_case string plus extras);

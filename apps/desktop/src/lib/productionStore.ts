@@ -27,7 +27,10 @@ import type {
   VoiceStats,
   PerfSample,
   MixerChannelView,
+  FxSettings,
+  FxStats,
 } from "./types";
+import { FX_OFF } from "./types";
 
 interface ProductionStore {
   ready: boolean;
@@ -51,7 +54,8 @@ interface ProductionStore {
   init: () => Promise<void>;
   dispose: () => void;
   refresh: () => Promise<void>;
-  pollMonitor: () => Promise<void>;
+  /** Resolves true when a new program frame arrived. */
+  pollMonitor: () => Promise<boolean>;
   pollDiagnostics: () => Promise<void>;
   /** Last ~2 minutes of real diagnostics samples (1 per poll). */
   perf: PerfSample[];
@@ -65,6 +69,8 @@ interface ProductionStore {
   setChannelPan: (source_id: string, pan: number) => void;
   setChannelSolo: (source_id: string, solo: boolean) => Promise<void>;
   setChannelTrim: (source_id: string, trim_db: number) => void;
+  /** One channel's effects ("master" = program bus); sent ≤ 20×/s. */
+  setChannelFx: (source_id: string | "master", fx: FxSettings) => void;
 
   /** The scene everything is added to (program). */
   sceneId: () => string | null;
@@ -177,6 +183,10 @@ function scheduleGainFlush() {
 }
 
 let avTimer: ReturnType<typeof setTimeout> | null = null;
+let fxTimer: ReturnType<typeof setTimeout> | null = null;
+let previewSeq = 0;
+let previewSceneOf: string | null = null;
+const pendingFx = new Map<string, FxSettings>();
 let unlisten: (() => void) | null = null;
 let monitorInFlight = false;
 let diagInFlight = false;
@@ -254,6 +264,7 @@ function normalizeProductionState(raw: unknown): ProductionStateData {
     pan: num(ch?.pan, 0),
     solo: !!ch?.solo,
     trim_db: num(ch?.trim_db, 0),
+    fx: { ...FX_OFF, ...(ch?.fx ?? {}) } as FxSettings,
   }));
   const sl = (r.stream_lifecycle ?? {}) as Record<string, any>;
   const rl = (r.record_lifecycle ?? {}) as Record<string, any>;
@@ -264,7 +275,9 @@ function normalizeProductionState(raw: unknown): ProductionStateData {
     program_scene_id: r.program_scene_id ?? null,
     mixer: {
       channels,
-      master: { gain: num(r.mixer?.master?.gain, 1), mute: !!r.mixer?.master?.mute },
+      master: { gain: num(r.mixer?.master?.gain, 1), mute: !!r.mixer?.master?.mute, fx: { ...FX_OFF, ...(r.mixer?.master?.fx ?? {}) } as FxSettings },
+      fx_stats: r.mixer?.fx_stats && typeof r.mixer.fx_stats === "object" ? (r.mixer.fx_stats as Record<string, FxStats>) : {},
+      master_fx_stats: r.mixer?.master_fx_stats && typeof r.mixer.master_fx_stats === "object" ? (r.mixer.master_fx_stats as FxStats) : null,
       meters_live: !!r.mixer?.meters_live,
       meters:
         r.mixer?.meters && typeof r.mixer.meters === "object"
@@ -399,16 +412,19 @@ export const useProduction = create<ProductionStore>()((set, get) => ({
   pollMonitor: async () => {
     const st = get().state;
     const scene = st?.program_scene_id ?? st?.scenes[0]?.id ?? null;
-    if (!isTauri || !scene || monitorInFlight) return;
+    if (!isTauri || !scene || monitorInFlight) return false;
     monitorInFlight = true;
     try {
       const buf = await api.monitorFrameIfNew(scene, get().programSeq);
       if (buf && buf.byteLength > 8) {
         const seq = Number(new DataView(buf).getBigUint64(0, true));
         set({ programSeq: seq, programUrl: swapUrl("program", buf.slice(8)) });
+        return true;
       }
+      return false;
     } catch {
       /* next poll retries */
+      return false;
     } finally {
       monitorInFlight = false;
     }
@@ -462,6 +478,24 @@ export const useProduction = create<ProductionStore>()((set, get) => ({
     patchChannel(set, get, source_id, { trim_db });
     void api.mixerSetTrim(source_id, trim_db).catch((e) => toast(`Trim failed: ${errText(e)}`));
   },
+  setChannelFx: (source_id, fx) => {
+    const st = get().state;
+    if (st) {
+      if (source_id === "master") set({ state: { ...st, mixer: { ...st.mixer, master: { ...st.mixer.master, fx } } } });
+      else patchChannel(set, get, source_id, { fx });
+    }
+    pendingFx.set(source_id, fx);
+    if (fxTimer !== null) return;
+    fxTimer = setTimeout(() => {
+      fxTimer = null;
+      const batch = [...pendingFx.entries()];
+      pendingFx.clear();
+      for (const [id, f] of batch) {
+        const p = id === "master" ? api.mixerSetMasterFx(f) : api.mixerSetFx(id, f);
+        void p.catch((e) => toast(`Audio effect not applied: ${errText(e)}`));
+      }
+    }, 50);
+  },
 
   pollDiagnostics: async () => {
     if (!isTauri || diagInFlight) return;
@@ -496,11 +530,20 @@ export const useProduction = create<ProductionStore>()((set, get) => ({
     const pv = st?.preview_scene_id;
     if (!pv || pv === st?.program_scene_id) {
       if (get().previewUrl) set({ previewUrl: swapUrl("preview", null) });
+      previewSceneOf = null;
       return;
     }
+    if (pv !== previewSceneOf) {
+      previewSceneOf = pv;
+      previewSeq = 0;
+    }
     try {
-      const buf = await api.scenePreviewJpg(pv);
-      if (buf && buf.byteLength) set({ previewUrl: swapUrl("preview", buf) });
+      // Only a changed picture is transferred (a still scene costs nothing).
+      const buf = await api.monitorFrameIfNew(pv, previewSeq);
+      if (buf && buf.byteLength > 8) {
+        previewSeq = Number(new DataView(buf).getBigUint64(0, true));
+        set({ previewUrl: swapUrl("preview", buf.slice(8)) });
+      }
     } catch {
       /* scene vanished between polls */
     }
@@ -627,6 +670,17 @@ export const useProduction = create<ProductionStore>()((set, get) => ({
   sourceReorder: async (order) => {
     const scene = get().sceneId();
     if (!scene) return;
+    // Optimistic: the strip and the preview overlay follow at once.
+    const st = get().state;
+    if (st) {
+      const pos = new Map(order.map((id, i) => [id, i]));
+      set({
+        state: {
+          ...st,
+          scenes: st.scenes.map((sc) => (sc.id !== scene ? sc : { ...sc, sources: sc.sources.map((x) => ({ ...x, order: pos.get(x.id) ?? x.order })) })),
+        },
+      });
+    }
     try {
       await api.sourceReorder(scene, order);
       await get().refresh();

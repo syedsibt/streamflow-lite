@@ -2,7 +2,7 @@ import { useEffect, useState } from "react";
 import { api } from "../../lib/ipc";
 import { errText, useProduction } from "../../lib/productionStore";
 import { useStudio, type TabId } from "../../lib/store";
-import type { CameraSourceInfo, EnhancerSettings, FitMode, SceneLayout, SourceDiag, SourceTransform, SourceView } from "../../lib/types";
+import type { CameraSourceInfo, FitMode, SceneLayout, SourceDiag, SourceTransform, SourceView } from "../../lib/types";
 import BasicTab from "../tabs/BasicTab";
 import CreativeTab from "../tabs/CreativeTab";
 import CurvesTab from "../tabs/CurvesTab";
@@ -12,6 +12,7 @@ import EffectsTab from "../tabs/EffectsTab";
 import FiltersTab from "../tabs/FiltersTab";
 import PresetsTab from "../tabs/PresetsTab";
 import { KIND_NAME } from "./SourceStrip";
+import { FxEditor } from "./AudioFx";
 
 type PTab = string;
 
@@ -475,74 +476,64 @@ function ColorTab({ source, onOpen }: { source: SourceView; onOpen: () => void }
 // Audio processing (global)
 // ---------------------------------------------------------------------------
 
-function Range({ label, value, min, max, step, fmt, onChange, disabled, neutral }: { label: string; value: number; min: number; max: number; step: number; fmt: (v: number) => string; onChange: (v: number) => void; disabled?: boolean; neutral?: number }) {
-  return (
-    <label className={"hrange" + (disabled ? " disabled" : "")} onDoubleClick={() => neutral !== undefined && !disabled && onChange(neutral)}>
-      <span>{label}</span>
-      <input
-        type="range"
-        min={min}
-        max={max}
-        step={step}
-        value={value}
-        disabled={disabled}
-        onChange={(e) => onChange(parseFloat(e.target.value))}
-        style={{ ["--pct" as string]: `${((value - min) / (max - min)) * 100}%` }}
-      />
-      <output>{fmt(value)}</output>
-    </label>
-  );
-}
-
-function Check({ label, checked, onChange, disabled, hint }: { label: string; checked: boolean; onChange: (v: boolean) => void; disabled?: boolean; hint?: string }) {
-  return (
-    <label className={"check" + (disabled ? " disabled" : "")} title={hint}>
-      <input type="checkbox" checked={checked} disabled={disabled} onChange={(e) => onChange(e.target.checked)} />
-      <span>{label}</span>
-      {hint && <small>{hint}</small>}
-    </label>
-  );
-}
+const AUDIO_KINDS = new Set(["audioinput", "camera", "media"]);
 
 function AudioProcessing() {
   const mixer = useProduction((s) => s.state?.mixer);
-  const sources = useProduction((s) => s.state?.scenes.flatMap((sc) => sc.sources) ?? []);
-  const setEnh = useProduction((s) => s.setEnhancerSettings);
+  const scenes = useProduction((s) => s.state?.scenes);
+  const selectedId = useProduction((s) => s.selectedSourceId);
   const setAvSync = useProduction((s) => s.setAvSync);
-  if (!mixer) return null;
-  const enh = mixer.enhancer;
-  const e = (p: Partial<EnhancerSettings>) => void setEnh({ ...enh, ...p });
+  const [pick, setPick] = useState<string | null>(null);
+  if (!mixer || !scenes) return null;
+  // Every channel that can carry sound, once (a source may sit in several scenes).
+  const seen = new Set<string>();
+  const audio = scenes
+    .flatMap((sc) => sc.sources)
+    .filter((s) => AUDIO_KINDS.has(s.kind) && mixer.channels.some((c) => c.source_id === s.id) && !seen.has(s.id) && !!seen.add(s.id));
+  const selectedAudio = audio.find((s) => s.id === selectedId)?.id;
+  const target = pick && (pick === "master" || audio.some((s) => s.id === pick)) ? pick : selectedAudio ?? audio[0]?.id ?? "master";
   const av = mixer.av_sync;
-  const db = (v: number) => `${v > 0 ? "+" : ""}${v.toFixed(1)} dB`;
   return (
-    <div className="ptab-body two-col">
-      <div>
-        <h4 className="sub">Voice enhancer (microphones and camera audio)</h4>
-        <Check label="Enhance voices" checked={enh.enabled} onChange={(v) => e({ enabled: v })} />
-        <Check label="AI noise removal" hint="Fans, hum, keyboard, room noise" checked={enh.ai_denoise} disabled={!enh.enabled} onChange={(v) => e({ ai_denoise: v })} />
-        <Range label="Strength" value={enh.ai_strength} min={0} max={1} step={0.05} neutral={1} fmt={(v) => `${Math.round(v * 100)}%`} disabled={!enh.enabled || !enh.ai_denoise} onChange={(v) => e({ ai_strength: v })} />
-        <Check label="Noise gate" checked={enh.gate_enabled} disabled={!enh.enabled} onChange={(v) => e({ gate_enabled: v })} />
-        <Range label="Threshold" value={enh.gate_threshold_db} min={-60} max={0} step={1} neutral={-40} fmt={(v) => `${Math.round(v)} dB`} disabled={!enh.enabled || !enh.gate_enabled} onChange={(v) => e({ gate_threshold_db: v })} />
-        <Range label="EQ low" value={enh.eq_low_db} min={-12} max={12} step={0.5} neutral={0} fmt={db} disabled={!enh.enabled} onChange={(v) => e({ eq_low_db: v })} />
-        <Range label="EQ mid" value={enh.eq_mid_db} min={-12} max={12} step={0.5} neutral={0} fmt={db} disabled={!enh.enabled} onChange={(v) => e({ eq_mid_db: v })} />
-        <Range label="EQ high" value={enh.eq_high_db} min={-12} max={12} step={0.5} neutral={0} fmt={db} disabled={!enh.enabled} onChange={(v) => e({ eq_high_db: v })} />
-        <Check label="Compressor" hint="Gentle levelling" checked={enh.compressor_enabled} disabled={!enh.enabled} onChange={(v) => e({ compressor_enabled: v })} />
+    <div className="ptab-body">
+      <div className="fx-target">
+        <label className="f">
+          <span>Channel</span>
+          <select value={target} onChange={(e) => setPick(e.target.value)}>
+            {audio.map((s) => (
+              <option key={s.id} value={s.id}>
+                {s.name}
+              </option>
+            ))}
+            <option value="master">Master (program)</option>
+          </select>
+        </label>
+        <p className="note">Each effect has its own switch. The same settings open from the mixer’s FX button.</p>
       </div>
-      <div>
-        <h4 className="sub">A/V sync</h4>
-        <Check label="Automatic sync" hint="Delay each mic to match its camera's measured picture delay" checked={av.auto} onChange={(v) => setAvSync(v, av.offset_ms)} />
-        <Range label="Offset" value={av.offset_ms} min={-100} max={100} step={1} neutral={0} fmt={(v) => `${v > 0 ? "+" : ""}${Math.round(v)} ms`} onChange={(v) => setAvSync(av.auto, Math.round(v))} />
+      <FxEditor key={target} target={target} />
+      <h4 className="sub">A/V sync (all live audio)</h4>
+      <div className="two-col-tight">
+        <label className="check" title="Delay each mic to match its camera's measured picture delay">
+          <input type="checkbox" checked={av.auto} onChange={(e) => setAvSync(e.target.checked, av.offset_ms)} />
+          <span>Automatic sync</span>
+        </label>
+        <label className="hrange" onDoubleClick={() => setAvSync(av.auto, 0)}>
+          <span>Offset</span>
+          <input type="range" min={-100} max={100} step={1} value={av.offset_ms} onChange={(e) => setAvSync(av.auto, Math.round(parseFloat(e.target.value)))} />
+          <output>{`${av.offset_ms > 0 ? "+" : ""}${Math.round(av.offset_ms)} ms`}</output>
+        </label>
+      </div>
+      {Object.keys(mixer.voice).length > 0 && (
         <dl className="kv">
           {Object.entries(mixer.voice).map(([id, v]) => (
             <KV
               key={id}
-              k={sources.find((s) => s.id === id)?.name ?? "Microphone"}
+              k={audio.find((s) => s.id === id)?.name ?? "Microphone"}
               v={v.audio_age_ms != null ? `${Math.round(v.audio_age_ms)} ms${v.target_age_ms != null ? ` → ${Math.round(v.target_age_ms)} ms` : ""}` : v.device}
               tone={v.device.startsWith("error") ? "bad" : undefined}
             />
           ))}
         </dl>
-      </div>
+      )}
     </div>
   );
 }

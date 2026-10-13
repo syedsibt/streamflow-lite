@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useEffect, useState, type ReactNode } from "react";
 type OTab = "stream" | "record" | "format";
 import { save } from "@tauri-apps/plugin-dialog";
 import { api } from "../../lib/ipc";
@@ -20,6 +20,97 @@ const ENCODERS = [
   { id: "h264_amf", label: "AMD AMF" },
   { id: "libx264", label: "x264 (CPU)" },
 ];
+
+/** Output sizes (all 16:9, even dimensions) — must match `VIDEO_OUTPUT_SIZES`. */
+const OUTPUT_SIZES = [
+  { label: "360p", w: 640, h: 360 },
+  { label: "480p", w: 854, h: 480 },
+  { label: "540p", w: 960, h: 540 },
+  { label: "720p", w: 1280, h: 720 },
+  { label: "1080p", w: 1920, h: 1080 },
+  { label: "1440p", w: 2560, h: 1440 },
+];
+
+/** Recommended H.264 bitrate range (kbps) by height and frame rate (YouTube guidance). */
+function bitrateRange(h: number, fps: number): [number, number] {
+  const hi = fps > 30;
+  if (h <= 360) return hi ? [600, 1500] : [400, 1000];
+  if (h <= 480) return hi ? [800, 2500] : [500, 2000];
+  if (h <= 540) return hi ? [1500, 3500] : [1000, 2500];
+  if (h <= 720) return hi ? [3500, 6000] : [2500, 4000];
+  if (h <= 1080) return hi ? [6000, 9000] : [4500, 9000];
+  return hi ? [13000, 24000] : [9000, 18000];
+}
+
+/** Like `Field`, but a <div>: a <label> around several buttons would
+ * forward clicks on its empty space to the first button. */
+function FieldBox({ label, hint, children }: { label: string; hint?: string; children: ReactNode }) {
+  return (
+    <div className="field" role="group" aria-label={label}>
+      <span className="field-label">{label}</span>
+      <span className="field-control">{children}</span>
+      {hint && <span className="field-hint">{hint}</span>}
+    </div>
+  );
+}
+
+const BITRATE_MIN = 300;
+const BITRATE_MAX = 60000;
+
+/** Bitrate: quick picks from the recommended range, or any custom value. */
+function BitrateField({ vs, setVs, apply }: { vs: VideoSettings; setVs: (v: VideoSettings) => void; apply: (v: VideoSettings) => Promise<void> }) {
+  const [lo, hi] = bitrateRange(vs.output_height, vs.output_fps);
+  const mid = Math.round((lo + hi) / 2 / 100) * 100;
+  const picks = [
+    { label: "Low", v: lo },
+    { label: "Recommended", v: mid },
+    { label: "High", v: hi },
+  ];
+  const [text, setText] = useState(String(vs.bitrate_kbps));
+  useEffect(() => setText(String(vs.bitrate_kbps)), [vs.bitrate_kbps]);
+  const commit = () => {
+    const n = Math.round(Number(text));
+    if (!Number.isFinite(n) || n < BITRATE_MIN || n > BITRATE_MAX) {
+      setText(String(vs.bitrate_kbps));
+      return;
+    }
+    if (n !== vs.bitrate_kbps) void apply({ ...vs, bitrate_kbps: n });
+  };
+  const b = vs.bitrate_kbps;
+  const note = b > hi * 1.25 ? `More than ${vs.output_height}p needs (${lo}–${hi}) — uses upload and encoder time for nothing.` : b < lo * 0.8 ? `Below the usual ${lo}–${hi} for ${vs.output_height}p${vs.output_fps > 30 ? "60" : "30"} — the picture may look blocky.` : null;
+  return (
+    <FieldBox label="Bitrate" hint={`Recommended for ${vs.output_height}p${vs.output_fps > 30 ? "60" : "30"}: ${lo}–${hi} kbps · any value ${BITRATE_MIN}–${BITRATE_MAX}`}>
+      <div className="bitrate">
+        <div className="bitrate-picks">
+          {picks.map((p) => (
+            <button key={p.label} type="button" className={"tool" + (b === p.v ? " on" : "")} onClick={() => void apply({ ...vs, bitrate_kbps: p.v })}>
+              {p.label} <small>{p.v}</small>
+            </button>
+          ))}
+        </div>
+        <span className="inline-controls">
+          <input
+            type="number"
+            aria-label="Custom bitrate"
+            min={BITRATE_MIN}
+            max={BITRATE_MAX}
+            step={100}
+            value={text}
+            onChange={(e) => {
+              setText(e.target.value);
+              const n = Number(e.target.value);
+              if (Number.isFinite(n)) setVs({ ...vs, bitrate_kbps: n });
+            }}
+            onBlur={commit}
+            onKeyDown={(e) => e.key === "Enter" && commit()}
+          />
+          <span className="unit">kbps (custom)</span>
+        </span>
+        {note && <small className="bitrate-note">{note}</small>}
+      </div>
+    </FieldBox>
+  );
+}
 
 const fmtTime = (s: number) => {
   const h = Math.floor(s / 3600);
@@ -187,21 +278,29 @@ export default function OutputPanel() {
         <Section footer={outputLocked ? "Resolution, encoder and bitrate apply the next time you go live or record. Frame rate applies immediately." : "Stream and recording share one encoder."}>
           {vs && (
             <>
-              <Field label="Resolution">
-                <Segmented
-                  label="Resolution"
-                  size="small"
-                  value={`${vs.output_width}x${vs.output_height}`}
-                  onChange={(v) => {
-                    const [w, h] = v.split("x").map(Number);
-                    void applyOutput({ ...vs, output_width: w, output_height: h });
-                  }}
-                  options={[
-                    { value: "1280x720", label: "720p" },
-                    { value: "1920x1080", label: "1080p" },
-                  ]}
-                />
-              </Field>
+              <FieldBox label="Resolution">
+                <div className="res-grid" role="radiogroup" aria-label="Output resolution">
+                  {OUTPUT_SIZES.map((r) => {
+                    const on = vs.output_width === r.w && vs.output_height === r.h;
+                    return (
+                      <button
+                        key={r.label}
+                        type="button"
+                        role="radio"
+                        aria-checked={on}
+                        className={on ? "on" : ""}
+                        title={`${r.w}×${r.h}`}
+                        onClick={() => void applyOutput({ ...vs, output_width: r.w, output_height: r.h })}
+                      >
+                        <b>{r.label}</b>
+                        <small>
+                          {r.w}×{r.h}
+                        </small>
+                      </button>
+                    );
+                  })}
+                </div>
+              </FieldBox>
               <Field label="Frame rate">
                 <Segmented label="Frame rate" size="small" value={vs.output_fps} onChange={(v) => void applyOutput({ ...vs, output_fps: v })} options={[30, 60].map((f) => ({ value: f, label: `${f} fps` }))} />
               </Field>
@@ -214,21 +313,7 @@ export default function OutputPanel() {
                   ))}
                 </select>
               </Field>
-              <Field label="Bitrate" hint="YouTube 1080p30: 4500–9000 kbps · 720p30: 2500–4000 kbps">
-                <span className="inline-controls">
-                  <input
-                    type="number"
-                    min={500}
-                    max={50000}
-                    step={250}
-                    value={vs.bitrate_kbps}
-                    onChange={(e) => setVs({ ...vs, bitrate_kbps: Number(e.target.value) })}
-                    onBlur={() => void applyOutput(vs)}
-                    onKeyDown={(e) => e.key === "Enter" && void applyOutput(vs)}
-                  />
-                  <span className="unit">kbps</span>
-                </span>
-              </Field>
+              <BitrateField vs={vs} setVs={setVs} apply={applyOutput} />
               <Row title="Keyframe interval" subtitle="Fixed at 2 seconds — what YouTube, Facebook and TikTok require" trailing={<span className="mono">2 s</span>} />
               <Row title="Audio" subtitle="AAC, 48 kHz stereo" trailing={<span className="mono">128 kbps</span>} />
               {diag?.encoder && <Row title="Encoder in use" subtitle={diag.encoder.note ?? (diag.encoder.hardware ? "Hardware" : "Software (CPU)")} trailing={<span className="mono">{diag.encoder.name}</span>} />}
