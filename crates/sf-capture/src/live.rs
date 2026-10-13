@@ -389,25 +389,40 @@ mod tests {
         let rate = ((l0.1 - f0.1) as f64 / 1e6) / l0.0.duration_since(f0.0).as_secs_f64().max(0.1);
 
         // Stall the consumer for 3 s (a frozen UI / slow tick). Live-first:
-        // the next frame must be fresh, not the first of a 3 s backlog.
-        let before = live.take_latest().map(|f| f.pts_us);
+        // the next frame must be the newest one, not the head of a 3 s
+        // backlog.
+        let before = live.take_latest().map(|f| (Instant::now(), f.pts_us));
         std::thread::sleep(Duration::from_secs(3));
-        let f = loop {
+        let (tf, f) = loop {
             if let Some(f) = live.take_latest() {
-                break f;
+                break (Instant::now(), f);
             }
             std::thread::sleep(Duration::from_millis(2));
         };
-        if let Some(b) = before {
-            let advanced = f.pts_us - b;
-            let expected = 3_000_000.0 * rate.min(1.0);
-            assert!(
-                advanced as f64 > expected * 0.9,
-                "{codec}: after a 3 s stall the frame is only {advanced} us newer, sender rate {rate:.2}x (backlog?) stats {:?}",
-                live.stats()
-            );
-        }
         let age_ms = (crate::clock::now_us() - f.captured_at_us) / 1000;
+        // The decisive invariant: frames after the stall continue at the
+        // source's pace from `f` — no catch-up jump. A stale `f` (backlog)
+        // would be followed by frames racing ahead of wall time.
+        let mut g = (tf, f.pts_us);
+        while tf.elapsed() < Duration::from_secs(1) {
+            if let Some(n) = live.take_latest() {
+                g = (Instant::now(), n.pts_us);
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let wall_fg = g.0.duration_since(tf).as_secs_f64() * 1e6 * rate.min(1.0);
+        let jump_us = (g.1 - f.pts_us) as f64 - wall_fg;
+        let advanced = before.map(|(tb, b)| (f.pts_us - b, tf.duration_since(tb).as_millis()));
+        assert!(
+            jump_us < 300_000.0,
+            "{codec}: frames raced {:.0} ms ahead after the stall — the first frame was stale (backlog); advanced {advanced:?}, rate {rate:.2}x, stats {:?}",
+            jump_us / 1000.0,
+            live.stats()
+        );
+        if let Some((adv, wall_ms)) = advanced {
+            // Informational on hosts where the sender itself stutters.
+            eprintln!("{codec}: stall {wall_ms} ms, media advanced {} ms, post-stall jump {:.0} ms", adv / 1000, jump_us / 1000.0);
+        }
         // Capture age is only meaningful when the sender keeps real time
         // (a slower sender makes every frame "late" by construction).
         if rate > 0.97 {

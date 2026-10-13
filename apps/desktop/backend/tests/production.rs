@@ -376,7 +376,9 @@ fn stream_lifecycle_fails_cleanly_and_redacts_key() {
     })
     .expect("async start must not fail synchronously");
     let mut lifecycle = s.production_state().stream_lifecycle;
-    for _ in 0..200 {
+    // Up to 20 s: Windows reports a refused localhost connection only after
+    // its SYN retries.
+    for _ in 0..800 {
         s.stream_drain_worker();
         lifecycle = s.production_state().stream_lifecycle;
         if matches!(lifecycle, StreamLifecycle::Error { .. }) {

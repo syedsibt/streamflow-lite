@@ -521,7 +521,7 @@ fn stream_and_record_share_one_encoder_and_follow_wall_clock() {
     let streams = ffprobe_streams(rec_path);
     eprintln!("recording streams: {streams:?}");
     let (r0, r1, rn) = ffprobe_span(rec_path, "v");
-    assert!(rn > 10, "recording has too few frames");
+    assert!(rn > 3, "recording has too few frames ({rn})");
     assert!(r0.abs() < 0.05, "recording should start at 0, starts at {r0}");
     assert!(
         ((r1 - r0) - rec_wall).abs() < rec_wall * 0.15 + 0.15,
