@@ -221,6 +221,8 @@ pub mod camera;
 pub mod media;
 pub mod screen;
 
+#[allow(dead_code)]
+pub(crate) mod dshow_rate;
 #[cfg(any(windows, sf_wincheck))]
 pub mod dshow;
 

@@ -1328,6 +1328,12 @@ impl Shell {
                 SourceKind::Text { text } => {
                     std::sync::Arc::new(self.text_pixels(&src.id, text, w, h))
                 }
+                SourceKind::TestPattern => std::sync::Arc::new(self.test_pattern.frame(
+                    w,
+                    h,
+                    self.video_settings.output_fps,
+                    std::time::SystemTime::now(),
+                )),
                 _ => std::sync::Arc::new(source_pixels(&src.kind, w, h)),
             };
             let g0 = std::time::Instant::now();

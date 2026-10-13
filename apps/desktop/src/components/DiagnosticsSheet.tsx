@@ -1,6 +1,7 @@
 import { useEffect } from "react";
 import { useProduction } from "../lib/productionStore";
 import { Section, Row, Dot } from "./ui";
+import type { SourceDiag } from "../lib/types";
 
 const ms = (v: number | null | undefined) => (v == null ? "—" : `${v < 10 ? v.toFixed(1) : Math.round(v)} ms`);
 const fmtUptime = (s: number) => {
@@ -95,26 +96,38 @@ export default function DiagnosticsSheet({ open, onClose }: { open: boolean; onC
 
             <Section title="Video sources">
               {d.sources.length === 0 && <Row title="No video sources" dim />}
-              {d.sources.map((s) => (
-                <Row
-                  key={s.id}
-                  icon={<Dot tone={s.error ? "bad" : s.fps > 0 ? "ok" : "warn"} />}
-                  title={s.name}
-                  subtitle={
-                    s.error ??
-                    [
-                      s.width ? `${s.width}×${s.height}` : null,
-                      s.format,
-                      `${Math.round(s.fps)} fps in`,
-                      s.device_fps != null ? `device ${Math.round(s.device_fps)} fps` : null,
-                      s.dropped ? `${s.dropped} older frames skipped` : null,
-                    ]
-                      .filter(Boolean)
-                      .join(" · ")
-                  }
-                  trailing={<span className="mono">{ms(s.age_ms)}</span>}
-                />
-              ))}
+              {d.sources.map((s) => {
+                const live = s.device_packet_fps != null;
+                const f1 = (v: number | null) => (v == null ? "—" : v.toFixed(1));
+                return (
+                  <div key={s.id}>
+                    <Row
+                      icon={<Dot tone={s.error ? "bad" : s.fps >= d.target_fps * 0.8 ? "ok" : "warn"} />}
+                      title={s.name}
+                      subtitle={
+                        s.error ??
+                        [s.width ? `${s.width}×${s.height}` : null, s.format?.split(" — ")[0]].filter(Boolean).join(" · ")
+                      }
+                      trailing={<span className="mono">{ms(s.age_ms)}</span>}
+                    />
+                    {live && (
+                      <div className="diag-grid mono">
+                        <span>Camera sends</span><span>{f1(s.device_packet_fps)} fps</span>
+                        <span>Captured</span><span>{f1(s.device_fps)} fps</span>
+                        <span>Reaching program</span><span>{f1(s.fps)} fps</span>
+                        <span>Decode</span><span>{f1(s.decode_ms)} ms</span>
+                        <span>Convert</span><span>{f1(s.convert_ms)} ms</span>
+                        <span>Camera → capture</span><span>{f1(s.capture_latency_ms)} ms</span>
+                        <span>Longest gap (1 s)</span><span>{f1(s.max_gap_ms)} ms</span>
+                        <span>Skipped (newer frame)</span><span>{s.dropped}</span>
+                        <span>Decode / read errors</span><span>{s.decode_errors} / {s.capture_errors}</span>
+                      </div>
+                    )}
+                    {live && <div className="diag-note">{cameraVerdict(s, d.target_fps)}</div>}
+                    {s.format?.includes(" — ") && <div className="diag-note">{s.format.split(" — ")[1]}</div>}
+                  </div>
+                );
+              })}
             </Section>
 
             <Section
@@ -176,4 +189,19 @@ export default function DiagnosticsSheet({ open, onClose }: { open: boolean; onC
       </aside>
     </div>
   );
+}
+
+/** Where a slow camera loses frames, from the measured stage rates. */
+function cameraVerdict(s: SourceDiag, target: number): string {
+  const nominal = Number(/@(\d+(?:\.\d+)?)fps/.exec(s.format ?? "")?.[1] ?? 0) || target;
+  const sends = s.device_packet_fps ?? 0;
+  const captured = s.device_fps ?? 0;
+  const want = Math.min(nominal, target);
+  if (sends < nominal * 0.8)
+    return `The camera itself sends only ${sends.toFixed(1)} of ${nominal} fps — limited before the app (mode, USB bandwidth, or auto‑exposure in low light).`;
+  if (captured < Math.min(sends, want) * 0.8)
+    return `Camera sends ${sends.toFixed(0)} fps but capture keeps ${captured.toFixed(1)} — decode/convert (${((s.decode_ms ?? 0) + (s.convert_ms ?? 0)).toFixed(1)} ms) or read errors limit it.`;
+  if (s.fps < want * 0.8)
+    return `Capture is fine (${captured.toFixed(0)} fps) but only ${s.fps.toFixed(1)} fps reach the program — the render loop is late.`;
+  return "Camera, capture and program are all at full rate.";
 }

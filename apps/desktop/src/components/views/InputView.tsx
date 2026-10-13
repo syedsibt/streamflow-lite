@@ -75,8 +75,11 @@ export default function InputView() {
       return v ? (v.device === "running" ? "Receiving audio" : v.device) : "Microphone";
     }
     if (d) {
-      if (d.fps <= 0) return "Waiting for frames…";
-      return [`${d.width}×${d.height}`, `${Math.round(d.fps)} fps`, d.format?.split(" [")[0]].filter(Boolean).join(" · ");
+      // Only "waiting" before the first picture; afterwards show the real
+      // rate (a slow camera is reported as slow, not as flapping "waiting").
+      if (!d.width) return "Waiting for first frame…";
+      const cam = d.device_packet_fps != null ? ` (camera sends ${Math.round(d.device_packet_fps)})` : "";
+      return [`${d.width}×${d.height}`, `${d.fps.toFixed(d.fps < 10 ? 1 : 0)} fps${cam}`, d.format?.split(" [")[0]].filter(Boolean).join(" · ");
     }
     return kindName(s.kind);
   };
@@ -89,7 +92,7 @@ export default function InputView() {
       const v = state?.mixer.voice[s.id];
       return v?.device === "running" ? ("ok" as const) : v?.device.startsWith("error") ? ("bad" as const) : ("warn" as const);
     }
-    if (d) return d.fps > 0 ? ("ok" as const) : ("warn" as const);
+    if (d) return d.width && d.fps >= (diag?.target_fps ?? 30) * 0.8 ? ("ok" as const) : ("warn" as const);
     return "ok" as const;
   };
 
@@ -133,6 +136,17 @@ export default function InputView() {
         </Section>
         {adding && <AddSource onDone={() => setAdding(false)} />}
         {sel && !adding && <SourceDetail key={sel.id} source={sel} sources={sources} onRemoved={() => setSelected(null)} />}
+        {sel && !adding && sel.kind === "testpattern" && (
+          <Section title="Reading the test signal">
+            <div className="help-list">
+              <p><b>Bars, steps, ramp</b> — colour/LUT path. The 2–10 near‑black and 245–255 near‑white steps must stay distinct (merged = crushed/clipped). Banding in the ramp = 8‑bit grade or low bitrate.</p>
+              <p><b>Line patches</b> — scaling. They turn flat grey when the picture is resized; moiré means a poor scaler.</p>
+              <p><b>Border + circle</b> — the 1‑px border must show on all four sides (no crop); the circle must stay round (aspect).</p>
+              <p><b>Yellow bar + frame boxes</b> — smoothness. The bar moves at constant speed; in a recording every box lights in turn — a skipped box is a dropped frame.</p>
+              <p><b>Timecode</b> — latency. Photograph this preview next to the stream player: the timecode difference is the end‑to‑end delay.</p>
+            </div>
+          </Section>
+        )}
       </aside>
     </div>
   );

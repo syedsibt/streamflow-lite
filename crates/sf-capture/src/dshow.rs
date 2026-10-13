@@ -22,6 +22,7 @@ use ffmpeg_next as ff;
 
 use super::demux::ensure_init;
 use super::live::{LiveVideo, LiveVideoStats};
+use super::dshow_rate::{div_ceil_i64, dshow_rate_for_interval};
 use super::media;
 use super::{CaptureError, CapturedFrame, FrameProducer, StreamInfo};
 
@@ -186,33 +187,61 @@ impl DshowProducer {
         ensure_init();
         let size = format!("{width}x{height}");
         let rate = fps.to_string();
-        let attempts: Vec<(&str, Vec<(&str, &str)>)> = vec![
-            ("mjpeg", vec![("vcodec", "mjpeg"), ("video_size", &size), ("framerate", &rate)]),
-            ("nv12", vec![("pixel_format", "nv12"), ("video_size", &size), ("framerate", &rate)]),
-            ("yuv420p", vec![("pixel_format", "yuv420p"), ("video_size", &size), ("framerate", &rate)]),
-            ("size+fps", vec![("video_size", &size), ("framerate", &rate)]),
-            ("negotiated", vec![]),
+        // dshow turns the requested rate into a 100 ns frame interval with
+        // integer division (`den*10^7/num`) and requires it to lie inside the
+        // pin's [MinFrameInterval, MaxFrameInterval]. "60" → 166666, but most
+        // drivers advertise 60 fps as 166667 (rounded), so a plain "60"
+        // request is rejected. Ask for the rounded-up interval exactly first.
+        let rate_ceil = dshow_rate_for_interval(div_ceil_i64(10_000_000, fps.max(1) as i64))
+            .unwrap_or_else(|| rate.clone());
+        // Compressed MJPEG first: USB cameras deliver 1080p at full rate
+        // only as MJPEG (raw YUY2 1080p exceeds USB 2 bandwidth and is
+        // typically limited to ~5 fps or not offered at all).
+        let mut attempts: Vec<(&str, Vec<(&str, &str)>)> = vec![
+            ("mjpeg", vec![("vcodec", "mjpeg"), ("video_size", &size), ("framerate", &rate_ceil)]),
         ];
+        if rate_ceil != rate {
+            attempts.push(("mjpeg", vec![("vcodec", "mjpeg"), ("video_size", &size), ("framerate", &rate)]));
+        }
+        attempts.extend([
+            ("mjpeg any fps", vec![("vcodec", "mjpeg"), ("video_size", &size)]),
+            ("raw", vec![("video_size", &size), ("framerate", &rate_ceil)]),
+            ("h264", vec![("vcodec", "h264"), ("video_size", &size), ("framerate", &rate_ceil)]),
+            ("device default", vec![]),
+        ]);
         let url = format!("video={device}");
         let mut last_err = String::new();
+        let mut tried: Vec<String> = Vec::new();
         for (label, opts) in &attempts {
             match LiveVideo::open("dshow", Some("dshow"), &url, opts, OPEN_TIMEOUT) {
                 Ok((live, codec)) => {
                     let info = live.stream_info();
-                    let negotiated_format = format!(
+                    let mut negotiated_format = format!(
                         "{} {}×{}@{}fps [via {label}]",
                         codec,
                         info.width,
                         info.height,
                         info.fps().round() as u32
                     );
+                    if !tried.is_empty() {
+                        negotiated_format.push_str(&format!(" — not available: {}", tried.join("; ")));
+                    }
                     return Ok(Self {
                         live,
                         info,
                         negotiated_format,
                     });
                 }
-                Err(e) => last_err = e.to_string(),
+                Err(e) => {
+                    last_err = e.to_string();
+                    let fr = opts
+                        .iter()
+                        .find(|(k, _)| *k == "framerate")
+                        .map(|(_, v)| format!("@{v}"))
+                        .unwrap_or_default();
+                    let sz = if opts.is_empty() { String::new() } else { format!(" {size}{fr}") };
+                    tried.push(format!("{label}{sz}"));
+                }
             }
         }
         Err(CaptureError::OpenFailed(format!(

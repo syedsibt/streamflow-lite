@@ -60,6 +60,12 @@ pub(crate) struct LiveDrain {
     pub eof: bool,
     /// Packets the decoder rejected (skipped, not fatal).
     pub decode_errors: u32,
+    /// Video packets read in this pass (device delivery, before dropping).
+    pub video_packets: u32,
+    /// Time spent decoding video in this pass, µs.
+    pub decode_us: u64,
+    /// Time spent converting the published picture to RGBA, µs.
+    pub convert_us: u64,
 }
 
 /// Upper bound on packets consumed per drain pass, so a device that is
@@ -392,6 +398,7 @@ impl DemuxDecoder {
             out.packets += 1;
             let read_at = crate::clock::now_us();
             if pkt.stream() == self.video_stream {
+                out.video_packets += 1;
                 if self.intra_only {
                     if newest_pkt.replace((pkt, read_at)).is_some() {
                         out.dropped += 1;
@@ -400,6 +407,7 @@ impl DemuxDecoder {
                     // A corrupt/undecodable packet (e.g. joining an H.264
                     // stream mid-GOP: "non-existing PPS") is skipped, not
                     // fatal — the decoder recovers at the next keyframe.
+                    let t = crate::clock::now_us();
                     if self.video_decoder.send_packet(&pkt).is_ok() {
                         while let Ok(Some(pic)) = self.receive_raw_video() {
                             if newest_pic.replace((pic, read_at)).is_some() {
@@ -409,6 +417,7 @@ impl DemuxDecoder {
                     } else {
                         out.decode_errors += 1;
                     }
+                    out.decode_us += (crate::clock::now_us() - t) as u64;
                 }
             } else if Some(pkt.stream()) == self.audio_stream {
                 if let Some(ref mut ad) = self.audio_decoder {
@@ -420,7 +429,9 @@ impl DemuxDecoder {
             }
         }
         if let Some((pkt, read_at)) = newest_pkt {
-            if self.video_decoder.send_packet(&pkt).is_ok() {
+            let t = crate::clock::now_us();
+            let sent = self.video_decoder.send_packet(&pkt).is_ok();
+            if sent {
                 while let Ok(Some(pic)) = self.receive_raw_video() {
                     if newest_pic.replace((pic, read_at)).is_some() {
                         out.dropped += 1;
@@ -429,9 +440,12 @@ impl DemuxDecoder {
             } else {
                 out.decode_errors += 1;
             }
+            out.decode_us += (crate::clock::now_us() - t) as u64;
         }
         if let Some((pic, read_at)) = newest_pic {
+            let t = crate::clock::now_us();
             let mut f = self.scale_picture(&pic)?;
+            out.convert_us = (crate::clock::now_us() - t) as u64;
             f.captured_at_us = self.video_clock.map(f.pts_us, read_at);
             out.frame = Some(f);
         }

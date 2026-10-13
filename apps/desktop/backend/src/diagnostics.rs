@@ -160,8 +160,20 @@ pub struct SourceDiag {
     pub kind: String,
     /// New frames reaching the pipeline per second.
     pub fps: f32,
-    /// Device capture rate (live devices only).
+    /// Frames the capture thread published per second (live devices only).
     pub device_fps: Option<f32>,
+    /// Video packets the camera delivered per second (its real output
+    /// rate, before stale frames are dropped). Live devices only.
+    pub device_packet_fps: Option<f32>,
+    /// Decode / RGBA-convert time per frame, ms (live devices only).
+    pub decode_ms: Option<f32>,
+    pub convert_ms: Option<f32>,
+    /// Device timestamp → mailbox, ms (queueing + decode inside capture).
+    pub capture_latency_ms: Option<f32>,
+    /// Longest gap between two published frames in the last second, ms.
+    pub max_gap_ms: Option<f32>,
+    pub decode_errors: u64,
+    pub capture_errors: u64,
     /// Frames dropped at capture because newer ones arrived (live-first).
     pub dropped: u64,
     /// Picture age when rendered (smoothed), ms.
@@ -291,6 +303,13 @@ impl Shell {
                 kind: kind.to_string(),
                 fps: f.map(|f| f.fps()).unwrap_or(0.0),
                 device_fps: live.as_ref().map(|l| l.capture_fps),
+                device_packet_fps: live.as_ref().map(|l| l.device_fps),
+                decode_ms: live.as_ref().map(|l| l.decode_ms),
+                convert_ms: live.as_ref().map(|l| l.convert_ms),
+                capture_latency_ms: live.as_ref().map(|l| l.capture_latency_us as f32 / 1000.0),
+                max_gap_ms: live.as_ref().map(|l| l.max_gap_ms),
+                decode_errors: live.as_ref().map(|l| l.decode_errors).unwrap_or(0),
+                capture_errors: live.as_ref().map(|l| l.capture_errors).unwrap_or(0),
                 dropped: live.as_ref().map(|l| l.frames_dropped).unwrap_or(0),
                 age_ms: f.map(|f| f.age_ema_us as f32 / 1000.0).unwrap_or(0.0),
                 width: f.map(|f| f.width).unwrap_or(0),

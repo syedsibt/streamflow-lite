@@ -51,6 +51,7 @@ mod diagnostics;
 mod platforms;
 mod production;
 mod send_worker;
+mod test_pattern;
 
 pub use diagnostics::{DiagnosticsView, SourceDiag};
 pub use platforms::{platform_list, PlatformInfo};
@@ -526,6 +527,8 @@ pub struct Shell {
     /// Rasterized text overlays keyed by (source_id, text, w, h). Text
     /// rarely changes, so it renders once — not on every tick.
     text_cache: HashMap<(String, String, u32, u32), Vec<u8>>,
+    /// Diagnostic test signal (static part cached per size).
+    test_pattern: test_pattern::TestPatternCache,
     /// Real audio mixer (sf-audio); fed equal-length blocks by the bus.
     audio_mixer: sf_audio::Mixer,
     /// Clocked audio bus: per-source jitter FIFOs, exact samples per tick
@@ -655,6 +658,7 @@ impl Shell {
             resized_frames: HashMap::new(),
             camera_formats: HashMap::new(),
             text_cache: HashMap::new(),
+            test_pattern: Default::default(),
             audio_mixer: sf_audio::Mixer::new(),
             audio_bus: sf_audio::AudioBus::new(30, 1),
             audio_timeline: sf_audio::AudioTimeline::new(),

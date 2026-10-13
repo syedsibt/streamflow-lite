@@ -1796,3 +1796,22 @@ details.advanced summary {
     display: none;
   }
 }
+
+/* Diagnostics: per-camera pipeline breakdown (dense, tabular). */
+.diag-grid {
+  display: grid;
+  grid-template-columns: 1fr auto;
+  gap: 2px 12px;
+  padding: 2px 16px 8px 44px;
+  font-size: 12px;
+  color: var(--label-2, #a1a1a6);
+}
+.diag-grid > span:nth-child(even) { text-align: right; color: var(--label, #f2f2f7); }
+.diag-note {
+  padding: 0 16px 8px 44px;
+  font-size: 11px;
+  color: var(--label-3, #6e6e73);
+}
+.help-list { padding: 8px 16px 10px; font-size: 12px; line-height: 1.45; color: var(--label-2); }
+.help-list p { margin: 0 0 6px; }
+.help-list b { color: var(--label); font-weight: 600; }

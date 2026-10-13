@@ -50,6 +50,20 @@ pub struct LiveVideoStats {
     /// Age of the newest frame when it was published (device → mailbox),
     /// microseconds: queueing + decode time inside capture.
     pub capture_latency_us: i64,
+    /// Video packets the device delivered over the last second (before
+    /// stale ones are dropped) — the camera's real output rate.
+    pub device_fps: f32,
+    /// Smoothed decode time per published frame, ms.
+    pub decode_ms: f32,
+    /// Smoothed RGBA conversion time per published frame, ms.
+    pub convert_ms: f32,
+    /// Packets the decoder rejected (corrupt MJPEG / mid-GOP H.264).
+    pub decode_errors: u64,
+    /// Failed capture passes (read/convert errors → short backoff).
+    pub capture_errors: u64,
+    /// Longest gap between two published frames in the last second, ms
+    /// (what the UI sees as a "waiting for frames" stall).
+    pub max_gap_ms: f32,
     /// Last read/decode error, if any (kept until the next good frame).
     pub last_error: Option<String>,
     /// The device ended (unplugged / graph stopped).
@@ -207,16 +221,58 @@ pub(crate) fn open_input(
     set("probesize", "32");
     set("analyzeduration", "0");
     set("fflags", "nobuffer");
+    let mut requested: Vec<&str> = Vec::new();
     for (k, v) in options {
+        if *k == "vcodec" {
+            // Not an AVOption: the FFmpeg CLI's `-vcodec` before `-i` sets
+            // AVFormatContext.video_codec_id, which dshow reads to choose a
+            // compressed (MJPEG/H.264) camera mode. Passed as a dictionary
+            // entry it was silently ignored — so "MJPEG 1080p30" was really
+            // a request for *raw* 1080p30, which most USB cameras can't do.
+            let name = CString::new(*v).map_err(|_| CaptureError::OpenFailed("bad codec".into()))?;
+            let codec = unsafe { ff::ffi::avcodec_find_decoder_by_name(name.as_ptr()) };
+            if codec.is_null() {
+                unsafe { ff::ffi::avformat_free_context(ctx) };
+                return Err(CaptureError::Unsupported(format!("no '{v}' decoder in this FFmpeg build")));
+            }
+            unsafe { (*ctx).video_codec_id = (*codec).id };
+            continue;
+        }
+        requested.push(k);
         set(k, v);
     }
     let ret = unsafe { ff::ffi::avformat_open_input(&mut ctx, curl.as_ptr(), fmt as *mut _, &mut dict) };
-    unsafe { ff::ffi::av_dict_free(&mut dict) };
+    // Options still in the dictionary were not recognised by the input:
+    // treat that as a failed attempt instead of silently opening with
+    // something else.
+    let mut unused: Vec<String> = Vec::new();
+    unsafe {
+        let mut e: *mut ff::ffi::AVDictionaryEntry = std::ptr::null_mut();
+        let empty = CString::new("").expect("static");
+        loop {
+            e = ff::ffi::av_dict_get(dict, empty.as_ptr(), e, ff::ffi::AV_DICT_IGNORE_SUFFIX);
+            if e.is_null() {
+                break;
+            }
+            let k = std::ffi::CStr::from_ptr((*e).key).to_string_lossy().into_owned();
+            if requested.contains(&k.as_str()) {
+                unused.push(k);
+            }
+        }
+        ff::ffi::av_dict_free(&mut dict);
+    }
     if ret < 0 || ctx.is_null() {
         // `avformat_open_input` freed `ctx` on failure.
         return Err(CaptureError::OpenFailed(format!(
             "cannot open '{url}': {}",
             ff::Error::from(ret)
+        )));
+    }
+    if !unused.is_empty() {
+        unsafe { ff::ffi::avformat_close_input(&mut ctx) };
+        return Err(CaptureError::OpenFailed(format!(
+            "input does not support option(s): {}",
+            unused.join(", ")
         )));
     }
     let si = unsafe { ff::ffi::avformat_find_stream_info(ctx, std::ptr::null_mut()) };
@@ -256,20 +312,22 @@ fn capture_loop(mut demux: DemuxDecoder, sh: Arc<Shared>) {
 
 fn run_capture(demux: &mut DemuxDecoder, sh: &Arc<Shared>) {
     let mut publish_times: VecDeque<i64> = VecDeque::with_capacity(128);
+    let mut packet_times: VecDeque<i64> = VecDeque::with_capacity(256);
     let mut consecutive_errors = 0u32;
+    let mut decode_ms = 0f32;
+    let mut convert_ms = 0f32;
     while !sh.stop.load(Ordering::Relaxed) {
         let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| demux.drain_live()))
             .unwrap_or_else(|_| Err(CaptureError::ReadFailed("capture backend panicked".into())));
+        let now = crate::clock::now_us();
         match r {
             Ok(d) => {
                 consecutive_errors = 0;
-                if d.dropped > 0 {
-                    if let Ok(mut s) = sh.stats.lock() {
-                        s.frames_dropped += d.dropped as u64;
-                    }
+                for _ in 0..d.video_packets {
+                    packet_times.push_back(now);
                 }
+                let mut published = None;
                 if let Some(frame) = d.frame {
-                    let now = crate::clock::now_us();
                     let latency = now - frame.captured_at_us;
                     let replaced = sh
                         .latest
@@ -277,15 +335,37 @@ fn run_capture(demux: &mut DemuxDecoder, sh: &Arc<Shared>) {
                         .map(|mut slot| slot.replace(frame).is_some())
                         .unwrap_or(false);
                     publish_times.push_back(now);
-                    while publish_times.front().map_or(false, |t| now - *t > 1_000_000) {
-                        publish_times.pop_front();
+                    decode_ms += 0.1 * (d.decode_us as f32 / 1000.0 - decode_ms);
+                    convert_ms += 0.1 * (d.convert_us as f32 / 1000.0 - convert_ms);
+                    published = Some((latency, replaced));
+                }
+                while publish_times.front().is_some_and(|t| now - *t > 1_000_000) {
+                    publish_times.pop_front();
+                }
+                while packet_times.front().is_some_and(|t| now - *t > 1_000_000) {
+                    packet_times.pop_front();
+                }
+                if let Ok(mut s) = sh.stats.lock() {
+                    s.frames_dropped += d.dropped as u64;
+                    s.decode_errors += d.decode_errors as u64;
+                    s.capture_fps = publish_times.len() as f32;
+                    s.device_fps = packet_times.len() as f32;
+                    s.decode_ms = decode_ms;
+                    s.convert_ms = convert_ms;
+                    let mut gap = 0i64;
+                    let mut prev: Option<i64> = None;
+                    for &t in publish_times.iter().chain(std::iter::once(&now)) {
+                        if let Some(p) = prev {
+                            gap = gap.max(t - p);
+                        }
+                        prev = Some(t);
                     }
-                    if let Ok(mut s) = sh.stats.lock() {
+                    s.max_gap_ms = if publish_times.is_empty() { 1000.0 } else { gap as f32 / 1000.0 };
+                    if let Some((latency, replaced)) = published {
                         s.frames_captured += 1;
                         if replaced {
                             s.frames_dropped += 1;
                         }
-                        s.capture_fps = publish_times.len() as f32;
                         s.capture_latency_us = latency;
                         s.last_error = None;
                     }
@@ -304,6 +384,7 @@ fn run_capture(demux: &mut DemuxDecoder, sh: &Arc<Shared>) {
             Err(e) => {
                 consecutive_errors += 1;
                 if let Ok(mut s) = sh.stats.lock() {
+                    s.capture_errors += 1;
                     s.last_error = Some(e.to_string());
                 }
                 let ms = (5u64 << consecutive_errors.min(5)).min(200);
@@ -457,6 +538,35 @@ mod tests {
         // Inter-coded camera (H.264): every packet is decoded to keep
         // references valid, only the newest picture is converted.
         run_live_case("libx264", 2);
+    }
+
+    /// Measurement (run explicitly): a 1080p60 MJPEG live source — the
+    /// mode the user's camera negotiated — through the capture thread.
+    /// `cargo test -p sf-capture --release bench_1080p60_mjpeg -- --ignored --nocapture`
+    #[test]
+    #[ignore]
+    fn bench_1080p60_mjpeg() {
+        let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+        let p = port(7);
+        let mut tx = Command::new("ffmpeg")
+            .args([
+                "-v", "error", "-re", "-readrate_initial_burst", "0",
+                "-f", "lavfi", "-i", "testsrc2=size=1920x1080:rate=60",
+                "-c:v", "mjpeg", "-q:v", "4", "-pix_fmt", "yuvj422p",
+                "-f", "nut", &format!("tcp://127.0.0.1:{p}?listen=1&tcp_nodelay=1"),
+            ])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap();
+        let live = open_live(p);
+        for _ in 0..6 {
+            std::thread::sleep(Duration::from_secs(1));
+            let _ = live.take_latest();
+            eprintln!("{:?}", live.stats());
+        }
+        drop(live);
+        let _ = tx.kill();
     }
 
     #[test]

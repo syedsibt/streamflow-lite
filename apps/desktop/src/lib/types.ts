@@ -466,7 +466,16 @@ export interface SourceDiag {
   name: string;
   kind: string;
   fps: number;
+  /** Frames the capture thread published per second. */
   device_fps: number | null;
+  /** Packets the camera actually delivered per second. */
+  device_packet_fps: number | null;
+  decode_ms: number | null;
+  convert_ms: number | null;
+  capture_latency_ms: number | null;
+  max_gap_ms: number | null;
+  decode_errors: number;
+  capture_errors: number;
   dropped: number;
   age_ms: number;
   width: number;
