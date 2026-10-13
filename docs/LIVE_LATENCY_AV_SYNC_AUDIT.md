@@ -280,7 +280,7 @@ real Tauri app (NSIS + MSI installers, portable exe) and runs the whole
 workspace test suite on Windows with FFmpeg 6.1.1 and Microsoft's
 software GPU (WARP):
 
-- **363 tests pass on Windows**, including the live-capture backlog tests,
+- **All 364 tests pass on Windows** (exit code 0), including the live-capture backlog tests,
   the end-to-end RTMP stream + late-joining recording, the A/V aligner
   and every GPU color test.
 - Windows-only issues found and fixed through it: DirectShow device
