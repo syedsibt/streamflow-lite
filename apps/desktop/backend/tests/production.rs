@@ -191,7 +191,10 @@ fn scene_render_returns_valid_nonblank_png_via_real_pipeline() {
     s.source_add(&scene, "camera", "Cam", [0, 0, 0], None, None, None, None, 0, 0, 0)
         .unwrap();
     let png2 = s.scene_render_png(&scene, 160, 90).unwrap();
-    assert_eq!(png, png2); // camera contributed nothing
+    // Camera contributed nothing. (The test signal's timecode/sweep move,
+    // so compare its static bar area: the top 40 % of rows.)
+    let static_rows = 160 * 4 * 36;
+    assert_eq!(&px[..static_rows], &decode_rgba(&png2)[..static_rows]);
 
     assert!(s.scene_render_png("nope", 160, 90).is_err());
 }
@@ -275,7 +278,7 @@ fn auto_transition_ticks_and_commits() {
     s.production_set_preview(&b).unwrap();
 
     // Unknown kind errors; double-start errors.
-    assert!(s.transition_auto(200, "wipe").is_err());
+    assert!(s.transition_auto(200, "stinger").is_err());
     let view = s.transition_auto(200, "mix").unwrap();
     assert!(view.active);
     assert_eq!(view.kind, "mix");
@@ -682,4 +685,73 @@ fn camera_auto_audio_attaches() {
         s.source_audio_device(&cam2),
         Some("Explicit Mic".to_string())
     );
+}
+
+// ---------------------------------------------------------------------------
+// Compositor: placed sources (PiP / split / fit / crop) and layouts
+// ---------------------------------------------------------------------------
+
+fn px_at(px: &[u8], w: usize, x: usize, y: usize) -> [u8; 3] {
+    let i = (y * w + x) * 4;
+    [px[i], px[i + 1], px[i + 2]]
+}
+
+#[test]
+fn placed_source_lands_in_its_box() {
+    use sf_ui_backend::{FitMode, SourceTransform};
+    let mut s = shell();
+    let scene = empty_scene(&mut s);
+    s.source_add(&scene, "color", "Red", [255, 0, 0], None, None, None, None, 0, 0, 0).unwrap();
+    let blue = s.source_add(&scene, "color", "Blue", [0, 0, 255], None, None, None, None, 0, 0, 0).unwrap();
+    // Bottom-right quarter.
+    s.source_set_transform(&scene, &blue.id, Some(SourceTransform::rect(0.5, 0.5, 0.5, 0.5))).unwrap();
+    let px = decode_rgba(&s.scene_render_png(&scene, 64, 36).unwrap());
+    assert_eq!(px_at(&px, 64, 10, 5), [255, 0, 0], "outside the box: layer below");
+    assert_eq!(px_at(&px, 64, 50, 30), [0, 0, 255], "inside the box: placed layer");
+    assert_eq!(px_at(&px, 64, 31, 30), [255, 0, 0], "box starts at x=32");
+
+    // Fit a 16:9 picture into a tall box: letterbox bars show the layer below.
+    let mut t = SourceTransform::rect(0.0, 0.0, 0.25, 1.0);
+    t.fit = FitMode::Fit;
+    s.source_set_transform(&scene, &blue.id, Some(t)).unwrap();
+    let px = decode_rgba(&s.scene_render_png(&scene, 64, 36).unwrap());
+    assert_eq!(px_at(&px, 64, 8, 2), [255, 0, 0], "bar above fitted content");
+    assert_eq!(px_at(&px, 64, 8, 18), [0, 0, 255], "fitted content centred");
+
+    // Half opacity blends.
+    let mut t = SourceTransform::rect(0.0, 0.0, 1.0, 1.0);
+    t.opacity = 0.5;
+    s.source_set_transform(&scene, &blue.id, Some(t)).unwrap();
+    let px = decode_rgba(&s.scene_render_png(&scene, 64, 36).unwrap());
+    let c = px_at(&px, 64, 32, 18);
+    assert!((120..=135).contains(&c[0]) && (120..=135).contains(&c[2]), "50 % blend, got {c:?}");
+
+    // Back to full frame clears the transform.
+    let st = s.source_set_transform(&scene, &blue.id, Some(SourceTransform::FULL)).unwrap();
+    assert!(st.transform.is_none());
+}
+
+#[test]
+fn layouts_place_video_sources_bottom_first() {
+    let mut s = shell();
+    let scene = empty_scene(&mut s);
+    add_pattern(&mut s, &scene, "A");
+    add_pattern(&mut s, &scene, "B");
+    assert_eq!(s.scene_apply_layout(&scene, "side_by_side").unwrap(), 2);
+    let sc = s.scene_list().into_iter().find(|x| x.id == scene).unwrap();
+    let a = sc.sources.iter().find(|x| x.name == "A").unwrap().transform.unwrap();
+    let b = sc.sources.iter().find(|x| x.name == "B").unwrap().transform.unwrap();
+    assert_eq!((a.x, a.w), (0.0, 0.5));
+    assert_eq!((b.x, b.w), (0.5, 0.5));
+    // Both halves show the (cropped) pattern: its centre cross is drawn
+    // white in the middle of each half.
+    let px = decode_rgba(&s.scene_render_png(&scene, 320, 180).unwrap());
+    assert_eq!(px_at(&px, 320, 80, 90), [255, 255, 255]);
+    assert_eq!(px_at(&px, 320, 240, 90), [255, 255, 255]);
+
+    assert_eq!(s.scene_apply_layout(&scene, "pip_br").unwrap(), 2);
+    let sc = s.scene_list().into_iter().find(|x| x.id == scene).unwrap();
+    assert!(sc.sources.iter().find(|x| x.name == "A").unwrap().transform.is_none(), "main is full frame");
+    assert!(s.scene_apply_layout(&scene, "nope").is_err());
+    assert_eq!(s.scene_apply_layout(&scene, "full").unwrap(), 2);
 }

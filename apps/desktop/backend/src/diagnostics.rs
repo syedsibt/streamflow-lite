@@ -286,7 +286,7 @@ impl Shell {
         let mut seen = std::collections::HashSet::new();
         let mut sources = Vec::new();
         for s in &all_sources {
-            if !seen.insert(s.id.clone()) {
+            if !seen.insert(self.frame_owner(&s.id).to_string()) {
                 continue;
             }
             let kind = match &s.kind {
@@ -295,8 +295,9 @@ impl Shell {
                 SourceKind::Media { .. } => "media",
                 _ => continue,
             };
-            let f = self.source_frames.get(&s.id);
-            let live = self.media_producers.get(&s.id).and_then(|p| p.live_stats());
+            let owner = self.frame_owner(&s.id).to_string();
+            let f = self.source_frames.get(&owner);
+            let live = self.media_producers.get(&owner).and_then(|p| p.live_stats());
             sources.push(SourceDiag {
                 id: s.id.clone(),
                 name: s.name.clone(),
@@ -314,7 +315,7 @@ impl Shell {
                 age_ms: f.map(|f| f.age_ema_us as f32 / 1000.0).unwrap_or(0.0),
                 width: f.map(|f| f.width).unwrap_or(0),
                 height: f.map(|f| f.height).unwrap_or(0),
-                format: self.camera_formats.get(&s.id).cloned(),
+                format: self.camera_formats.get(&owner).cloned(),
                 error: f
                     .and_then(|f| f.last_error.clone())
                     .or_else(|| live.and_then(|l| l.last_error)),

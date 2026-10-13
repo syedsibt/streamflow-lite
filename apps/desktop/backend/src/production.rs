@@ -163,6 +163,213 @@ pub struct SourceState {
     pub input_id: Option<String>,
     /// `"ready"` or `"pending"` (UI badge).
     pub status: String,
+    /// Position / size / crop in the canvas. `None` = full frame.
+    #[serde(default)]
+    pub transform: Option<SourceTransform>,
+}
+
+/// How a source fills its box when the aspect ratios differ.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum FitMode {
+    /// Cover the box, cropping the overflow (centre).
+    #[default]
+    Fill,
+    /// Whole picture inside the box (transparent bars).
+    Fit,
+    /// Distort to the box.
+    Stretch,
+}
+
+/// A source's placement in the canvas. Box and crop are fractions (0–1) of
+/// the canvas and of the source picture, so they survive a resolution
+/// change.
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+pub struct SourceTransform {
+    pub x: f32,
+    pub y: f32,
+    pub w: f32,
+    pub h: f32,
+    #[serde(default)]
+    pub crop_left: f32,
+    #[serde(default)]
+    pub crop_top: f32,
+    #[serde(default)]
+    pub crop_right: f32,
+    #[serde(default)]
+    pub crop_bottom: f32,
+    #[serde(default)]
+    pub fit: FitMode,
+    #[serde(default = "one")]
+    pub opacity: f32,
+}
+
+fn one() -> f32 {
+    1.0
+}
+
+impl SourceTransform {
+    pub const FULL: Self = Self {
+        x: 0.0,
+        y: 0.0,
+        w: 1.0,
+        h: 1.0,
+        crop_left: 0.0,
+        crop_top: 0.0,
+        crop_right: 0.0,
+        crop_bottom: 0.0,
+        fit: FitMode::Fill,
+        opacity: 1.0,
+    };
+
+    pub fn rect(x: f32, y: f32, w: f32, h: f32) -> Self {
+        Self { x, y, w, h, ..Self::FULL }
+    }
+
+    /// Identity placement (full canvas, no crop, opaque) — takes the fast
+    /// full-frame path.
+    pub fn is_full(&self) -> bool {
+        let z = |v: f32| v.abs() < 1e-4;
+        z(self.x) && z(self.y) && z(self.w - 1.0) && z(self.h - 1.0)
+            && z(self.crop_left) && z(self.crop_top) && z(self.crop_right) && z(self.crop_bottom)
+            && z(self.opacity - 1.0)
+    }
+
+    /// Clamped copy (box inside a sane range, crop leaves ≥ 2 % visible).
+    pub fn sanitized(mut self) -> Self {
+        let f = |v: f32, lo: f32, hi: f32| if v.is_finite() { v.clamp(lo, hi) } else { lo };
+        self.w = f(self.w, 0.01, 4.0);
+        self.h = f(self.h, 0.01, 4.0);
+        self.x = f(self.x, -self.w, 1.0);
+        self.y = f(self.y, -self.h, 1.0);
+        self.crop_left = f(self.crop_left, 0.0, 0.98);
+        self.crop_right = f(self.crop_right, 0.0, 0.98 - self.crop_left);
+        self.crop_top = f(self.crop_top, 0.0, 0.98);
+        self.crop_bottom = f(self.crop_bottom, 0.0, 0.98 - self.crop_top);
+        self.opacity = f(self.opacity, 0.0, 1.0);
+        self
+    }
+}
+
+/// Where a placed source lands: the content rectangle in canvas pixels and
+/// the full scaled-source size + offset whose sub-rectangle fills it.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) struct Placement {
+    /// Content rect in canvas pixels (may extend outside the canvas).
+    pub cx: i64,
+    pub cy: i64,
+    pub cw: u32,
+    pub ch: u32,
+    /// Size to pull/scale the whole source to.
+    pub sw: u32,
+    pub sh: u32,
+    /// Offset of the content inside that scaled source.
+    pub ox: i64,
+    pub oy: i64,
+}
+
+/// Layout math for a placed source of native size `src_w`×`src_h` on a
+/// `canvas_w`×`canvas_h` canvas.
+pub(crate) fn placement(t: &SourceTransform, canvas_w: u32, canvas_h: u32, src_w: u32, src_h: u32) -> Placement {
+    let t = t.sanitized();
+    let (cwf, chf) = (canvas_w as f64, canvas_h as f64);
+    let (sw, sh) = (src_w.max(1) as f64, src_h.max(1) as f64);
+    // Box in canvas px.
+    let (bx, by, bw, bh) = (t.x as f64 * cwf, t.y as f64 * chf, (t.w as f64 * cwf).max(1.0), (t.h as f64 * chf).max(1.0));
+    // Crop window in source fractions.
+    let (mut l, mut tp) = (t.crop_left as f64, t.crop_top as f64);
+    let (mut r, mut b) = (1.0 - t.crop_right as f64, 1.0 - t.crop_bottom as f64);
+    let crop_aspect = ((r - l) * sw) / ((b - tp) * sh);
+    let box_aspect = bw / bh;
+    let (mut cx, mut cy, mut cw, mut ch) = (bx, by, bw, bh);
+    match t.fit {
+        FitMode::Stretch => {}
+        FitMode::Fill => {
+            if crop_aspect > box_aspect {
+                // Too wide: narrow the crop window around its centre.
+                let keep = (r - l) * box_aspect / crop_aspect;
+                let mid = (l + r) / 2.0;
+                l = mid - keep / 2.0;
+                r = mid + keep / 2.0;
+            } else {
+                let keep = (b - tp) * crop_aspect / box_aspect;
+                let mid = (tp + b) / 2.0;
+                tp = mid - keep / 2.0;
+                b = mid + keep / 2.0;
+            }
+        }
+        FitMode::Fit => {
+            if crop_aspect > box_aspect {
+                ch = bw / crop_aspect;
+                cy = by + (bh - ch) / 2.0;
+            } else {
+                cw = bh * crop_aspect;
+                cx = bx + (bw - cw) / 2.0;
+            }
+        }
+    }
+    let scale_w = (cw / (r - l)).clamp(1.0, 8192.0);
+    let scale_h = (ch / (b - tp)).clamp(1.0, 8192.0);
+    Placement {
+        cx: cx.round() as i64,
+        cy: cy.round() as i64,
+        cw: cw.round().max(1.0) as u32,
+        ch: ch.round().max(1.0) as u32,
+        sw: scale_w.round() as u32,
+        sh: scale_h.round() as u32,
+        ox: (l * scale_w).round() as i64,
+        oy: (tp * scale_h).round() as i64,
+    }
+}
+
+/// Blits the placed content of `src` (`p.sw`×`p.sh` RGBA) into `canvas`
+/// with `opacity`; `opaque` sources (cameras, files…) copy whole rows.
+pub(crate) fn blit_placed(canvas: &mut [u8], w: u32, h: u32, src: &[u8], p: &Placement, opacity: f32, opaque: bool) {
+    let (w, h) = (w as i64, h as i64);
+    let (sw, sh) = (p.sw as i64, p.sh as i64);
+    if src.len() < (sw * sh * 4) as usize {
+        return;
+    }
+    let x0 = p.cx.max(0);
+    let x1 = (p.cx + p.cw as i64).min(w);
+    let y0 = p.cy.max(0);
+    let y1 = (p.cy + p.ch as i64).min(h);
+    if x0 >= x1 || y0 >= y1 {
+        return;
+    }
+    let op = opacity.clamp(0.0, 1.0);
+    for y in y0..y1 {
+        let syy = p.oy + (y - p.cy);
+        if syy < 0 || syy >= sh {
+            continue;
+        }
+        let sx0 = p.ox + (x0 - p.cx);
+        let sx1 = (sx0 + (x1 - x0)).min(sw);
+        let sx0c = sx0.max(0);
+        if sx0c >= sx1 {
+            continue;
+        }
+        let dx0 = x0 + (sx0c - sx0);
+        let n = (sx1 - sx0c) as usize;
+        let s_off = ((syy * sw + sx0c) * 4) as usize;
+        let d_off = ((y * w + dx0) * 4) as usize;
+        let srow = &src[s_off..s_off + n * 4];
+        let drow = &mut canvas[d_off..d_off + n * 4];
+        if opaque && op >= 0.999 {
+            drow.copy_from_slice(srow);
+            continue;
+        }
+        for (d, s) in drow.chunks_exact_mut(4).zip(srow.chunks_exact(4)) {
+            let a = s[3] as f32 / 255.0 * op;
+            if a <= 0.0 {
+                continue;
+            }
+            for c in 0..3 {
+                d[c] = (s[c] as f32 * a + d[c] as f32 * (1.0 - a)).round() as u8;
+            }
+            d[3] = d[3].max((a * 255.0).round() as u8);
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -187,11 +394,34 @@ pub struct ProdScene {
 // Transitions
 // ---------------------------------------------------------------------------
 
-/// Supported transition kinds (only mix today).
-#[derive(Clone, Copy, Debug, Serialize, Deserialize)]
+/// Supported transition kinds.
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum TransitionKind {
+    /// Cross-dissolve.
     Mix,
+    /// Fade program to black, then black up to preview.
+    Fade,
+    /// Hard-edge wipe, left to right.
+    Wipe,
+}
+
+impl TransitionKind {
+    pub fn parse(s: &str) -> Option<Self> {
+        match s {
+            "mix" => Some(Self::Mix),
+            "fade" => Some(Self::Fade),
+            "wipe" => Some(Self::Wipe),
+            _ => None,
+        }
+    }
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Mix => "mix",
+            Self::Fade => "fade",
+            Self::Wipe => "wipe",
+        }
+    }
 }
 
 /// An in-flight auto transition (crate-private runtime state).
@@ -718,9 +948,7 @@ impl Shell {
                 TransitionView {
                     active: true,
                     progress: transition_progress(elapsed, t.duration_ms),
-                    kind: match t.kind {
-                        TransitionKind::Mix => "mix".to_string(),
-                    },
+                    kind: t.kind.name().to_string(),
                     duration_ms: t.duration_ms,
                 }
             }
@@ -833,6 +1061,11 @@ impl Shell {
         };
         for s in &src.sources {
             let new_id = Uuid::new_v4().to_string();
+            // Show the same capture (camera/screen/file) — never reopen it.
+            if matches!(s.kind, SourceKind::Camera { .. } | SourceKind::Screen | SourceKind::Media { .. }) {
+                let owner = self.frame_owner(&s.id).to_string();
+                self.producer_alias.insert(new_id.clone(), owner);
+            }
             let input_id = s.kind.is_real().then(|| source_input_id(&new_id));
             if let Some(input_id) = &input_id {
                 self.engine.state_mut().add_input(input_id, &s.name);
@@ -848,6 +1081,7 @@ impl Shell {
                 order: s.order,
                 input_id,
                 status: s.kind.status().to_string(),
+                transform: s.transform,
             });
         }
         self.scenes.push(dup.clone());
@@ -1045,6 +1279,12 @@ impl Shell {
             }
         }
         let id = Uuid::new_v4().to_string();
+        // The same camera / screen already captured by another source (in
+        // any scene) is shared, not opened twice (a device opens once).
+        let shared = self.shared_producer_for(&kind);
+        if let Some(owner) = &shared {
+            self.producer_alias.insert(id.clone(), owner.clone());
+        }
         // Open producers BEFORE the source is pushed, so a bad file or
         // missing camera fails cleanly without leaving a half-added source.
         if let SourceKind::Media { path } = &kind {
@@ -1065,14 +1305,16 @@ impl Shell {
                 (1280, 720)
             };
             let f = if *fps == 30 || *fps == 60 { *fps } else { 30 };
-            self.open_camera_producer(&id, device.as_deref(), audio_device.as_deref(), w, h, f)?;
+            if shared.is_none() {
+                self.open_camera_producer(&id, device.as_deref(), audio_device.as_deref(), w, h, f)?;
+            }
         }
         #[cfg(any(windows, sf_wincheck))]
         if let SourceKind::AudioInput { device } = &kind {
             self.open_audio_producer(&id, device.as_deref())?;
         }
         #[cfg(any(windows, sf_wincheck))]
-        if matches!(kind, SourceKind::Screen) {
+        if matches!(kind, SourceKind::Screen) && shared.is_none() {
             self.open_screen_producer(&id)?;
         }
         // Audio-only sources need no video input record.
@@ -1091,6 +1333,7 @@ impl Shell {
             visible: true,
             order,
             input_id: input_id.clone(),
+            transform: None,
         };
         // End the scene borrow before touching the engine/mixer.
         self.find_scene_mut(scene_id)
@@ -1124,15 +1367,37 @@ impl Shell {
             s.order = i as u32;
         }
         self.mixer.channels.remove(source_id);
-        self.media_producers.remove(source_id);
-        // Dropping the LiveInput signals its capture thread to stop (never
-        // joins: a wedged driver can't hang this command).
-        self.audio_inputs.remove(source_id);
-        self.voice_enhancers.remove(source_id);
-        self.audio_bus.remove(source_id);
-        self.source_frames.remove(source_id);
-        self.resized_frames.retain(|(id, _, _), _| id != source_id);
-        self.camera_formats.remove(source_id);
+        // Shared captures: an alias just unlinks; an owner still shown by
+        // other scenes keeps capturing until its last user is removed.
+        let owner = self.producer_alias.remove(source_id);
+        let still_used = |me: &Self, o: &str| me.producer_alias.values().any(|v| v == o);
+        let mut release: Vec<String> = Vec::new();
+        match owner {
+            Some(o) => {
+                if self.orphan_owners.contains(&o) && !still_used(self, &o) {
+                    self.orphan_owners.remove(&o);
+                    release.push(o);
+                }
+            }
+            None => {
+                if still_used(self, source_id) {
+                    self.orphan_owners.insert(source_id.to_string());
+                } else {
+                    release.push(source_id.to_string());
+                }
+            }
+        }
+        for id in &release {
+            self.media_producers.remove(id);
+            // Dropping the LiveInput signals its capture thread to stop
+            // (never joins: a wedged driver can't hang this command).
+            self.audio_inputs.remove(id);
+            self.voice_enhancers.remove(id);
+            self.audio_bus.remove(id);
+            self.source_frames.remove(id);
+            self.resized_frames.retain(|(rid, _, _), _| rid != id);
+            self.camera_formats.remove(id);
+        }
         // Drop any cached text rasterizations for this source.
         self.text_cache.retain(|(sid, _, _, _), _| sid != source_id);
         self.meter_values.remove(source_id);
@@ -1202,6 +1467,89 @@ impl Shell {
     }
 }
 
+impl Shell {
+    /// Places a source in the canvas (`None` = full frame).
+    pub fn source_set_transform(
+        &mut self,
+        scene_id: &str,
+        source_id: &str,
+        transform: Option<SourceTransform>,
+    ) -> Result<SourceState, ShellError> {
+        let scene = self
+            .find_scene_mut(scene_id)
+            .ok_or_else(|| ShellError::UnknownScene(scene_id.to_string()))?;
+        let src = scene
+            .sources
+            .iter_mut()
+            .find(|s| s.id == source_id)
+            .ok_or_else(|| ShellError::UnknownSource(source_id.to_string()))?;
+        src.transform = transform.map(|t| t.sanitized()).filter(|t| !t.is_full());
+        let src = src.clone();
+        self.events.push_back(UiEvent::SourceChanged {
+            scene_id: scene_id.to_string(),
+        });
+        Ok(src)
+    }
+
+    /// Arranges the scene's visible video sources (bottom-first order) in a
+    /// preset layout: `full`, `side_by_side`, `side_by_side_fit`, `split_v`,
+    /// `pip_tl` / `pip_tr` / `pip_bl` / `pip_br`, `grid`. Returns how many
+    /// sources were placed.
+    pub fn scene_apply_layout(&mut self, scene_id: &str, layout: &str) -> Result<usize, ShellError> {
+        let rects = layout_rects(layout)
+            .ok_or_else(|| ShellError::InvalidSetting(format!("unknown layout '{layout}'")))?;
+        let scene = self
+            .find_scene_mut(scene_id)
+            .ok_or_else(|| ShellError::UnknownScene(scene_id.to_string()))?;
+        let mut video: Vec<&mut SourceState> = scene
+            .sources
+            .iter_mut()
+            .filter(|s| {
+                s.visible
+                    && matches!(
+                        s.kind,
+                        SourceKind::Camera { .. } | SourceKind::Screen | SourceKind::Media { .. } | SourceKind::TestPattern
+                    )
+            })
+            .collect();
+        video.sort_by_key(|s| s.order);
+        let n = video.len().min(rects.len());
+        for (src, t) in video.into_iter().zip(rects.iter()) {
+            src.transform = t.filter(|t| !t.is_full());
+        }
+        self.events.push_back(UiEvent::SourceChanged {
+            scene_id: scene_id.to_string(),
+        });
+        Ok(n)
+    }
+}
+
+/// Box per video source (bottom-first) for a preset layout.
+pub(crate) fn layout_rects(layout: &str) -> Option<Vec<Option<SourceTransform>>> {
+    use SourceTransform as T;
+    let full = None;
+    // PiP: 30 % size (keeps 16:9 on a 16:9 canvas), 3 % margin.
+    let (pw, m) = (0.30_f32, 0.03_f32);
+    let pip = |x: f32, y: f32| Some(T::rect(x, y, pw, pw));
+    Some(match layout {
+        "full" => vec![full; 8],
+        "side_by_side" => vec![Some(T::rect(0.0, 0.0, 0.5, 1.0)), Some(T::rect(0.5, 0.0, 0.5, 1.0))],
+        "side_by_side_fit" => vec![Some(T::rect(0.0, 0.25, 0.5, 0.5)), Some(T::rect(0.5, 0.25, 0.5, 0.5))],
+        "split_v" => vec![Some(T::rect(0.0, 0.0, 1.0, 0.5)), Some(T::rect(0.0, 0.5, 1.0, 0.5))],
+        "pip_tl" => vec![full, pip(m, m)],
+        "pip_tr" => vec![full, pip(1.0 - pw - m, m)],
+        "pip_bl" => vec![full, pip(m, 1.0 - pw - m)],
+        "pip_br" => vec![full, pip(1.0 - pw - m, 1.0 - pw - m)],
+        "grid" => vec![
+            Some(T::rect(0.0, 0.0, 0.5, 0.5)),
+            Some(T::rect(0.5, 0.0, 0.5, 0.5)),
+            Some(T::rect(0.0, 0.5, 0.5, 0.5)),
+            Some(T::rect(0.5, 0.5, 0.5, 0.5)),
+        ],
+        _ => return None,
+    })
+}
+
 // ---------------------------------------------------------------------------
 // Scene render: real pipeline + CPU "over" composite
 // ---------------------------------------------------------------------------
@@ -1265,6 +1613,42 @@ fn composite_over(canvas: &mut [u8], src: &[u8]) {
     }
 }
 
+/// Transition frame between `a` (from) and `b` (to) at eased progress `t`.
+pub(crate) fn transition_blend(kind: TransitionKind, a: &Frame, b: &Frame, t: f32) -> Frame {
+    let t = t.clamp(0.0, 1.0);
+    match kind {
+        TransitionKind::Mix => crossfade(a, b, t),
+        TransitionKind::Fade => {
+            // First half: a → black; second half: black → b.
+            let (src, k) = if t < 0.5 { (a, 1.0 - t * 2.0) } else { (b, t * 2.0 - 1.0) };
+            let pixels = src
+                .pixels
+                .chunks_exact(4)
+                .flat_map(|p| {
+                    [
+                        (p[0] as f32 * k).round() as u8,
+                        (p[1] as f32 * k).round() as u8,
+                        (p[2] as f32 * k).round() as u8,
+                        p[3],
+                    ]
+                })
+                .collect();
+            Frame { width: src.width, height: src.height, pixels }
+        }
+        TransitionKind::Wipe => {
+            let w = a.width as usize;
+            let edge = (t * a.width as f32).round() as usize;
+            let mut pixels = a.pixels.clone();
+            if b.pixels.len() == pixels.len() && w > 0 {
+                for (row_a, row_b) in pixels.chunks_exact_mut(w * 4).zip(b.pixels.chunks_exact(w * 4)) {
+                    row_a[..edge * 4].copy_from_slice(&row_b[..edge * 4]);
+                }
+            }
+            Frame { width: a.width, height: a.height, pixels }
+        }
+    }
+}
+
 /// Linear crossfade between two same-size frames (`t` = 0 → `a`).
 pub(crate) fn crossfade(a: &Frame, b: &Frame, t: f32) -> Frame {
     let t = t.clamp(0.0, 1.0);
@@ -1309,36 +1693,74 @@ impl Shell {
             && matches!(
                 sources[0].kind,
                 SourceKind::Media { .. } | SourceKind::Camera { .. } | SourceKind::Screen
-            );
+            )
+            && sources[0].transform.is_none_or(|t| t.is_full());
         let mut canvas: Option<Vec<u8>> = None;
         for src in &sources {
             let input_id = src
                 .input_id
                 .as_ref()
                 .ok_or_else(|| ShellError::UnknownSource(src.id.clone()))?;
+            let is_capture = matches!(
+                src.kind,
+                SourceKind::Media { .. } | SourceKind::Camera { .. } | SourceKind::Screen
+            );
+            // Placed layer (PiP / side-by-side / crop): pull the source
+            // already scaled for its box (GPU resize, cached per frame) and
+            // blit only that rectangle — no full-frame blend.
+            let place = match src.transform.filter(|t| !t.is_full()) {
+                Some(t) => {
+                    let (nw, nh) = if is_capture {
+                        match self.source_native_size(&src.id) {
+                            Some(sz) => sz,
+                            None => continue,
+                        }
+                    } else {
+                        (w, h)
+                    };
+                    Some((placement(&t, w, h, nw, nh), t.opacity))
+                }
+                None => None,
+            };
+            let (pw, ph) = place.map_or((w, h), |(p, _)| (p.sw, p.sh));
             let pixels: std::sync::Arc<Vec<u8>> = match &src.kind {
                 SourceKind::Media { .. } | SourceKind::Camera { .. } | SourceKind::Screen => {
                     // The tick's cached frame (one pull per source per
                     // tick); skip the layer until the first frame arrives.
-                    match self.pull_media_frame(&src.id, w, h) {
+                    match self.pull_media_frame(&src.id, pw, ph) {
                         Some(px) => px,
                         None => continue,
                     }
                 }
                 SourceKind::Text { text } => {
-                    std::sync::Arc::new(self.text_pixels(&src.id, text, w, h))
+                    std::sync::Arc::new(self.text_pixels(&src.id, text, pw, ph))
                 }
                 SourceKind::TestPattern => std::sync::Arc::new(self.test_pattern.frame(
-                    w,
-                    h,
+                    pw,
+                    ph,
                     self.video_settings.output_fps,
                     std::time::SystemTime::now(),
                 )),
-                _ => std::sync::Arc::new(source_pixels(&src.kind, w, h)),
+                _ => std::sync::Arc::new(source_pixels(&src.kind, pw, ph)),
             };
             let g0 = std::time::Instant::now();
-            let frame = self.engine.grade_input_frame(input_id, w, h, &pixels)?;
+            let frame = self.engine.grade_input_frame(input_id, pw, ph, &pixels)?;
             self.perf_gpu_us_accum += g0.elapsed().as_micros() as u64;
+            if let Some((p, opacity)) = place {
+                let base = canvas.get_or_insert_with(|| vec![0u8; w as usize * h as usize * 4]);
+                let opaque = is_capture || matches!(src.kind, SourceKind::TestPattern | SourceKind::Color { .. });
+                blit_placed(base, w, h, &frame.pixels, &p, opacity, opaque);
+                if let Some(mode) = self.studio_watching(input_id) {
+                    let raw = (mode != crate::color_library::PreviewMode::After).then(|| Frame {
+                        width: pw,
+                        height: ph,
+                        pixels: std::sync::Arc::try_unwrap(pixels).unwrap_or_else(|a| (*a).clone()),
+                    });
+                    let input_id = input_id.clone();
+                    self.studio_tap_store(&input_id, frame, raw);
+                }
+                continue;
+            }
             // Color Studio live tap: hand over the exact graded frame that
             // goes to program/encoder (and the raw one for before/after).
             let watch = self.studio_watching(input_id);
@@ -1416,13 +1838,14 @@ impl Shell {
                 t.from_scene.clone(),
                 t.to_scene.clone(),
                 transition_progress(elapsed, t.duration_ms),
+                t.kind,
             )
         });
         match active {
-            Some((from, to, progress)) => {
+            Some((from, to, progress, kind)) => {
                 let a = self.render_scene_frame(&from, width, height)?;
                 let b = self.render_scene_frame(&to, width, height)?;
-                encode_png(&crossfade(&a, &b, progress))
+                encode_png(&transition_blend(kind, &a, &b, progress))
             }
             None => {
                 let program = self.program_scene_id.clone();
@@ -1516,10 +1939,8 @@ impl Shell {
         duration_ms: u64,
         kind: &str,
     ) -> Result<TransitionView, ShellError> {
-        let kind = match kind {
-            "mix" => TransitionKind::Mix,
-            _ => return Err(ShellError::UnknownTransitionKind(kind.to_string())),
-        };
+        let kind = TransitionKind::parse(kind)
+            .ok_or_else(|| ShellError::UnknownTransitionKind(kind.to_string()))?;
         if self.transition.is_some() {
             return Err(ShellError::Transition(
                 "a transition is already in progress".to_string(),
@@ -1571,9 +1992,7 @@ impl Shell {
             let view = TransitionView {
                 active: true,
                 progress,
-                kind: match active.kind {
-                    TransitionKind::Mix => "mix".to_string(),
-                },
+                kind: active.kind.name().to_string(),
                 duration_ms: active.duration_ms,
             };
             // The original start time is kept: progress is wall-clock.
@@ -1836,6 +2255,26 @@ impl Shell {
                 audio_device: existing_audio.clone(),
             };
         }
+        // A shared scene item reconfigures the shared capture (same physical
+        // device for every scene); switching it to another device unlinks it.
+        let mut target = source_id.to_string();
+        if let Some(owner) = self.producer_alias.get(source_id).cloned() {
+            let owner_dev = self
+                .scenes
+                .iter()
+                .flat_map(|s| s.sources.iter())
+                .find(|s| s.id == owner)
+                .and_then(|s| match &s.kind {
+                    SourceKind::Camera { device, .. } => Some(device.clone()),
+                    _ => None,
+                });
+            if owner_dev.is_none_or(|d| d == device) {
+                target = owner;
+            } else {
+                self.producer_alias.remove(source_id);
+            }
+        }
+        let source_id = target.as_str();
         // Drop the old producer + negotiated-format entry before reopening.
         self.media_producers.remove(source_id);
         self.camera_formats.remove(source_id);
@@ -2038,5 +2477,49 @@ impl Shell {
             hotkey: m.hotkey,
             happened,
         })
+    }
+}
+
+#[cfg(test)]
+mod transition_tests {
+    use super::*;
+
+    fn solid(v: u8) -> Frame {
+        Frame { width: 4, height: 2, pixels: vec![v; 4 * 2 * 4] }
+    }
+
+    #[test]
+    fn fade_passes_through_black_and_wipe_moves_an_edge() {
+        let (a, b) = (solid(200), solid(100));
+        assert_eq!(transition_blend(TransitionKind::Fade, &a, &b, 0.5).pixels[0], 0);
+        assert_eq!(transition_blend(TransitionKind::Fade, &a, &b, 0.0).pixels[0], 200);
+        assert_eq!(transition_blend(TransitionKind::Fade, &a, &b, 1.0).pixels[0], 100);
+        let w = transition_blend(TransitionKind::Wipe, &a, &b, 0.5);
+        assert_eq!(w.pixels[0], 100, "left of the edge shows the incoming scene");
+        assert_eq!(w.pixels[3 * 4], 200, "right of the edge still shows the outgoing scene");
+        assert_eq!(TransitionKind::parse("wipe"), Some(TransitionKind::Wipe));
+        assert_eq!(TransitionKind::parse("x"), None);
+    }
+
+    #[test]
+    fn placement_fill_crops_centre_and_fit_letterboxes() {
+        // 16:9 source into a square box.
+        let t = SourceTransform::rect(0.0, 0.0, 0.5, 1.0); // 100x100 on 200x100
+        let p = placement(&t, 200, 100, 1920, 1080);
+        assert_eq!((p.cx, p.cy, p.cw, p.ch), (0, 0, 100, 100));
+        // Scaled so the height fills: 100 high → 178 wide, centred crop.
+        assert_eq!((p.sw, p.sh), (178, 100));
+        assert_eq!(p.ox, 39);
+        let mut f = t;
+        f.fit = FitMode::Fit;
+        let p = placement(&f, 200, 100, 1920, 1080);
+        assert_eq!((p.cw, p.ch), (100, 56));
+        assert_eq!(p.cy, 22);
+        // Crop 25 % left: the offset starts inside the scaled source.
+        let mut c = SourceTransform::rect(0.0, 0.0, 1.0, 1.0);
+        c.crop_left = 0.25;
+        c.fit = FitMode::Stretch;
+        let p = placement(&c, 200, 100, 200, 100);
+        assert_eq!((p.sw, p.ox), (267, 67));
     }
 }

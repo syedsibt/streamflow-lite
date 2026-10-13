@@ -2,8 +2,8 @@ import { useEffect, useMemo, useState } from "react";
 import { open } from "@tauri-apps/plugin-dialog";
 import { api } from "../../lib/ipc";
 import { errText, useProduction } from "../../lib/productionStore";
-import type { CameraSourceInfo, SourceKind, SourceView } from "../../lib/types";
-import Monitor from "../Monitor";
+import type { CameraSourceInfo, FitMode, SceneLayout, SourceKind, SourceTransform, SourceView } from "../../lib/types";
+import Monitor, { PreviewMonitor } from "../Monitor";
 import { Banner, Dot, Empty, Field, Glyph, Row, Section, Segmented, Switch } from "../ui";
 
 type AddKind = "camera" | "capture" | "screen" | "media" | "mic" | "text";
@@ -99,7 +99,7 @@ export default function InputView() {
   return (
     <div className="workspace">
       <div className="stage-area">
-        <Monitor />
+        {state && state.preview_scene_id && state.preview_scene_id !== state.program_scene_id ? <PreviewMonitor /> : <Monitor />}
       </div>
       <aside className="inspector">
         <Section
@@ -135,7 +135,9 @@ export default function InputView() {
           ))}
         </Section>
         {adding && <AddSource onDone={() => setAdding(false)} />}
+        <LayoutPicker />
         {sel && !adding && <SourceDetail key={sel.id} source={sel} sources={sources} onRemoved={() => setSelected(null)} />}
+        {sel && !adding && sel.kind !== "audioinput" && <TransformEditor key={`t-${sel.id}`} source={sel} />}
         {sel && !adding && sel.kind === "testpattern" && (
           <Section title="Reading the test signal">
             <div className="help-list">
@@ -482,6 +484,103 @@ function SourceDetail({ source, sources, onRemoved }: { source: SourceView; sour
           onBlur={() => setConfirm(false)}
         >
           {confirm ? "Tap again to remove" : "Remove"}
+        </button>
+      </div>
+    </Section>
+  );
+}
+
+// ---------------------------------------------------------------------------
+// Multi-source layout + placement
+// ---------------------------------------------------------------------------
+
+const LAYOUTS: { id: SceneLayout; label: string; boxes: [number, number, number, number][] }[] = [
+  { id: "full", label: "Full", boxes: [[0, 0, 1, 1]] },
+  { id: "side_by_side", label: "Side by side", boxes: [[0, 0, 0.5, 1], [0.5, 0, 0.5, 1]] },
+  { id: "side_by_side_fit", label: "Side by side (whole picture)", boxes: [[0, 0.25, 0.5, 0.5], [0.5, 0.25, 0.5, 0.5]] },
+  { id: "split_v", label: "Top / bottom", boxes: [[0, 0, 1, 0.5], [0, 0.5, 1, 0.5]] },
+  { id: "pip_br", label: "Picture in picture, bottom right", boxes: [[0, 0, 1, 1], [0.67, 0.67, 0.3, 0.3]] },
+  { id: "pip_bl", label: "Picture in picture, bottom left", boxes: [[0, 0, 1, 1], [0.03, 0.67, 0.3, 0.3]] },
+  { id: "pip_tr", label: "Picture in picture, top right", boxes: [[0, 0, 1, 1], [0.67, 0.03, 0.3, 0.3]] },
+  { id: "grid", label: "2 × 2 grid", boxes: [[0, 0, 0.5, 0.5], [0.5, 0, 0.5, 0.5], [0, 0.5, 0.5, 0.5], [0.5, 0.5, 0.5, 0.5]] },
+];
+
+function LayoutPicker() {
+  const apply = useProduction((s) => s.sceneApplyLayout);
+  return (
+    <Section title="Layout" footer="Arranges the visible video sources, bottom of the list first (first = main picture).">
+      <div className="layout-grid">
+        {LAYOUTS.map((l) => (
+          <button key={l.id} type="button" className="layout-btn" title={l.label} aria-label={l.label} onClick={() => void apply(l.id)}>
+            <svg viewBox="0 0 32 18" width="32" height="18" aria-hidden="true">
+              <rect x="0.5" y="0.5" width="31" height="17" className="lo-frame" />
+              {l.boxes.map((b, i) => (
+                <rect key={i} x={b[0] * 32 + 1} y={b[1] * 18 + 1} width={b[2] * 32 - 2} height={b[3] * 18 - 2} className={i === 0 ? "lo-main" : "lo-sub"} />
+              ))}
+            </svg>
+          </button>
+        ))}
+      </div>
+    </Section>
+  );
+}
+
+const FULL_T: SourceTransform = { x: 0, y: 0, w: 1, h: 1, crop_left: 0, crop_top: 0, crop_right: 0, crop_bottom: 0, fit: "fill", opacity: 1 };
+
+function Pct({ label, value, onChange, min = 0, max = 100 }: { label: string; value: number; onChange: (v: number) => void; min?: number; max?: number }) {
+  return (
+    <label className="num-field">
+      <span>{label}</span>
+      <input
+        type="number"
+        step={1}
+        min={min}
+        max={max}
+        value={Math.round(value * 1000) / 10}
+        onChange={(e) => {
+          const v = Number(e.target.value);
+          if (Number.isFinite(v)) onChange(Math.min(max, Math.max(min, v)) / 100);
+        }}
+      />
+    </label>
+  );
+}
+
+function TransformEditor({ source }: { source: SourceView }) {
+  const setT = useProduction((s) => s.sourceSetTransform);
+  const t = source.transform ?? FULL_T;
+  const upd = (patch: Partial<SourceTransform>) => void setT(source.id, { ...t, ...patch });
+  return (
+    <Section title="Position, size & crop" footer="Percent of the canvas (position/size) and of the source picture (crop).">
+      <div className="num-grid">
+        <Pct label="X" value={t.x} min={-100} onChange={(x) => upd({ x })} />
+        <Pct label="Y" value={t.y} min={-100} onChange={(y) => upd({ y })} />
+        <Pct label="W" value={t.w} min={1} max={400} onChange={(w) => upd({ w })} />
+        <Pct label="H" value={t.h} min={1} max={400} onChange={(h) => upd({ h })} />
+        <Pct label="Crop L" value={t.crop_left} max={98} onChange={(crop_left) => upd({ crop_left })} />
+        <Pct label="Crop R" value={t.crop_right} max={98} onChange={(crop_right) => upd({ crop_right })} />
+        <Pct label="Crop T" value={t.crop_top} max={98} onChange={(crop_top) => upd({ crop_top })} />
+        <Pct label="Crop B" value={t.crop_bottom} max={98} onChange={(crop_bottom) => upd({ crop_bottom })} />
+      </div>
+      <Field label="Fit">
+        <Segmented<FitMode>
+          label="Fit"
+          size="small"
+          value={t.fit}
+          onChange={(fit) => upd({ fit })}
+          options={[
+            { value: "fill", label: "Fill" },
+            { value: "fit", label: "Fit" },
+            { value: "stretch", label: "Stretch" },
+          ]}
+        />
+      </Field>
+      <Field label={`Opacity ${Math.round(t.opacity * 100)}%`}>
+        <input type="range" min={0} max={100} value={Math.round(t.opacity * 100)} style={{ ["--pct" as string]: `${Math.round(t.opacity * 100)}%` }} onChange={(e) => upd({ opacity: Number(e.target.value) / 100 })} />
+      </Field>
+      <div className="pad actions">
+        <button type="button" className="btn small secondary" disabled={!source.transform} onClick={() => void setT(source.id, null)}>
+          Reset to full frame
         </button>
       </div>
     </Section>

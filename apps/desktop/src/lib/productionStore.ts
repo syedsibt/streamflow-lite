@@ -20,7 +20,10 @@ import type {
   EnhancerSettings,
   PlatformInfo,
   ProductionStateData,
+  SceneLayout,
   SourceKind,
+  SourceTransform,
+  TransitionKindName,
   VoiceStats,
 } from "./types";
 
@@ -55,6 +58,26 @@ interface ProductionStore {
   sourceRemove: (source_id: string) => Promise<void>;
   sourceReorder: (order: string[]) => Promise<void>;
   sourceSetVisible: (source_id: string, visible: boolean) => Promise<void>;
+  /** Live placement edit (optimistic; the backend clamps). */
+  sourceSetTransform: (source_id: string, t: SourceTransform | null) => Promise<void>;
+  sceneApplyLayout: (layout: SceneLayout) => Promise<void>;
+
+  // Studio: scenes, preview → program, transitions.
+  /** Preview-scene monitor (data URL), polled only while it differs from program. */
+  previewUrl: string | null;
+  pollPreviewMonitor: () => Promise<void>;
+  /** Eased progress of a running auto transition, null when idle. */
+  transitionProgress: number | null;
+  transitionKind: TransitionKindName;
+  transitionMs: number;
+  setTransition: (kind: TransitionKindName, ms: number) => void;
+  setPreviewScene: (scene_id: string) => Promise<void>;
+  cut: () => Promise<void>;
+  auto: () => Promise<void>;
+  sceneCreate: () => Promise<void>;
+  sceneDuplicate: (scene_id: string) => Promise<void>;
+  sceneRename: (scene_id: string, name: string) => Promise<void>;
+  sceneDelete: (scene_id: string) => Promise<void>;
   mediaSetPaused: (source_id: string, paused: boolean) => Promise<void>;
 
   setChannelGain: (source_id: string, gain: number) => void;
@@ -173,6 +196,7 @@ function normalizeProductionState(raw: unknown): ProductionStateData {
         order: num(s.order, 0),
         status: String(s.status ?? ""),
         input_id: typeof s.input_id === "string" ? s.input_id : null,
+        transform: s.transform && typeof s.transform === "object" ? (s.transform as SourceTransform) : null,
       };
     }),
   }));
@@ -284,6 +308,13 @@ export const useProduction = create<ProductionStore>()((set, get) => ({
         case "production.mixer_changed":
           void get().refresh();
           break;
+        case "production.transition_progress":
+          set({ transitionProgress: (e as { progress?: number }).progress ?? null });
+          break;
+        case "production.transition_done":
+          set({ transitionProgress: null });
+          void get().refresh();
+          break;
         default:
           break;
       }
@@ -343,9 +374,114 @@ export const useProduction = create<ProductionStore>()((set, get) => ({
     }
   },
 
+  // Edits target the PREVIEW scene (studio mode). With one scene, preview
+  // and program are the same scene, so edits are live.
   sceneId: () => {
     const st = get().state;
-    return st?.program_scene_id ?? st?.scenes[0]?.id ?? null;
+    return st?.preview_scene_id ?? st?.program_scene_id ?? st?.scenes[0]?.id ?? null;
+  },
+
+  previewUrl: null,
+  pollPreviewMonitor: async () => {
+    const st = get().state;
+    const pv = st?.preview_scene_id;
+    if (!pv || pv === st?.program_scene_id) {
+      if (get().previewUrl) set({ previewUrl: null });
+      return;
+    }
+    try {
+      set({ previewUrl: await api.scenePreviewJpg(pv) });
+    } catch {
+      /* scene vanished between polls */
+    }
+  },
+  transitionProgress: null,
+  transitionKind: (() => {
+    try {
+      const k = localStorage.getItem("sf.transition.kind");
+      return k === "fade" || k === "wipe" ? k : "mix";
+    } catch {
+      return "mix";
+    }
+  })() as TransitionKindName,
+  transitionMs: (() => {
+    try {
+      const v = Number(localStorage.getItem("sf.transition.ms"));
+      return v >= 100 && v <= 5000 ? v : 500;
+    } catch {
+      return 500;
+    }
+  })(),
+  setTransition: (kind, ms) => {
+    set({ transitionKind: kind, transitionMs: ms });
+    try {
+      localStorage.setItem("sf.transition.kind", kind);
+      localStorage.setItem("sf.transition.ms", String(ms));
+    } catch {
+      /* private mode */
+    }
+  },
+  setPreviewScene: async (scene_id) => {
+    try {
+      await api.setPreviewScene(scene_id);
+      await get().refresh();
+    } catch (e) {
+      toast(`Could not select scene: ${errText(e)}`);
+    }
+  },
+  cut: async () => {
+    try {
+      await api.transitionCut();
+      await get().refresh();
+    } catch (e) {
+      toast(`Cut failed: ${errText(e)}`);
+    }
+  },
+  auto: async () => {
+    const { transitionKind, transitionMs, state } = get();
+    if (!state || state.preview_scene_id === state.program_scene_id) return;
+    try {
+      set({ transitionProgress: 0 });
+      await api.transitionAuto(transitionMs, transitionKind);
+    } catch (e) {
+      set({ transitionProgress: null });
+      toast(`Transition failed: ${errText(e)}`);
+    }
+  },
+  sceneCreate: async () => {
+    try {
+      const n = (get().state?.scenes.length ?? 0) + 1;
+      const sc = await api.sceneCreate(`Scene ${n}`);
+      await api.setPreviewScene(sc.id);
+      await get().refresh();
+    } catch (e) {
+      toast(`Could not create scene: ${errText(e)}`);
+    }
+  },
+  sceneDuplicate: async (scene_id) => {
+    try {
+      const sc = await api.sceneDuplicate(scene_id);
+      await api.setPreviewScene(sc.id);
+      await get().refresh();
+    } catch (e) {
+      toast(`Could not duplicate scene: ${errText(e)}`);
+    }
+  },
+  sceneRename: async (scene_id, name) => {
+    try {
+      await api.sceneRename(scene_id, name);
+      await get().refresh();
+    } catch (e) {
+      toast(`Could not rename scene: ${errText(e)}`);
+    }
+  },
+  sceneDelete: async (scene_id) => {
+    try {
+      await api.sceneDelete(scene_id);
+      await get().refresh();
+    } catch (e) {
+      toast(`Could not delete scene: ${errText(e)}`);
+    }
   },
 
   sourceAdd: async (kind, name) => {
@@ -408,6 +544,40 @@ export const useProduction = create<ProductionStore>()((set, get) => ({
     } catch (e) {
       toast(`Could not change visibility: ${errText(e)}`);
       await get().refresh();
+    }
+  },
+
+  sourceSetTransform: async (source_id, t) => {
+    const scene = get().sceneId();
+    const { state } = get();
+    if (!scene || !state) return;
+    set({
+      state: {
+        ...state,
+        scenes: state.scenes.map((sc) =>
+          sc.id === scene
+            ? { ...sc, sources: sc.sources.map((s) => (s.id === source_id ? { ...s, transform: t } : s)) }
+            : sc,
+        ),
+      },
+    });
+    try {
+      await api.sourceSetTransform(scene, source_id, t);
+    } catch (e) {
+      toast(`Could not place source: ${errText(e)}`);
+      await get().refresh();
+    }
+  },
+
+  sceneApplyLayout: async (layout) => {
+    const scene = get().sceneId();
+    if (!scene) return;
+    try {
+      const n = await api.sceneApplyLayout(scene, layout);
+      if (n < 2 && layout !== "full") toast("Add a second video source (camera, screen or file) for this layout.");
+      await get().refresh();
+    } catch (e) {
+      toast(`Layout failed: ${errText(e)}`);
     }
   },
 

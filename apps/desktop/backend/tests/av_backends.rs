@@ -660,3 +660,41 @@ fn latency_bench() {
     // No backlog: the delay must not grow over the run.
     assert!(m2 - m1 < 0.25, "delay grew by {:.0} ms — backlog building", (m2 - m1) * 1e3);
 }
+
+/// Duplicating a scene shows the SAME capture (one producer, no reopen):
+/// the copy renders real frames, and removing the original keeps the
+/// copy alive until it too is removed.
+#[test]
+fn duplicated_scene_shares_the_capture() {
+    let media = &tmp("sf-be-share.mp4");
+    make_test_media(media);
+    let mut s = shell();
+    let a = s.scene_create("A").id;
+    let src = s
+        .source_add(&a, "media", "clip", [0, 0, 0], None, Some(media), None, None, 0, 0, 0)
+        .unwrap();
+    s.production_set_program(&a).unwrap();
+    for _ in 0..6 {
+        s.av_tick();
+    }
+    let b = s.scene_duplicate(&a).unwrap();
+    let copy = b.sources[0].id.clone();
+    assert_ne!(copy, src.id);
+    let nonblank = |s: &mut Shell, scene: &str| {
+        let png = s.scene_render_png(scene, 160, 90).unwrap();
+        let px = image::load_from_memory(&png).unwrap().to_rgba8().into_raw();
+        let (mn, mx) = px.chunks_exact(4).map(|c| c[1]).fold((255u8, 0u8), |(a, b), v| (a.min(v), b.max(v)));
+        mx > mn
+    };
+    assert!(nonblank(&mut s, &b.id), "the duplicated scene must show the shared capture");
+    // One capture for both scenes: diagnostics list it once.
+    assert_eq!(s.diagnostics().sources.iter().filter(|d| d.kind == "media").count(), 1);
+    // Remove the original: the copy keeps working.
+    s.source_remove(&a, &src.id).unwrap();
+    for _ in 0..3 {
+        s.av_tick();
+    }
+    assert!(nonblank(&mut s, &b.id), "copy survives removal of the original");
+    s.source_remove(&b.id, &copy).unwrap();
+    assert!(s.diagnostics().sources.is_empty());
+}

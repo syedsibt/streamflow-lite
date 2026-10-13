@@ -24,6 +24,9 @@ import type {
   SlotView,
   SourceKind,
   SourceView,
+  SourceTransform,
+  SceneLayout,
+  TransitionKindName,
   UiEvent,
   VideoSettings,
   CameraSourceInfo,
@@ -114,6 +117,17 @@ export const api = {
   // -------------------------------------------------------------------------
 
   sceneList: () => cmd<SceneView[]>("scene_list"),
+  sceneCreate: (name: string) => cmd<SceneView>("scene_create", { name }),
+  sceneRename: (scene_id: string, name: string) => cmd<SceneView>("scene_rename", { scene_id, name }),
+  sceneDelete: (scene_id: string) => cmd<void>("scene_delete", { scene_id }),
+  sceneDuplicate: (scene_id: string) => cmd<SceneView>("scene_duplicate", { scene_id }),
+  setPreviewScene: (scene_id: string) => cmd<void>("production_set_preview", { scene_id }),
+  setProgramScene: (scene_id: string) => cmd<void>("production_set_program", { scene_id }),
+  transitionCut: () => cmd<void>("transition_cut", {}),
+  transitionAuto: (duration_ms: number, kind: TransitionKindName) =>
+    cmd<unknown>("transition_auto", { duration_ms, kind }),
+  /** Monitor JPEG (data URL) of any scene; program comes from the tick. */
+  scenePreviewJpg: (scene_id: string) => cmd<string>("scene_preview_jpg", { scene_id }),
 
   sourceAdd: (scene_id: string, kind: SourceKind, name: string) => {
     // The backend takes flat args (kind as a snake_case string plus extras);
@@ -194,6 +208,10 @@ export const api = {
     cmd<void>("source_reorder", { scene_id, order }),
   sourceSetVisible: (scene_id: string, source_id: string, visible: boolean) =>
     cmd<void>("source_set_visible", { scene_id, source_id, visible }),
+  sourceSetTransform: (scene_id: string, source_id: string, transform: SourceTransform | null) =>
+    cmd<SourceView>("source_set_transform", { scene_id, source_id, transform }),
+  sceneApplyLayout: (scene_id: string, layout: SceneLayout) =>
+    cmd<number>("scene_apply_layout", { scene_id, layout }),
 
   mediaSetPaused: (source_id: string, paused: boolean) =>
     cmd<boolean>("media_set_paused", { source_id, paused }),

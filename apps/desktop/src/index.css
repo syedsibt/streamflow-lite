@@ -362,6 +362,11 @@ select option {
   background: rgba(255, 69, 58, 0.85);
 }
 
+.chip.pv {
+  background: rgba(48, 209, 88, 0.85);
+  color: #000;
+}
+
 .chip.warn {
   background: rgba(255, 159, 10, 0.9);
   color: #000;
@@ -1815,3 +1820,50 @@ details.advanced summary {
 .help-list { padding: 8px 16px 10px; font-size: 12px; line-height: 1.45; color: var(--label-2); }
 .help-list p { margin: 0 0 6px; }
 .help-list b { color: var(--label); font-weight: 600; }
+
+/* Layout presets + placement editor (dense). */
+.layout-grid { display: grid; grid-template-columns: repeat(4, 1fr); gap: 6px; padding: 8px 12px 10px; }
+.layout-btn { display: flex; align-items: center; justify-content: center; height: 34px; border-radius: 6px; border: 1px solid var(--sep); background: transparent; cursor: pointer; }
+.layout-btn:hover { background: rgba(255, 255, 255, 0.06); }
+.layout-btn .lo-frame { fill: none; stroke: var(--label-3); }
+.layout-btn .lo-main { fill: var(--label-2); }
+.layout-btn .lo-sub { fill: var(--accent, #0a84ff); }
+.num-grid { display: grid; grid-template-columns: repeat(4, 1fr); gap: 6px 8px; padding: 8px 12px; }
+.num-field { display: flex; flex-direction: column; gap: 2px; font-size: 11px; color: var(--label-2); }
+.num-field input { width: 100%; min-width: 0; font: 12px/1.2 ui-monospace, SFMono-Regular, Menlo, monospace; padding: 4px 6px; border-radius: 5px; border: 1px solid var(--sep); background: rgba(255, 255, 255, 0.04); color: var(--label); }
+
+/* ------------------------------------------------- studio (preview → program) */
+.workspace.studio { display: flex; flex-direction: column; gap: 10px; }
+.studio-monitors { flex: 1; min-height: 0; display: grid; grid-template-columns: minmax(0, 1fr); gap: 10px; }
+.studio-monitors.two { grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); }
+.studio-mon { display: flex; flex-direction: column; gap: 4px; min-width: 0; min-height: 0; }
+.studio-mon .monitor { flex: 1; }
+.studio-monitors.two { align-content: center; align-items: start; }
+.studio-monitors.two .studio-mon .monitor { flex: none; width: 100%; aspect-ratio: 16 / 9; }
+.studio-label { font: 600 11px/1 var(--font, system-ui); letter-spacing: 0.06em; padding: 3px 6px; border-left: 3px solid; color: var(--label-2); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.studio-label.pv { border-color: var(--green, #30d158); }
+.studio-label.pg { border-color: var(--red, #ff453a); }
+.studio-bar { display: flex; gap: 10px; align-items: stretch; flex-wrap: wrap; }
+.scene-strip { flex: 1 1 420px; display: flex; gap: 6px; flex-wrap: wrap; align-items: center; min-width: 0; }
+.scene-tile { display: flex; align-items: center; gap: 6px; height: 34px; padding: 0 10px; border-radius: 5px; background: var(--fill-2); border: 2px solid transparent; cursor: pointer; max-width: 200px; user-select: none; }
+.scene-tile:hover { background: var(--group-2, rgba(255, 255, 255, 0.1)); }
+.scene-tile.pv { border-color: var(--green, #30d158); }
+.scene-tile.pg { background: rgba(255, 69, 58, 0.22); }
+.scene-tile input { width: 130px; font-size: 12px; background: transparent; border: 0; color: var(--label); outline: none; }
+.scene-key { font: 10px/1 ui-monospace, Menlo, monospace; color: var(--label-3); }
+.scene-name { font-size: 12px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.scene-count { font: 10px/1 ui-monospace, Menlo, monospace; color: var(--label-3); }
+.scene-actions { display: flex; gap: 6px; }
+.transition-panel { display: flex; align-items: center; gap: 6px; }
+.transition-panel select { height: 34px; }
+.ms-field { display: flex; align-items: center; gap: 3px; font-size: 11px; color: var(--label-2); }
+.ms-field input { width: 64px; height: 30px; font: 12px ui-monospace, Menlo, monospace; padding: 0 6px; border-radius: 5px; border: 1px solid var(--sep); background: rgba(255, 255, 255, 0.04); color: var(--label); }
+.take { position: relative; overflow: hidden; height: 34px; min-width: 72px; border-radius: 5px; border: 0; font: 700 13px/1 var(--font, system-ui); letter-spacing: 0.06em; color: #fff; cursor: pointer; }
+.take.cut { background: #3a3a3c; }
+.take.auto { background: #b3261e; }
+.take:disabled { opacity: 0.35; cursor: default; }
+.take-progress { position: absolute; left: 0; bottom: 0; height: 3px; background: #fff; }
+@media (max-width: 900px) {
+  .studio-monitors.two { grid-template-columns: minmax(0, 1fr); }
+  .studio-mon .monitor { flex: none; height: min(56vw, 40vh); }
+}

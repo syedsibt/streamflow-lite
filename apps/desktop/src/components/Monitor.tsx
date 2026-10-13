@@ -62,3 +62,43 @@ export default function Monitor({ compact }: { compact?: boolean }) {
     </div>
   );
 }
+
+/**
+ * The PREVIEW scene (studio mode: what CUT/AUTO will put on air). Rendered
+ * on demand at monitor size, polled ~10 fps only while mounted.
+ */
+export function PreviewMonitor() {
+  const url = useProduction((s) => s.previewUrl);
+  const poll = useProduction((s) => s.pollPreviewMonitor);
+  const pv = useProduction((s) => s.state?.preview_scene_id);
+  useEffect(() => {
+    let stop = false;
+    let timer: ReturnType<typeof setTimeout> | null = null;
+    const loop = async () => {
+      if (stop) return;
+      if (!document.hidden) await poll();
+      if (!stop) timer = setTimeout(() => void loop(), 100);
+    };
+    void loop();
+    return () => {
+      stop = true;
+      if (timer) clearTimeout(timer);
+    };
+  }, [pv, poll]);
+  return (
+    <div className="monitor">
+      <div className="monitor-frame">
+        {url ? (
+          <img src={url} alt="Preview scene" draggable={false} />
+        ) : (
+          <div className="monitor-empty">
+            <div className="monitor-empty-title">Rendering preview…</div>
+          </div>
+        )}
+        <div className="monitor-chips">
+          <span className="chip pv">PREVIEW — not on air</span>
+        </div>
+      </div>
+    </div>
+  );
+}

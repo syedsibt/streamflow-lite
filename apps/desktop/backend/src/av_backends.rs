@@ -59,7 +59,6 @@ use super::production::{
     transition_progress, EnhancerView, RecordFormat, RecordRuntime, StreamLifecycle, VoiceStatsView,
 };
 use super::{Shell, ShellError};
-use crate::production::crossfade;
 use crate::production::SourceKind;
 
 /// Maps a Video panel encoder name to [`EncoderId`]. `"auto"` is handled by
@@ -627,6 +626,8 @@ impl Shell {
         w: u32,
         h: u32,
     ) -> Option<Arc<Vec<u8>>> {
+        let source_id = self.frame_owner(source_id).to_string();
+        let source_id = source_id.as_str();
         let f = self.source_frames.get(source_id)?;
         if f.data.is_empty() {
             return None;
@@ -650,6 +651,34 @@ impl Shell {
         Some(px)
     }
 
+    /// The source whose capture `id` shows (itself unless it is a shared
+    /// scene item).
+    pub(crate) fn frame_owner<'a>(&'a self, id: &'a str) -> &'a str {
+        self.producer_alias.get(id).map(String::as_str).unwrap_or(id)
+    }
+
+    /// Native size of a source's latest frame.
+    pub(crate) fn source_native_size(&self, id: &str) -> Option<(u32, u32)> {
+        let f = self.source_frames.get(self.frame_owner(id))?;
+        (!f.data.is_empty()).then_some((f.width, f.height))
+    }
+
+    /// An existing source (any scene) already capturing the same device /
+    /// file as `kind`, to share instead of opening it again.
+    pub(crate) fn shared_producer_for(&self, kind: &SourceKind) -> Option<String> {
+        let same = |k: &SourceKind| match (k, kind) {
+            (SourceKind::Camera { device: a, .. }, SourceKind::Camera { device: b, .. }) => a == b,
+            (SourceKind::Screen, SourceKind::Screen) => true,
+            _ => false,
+        };
+        self.scenes
+            .iter()
+            .flat_map(|s| s.sources.iter())
+            .find(|s| same(&s.kind))
+            .map(|s| self.frame_owner(&s.id).to_string())
+            .filter(|owner| self.media_producers.contains_key(owner) || self.source_frames.contains_key(owner))
+    }
+
     /// Smoothed age of the program's main live picture (first visible
     /// camera, else screen, else media) — the A/V alignment reference.
     pub(crate) fn program_video_age_us(&self) -> Option<i64> {
@@ -668,9 +697,9 @@ impl Shell {
             .iter()
             .filter(|s| s.visible)
             .filter_map(|s| Some((rank(&s.kind)?, s)))
-            .filter(|(_, s)| self.source_frames.contains_key(&s.id))
+            .filter(|(_, s)| self.source_frames.contains_key(self.frame_owner(&s.id)))
             .min_by_key(|(r, s)| (*r, s.order))
-            .and_then(|(_, s)| self.source_frames.get(&s.id))
+            .and_then(|(_, s)| self.source_frames.get(self.frame_owner(&s.id)))
             .map(|f| f.age_ema_us as i64)
     }
 
@@ -947,13 +976,14 @@ impl Shell {
                 t.from_scene.clone(),
                 t.to_scene.clone(),
                 transition_progress(elapsed, t.duration_ms),
+                t.kind,
             )
         });
         match active {
-            Some((from, to, progress)) => {
+            Some((from, to, progress, kind)) => {
                 let a = self.render_scene_frame(&from, width, height)?;
                 let b = self.render_scene_frame(&to, width, height)?;
-                Ok(crossfade(&a, &b, progress))
+                Ok(crate::production::transition_blend(kind, &a, &b, progress))
             }
             None => {
                 let program = self.program_scene_id.clone();

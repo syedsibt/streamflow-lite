@@ -352,7 +352,29 @@ export interface SourceView {
   status: string;
   /** Engine input id for real kinds (`src-<uuid>`); null for pending kinds. */
   input_id: string | null;
+  /** Placement in the canvas; null = full frame. */
+  transform: SourceTransform | null;
 }
+
+export type FitMode = "fill" | "fit" | "stretch";
+
+/** Box and crop are fractions (0–1) of the canvas / source picture. */
+export interface SourceTransform {
+  x: number;
+  y: number;
+  w: number;
+  h: number;
+  crop_left: number;
+  crop_top: number;
+  crop_right: number;
+  crop_bottom: number;
+  fit: FitMode;
+  opacity: number;
+}
+
+export type TransitionKindName = "mix" | "fade" | "wipe";
+
+export type SceneLayout = "full" | "side_by_side" | "side_by_side_fit" | "split_v" | "pip_tl" | "pip_tr" | "pip_bl" | "pip_br" | "grid";
 
 export interface SceneView {
   id: string;

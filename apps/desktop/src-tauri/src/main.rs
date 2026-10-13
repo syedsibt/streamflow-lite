@@ -28,7 +28,7 @@ use sf_ipc::FilterTarget;
 use sf_ui_backend::{
     AiResultView, CameraSourceInfo, ChannelStrip, EffectKindInfo, EnhancerView, LookInfo, Macro,
     MacroAction, MacroDispatchResult, ProdScene, ProductionStateView, Shell, ShellError, SlotView,
-    SourceState, TransitionView, UiEvent, VideoSettings, DiagnosticsView, PlatformInfo, AvSyncView,
+    SourceState, SourceTransform, TransitionView, UiEvent, VideoSettings, DiagnosticsView, PlatformInfo, AvSyncView,
 };
 use tauri::{AppHandle, Emitter, Manager, State};
 
@@ -579,6 +579,27 @@ fn source_set_visible(
         .map_err(ue)
 }
 
+/// Places a source in the canvas (position / size / crop / fit /
+/// opacity). `null` = full frame.
+#[tauri::command(async, rename_all = "snake_case")]
+fn source_set_transform(
+    state: State<'_, AppState>,
+    scene_id: String,
+    source_id: String,
+    transform: Option<SourceTransform>,
+) -> CmdResult<SourceState> {
+    lock(&state)?
+        .source_set_transform(&scene_id, &source_id, transform)
+        .map_err(ue)
+}
+
+/// Arranges a scene's video sources in a preset layout (side by side,
+/// picture-in-picture, split, grid, full).
+#[tauri::command(async, rename_all = "snake_case")]
+fn scene_apply_layout(state: State<'_, AppState>, scene_id: String, layout: String) -> CmdResult<usize> {
+    lock(&state)?.scene_apply_layout(&scene_id, &layout).map_err(ue)
+}
+
 // ---------------------------------------------------------------------------
 // Production screens: preview/program, transitions, monitor frames
 // ---------------------------------------------------------------------------
@@ -968,6 +989,8 @@ fn main() {
             source_remove,
             source_reorder,
             source_set_visible,
+            source_set_transform,
+            scene_apply_layout,
             production_state,
             production_set_preview,
             production_set_program,

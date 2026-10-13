@@ -65,7 +65,7 @@ pub fn media_clock_us(t: Instant) -> i64 {
 /// record, macros) — all headless-testable, no tauri dependency.
 pub use color_library::{encode_preview_jpeg, ColorPresetInfo, LutInfo, PreviewMode};
 pub use production::{
-    transition_progress, AvSyncView, CameraSourceInfo, ChannelStrip, EnhancerView, Macro, MacroAction,
+    transition_progress, AvSyncView, FitMode, SourceTransform, CameraSourceInfo, ChannelStrip, EnhancerView, Macro, MacroAction,
     MacroDispatchResult, MixerView, ProdScene, ProductionStateView, RecordFormat, RecordLifecycle,
     RecordSettings, SourceKind, SourceState, StreamLifecycle, StreamPlatform, StreamSettings,
     TransitionKind, TransitionView, VideoSettings,
@@ -527,6 +527,12 @@ pub struct Shell {
     /// Rasterized text overlays keyed by (source_id, text, w, h). Text
     /// rarely changes, so it renders once — not on every tick.
     text_cache: HashMap<(String, String, u32, u32), Vec<u8>>,
+    /// Scene items that show another source's capture (same camera /
+    /// screen / file in several scenes): item id → owner source id. One
+    /// device is opened once and shared, like OBS scene references.
+    producer_alias: HashMap<String, String>,
+    /// Owners removed from their scene while aliases still use them.
+    orphan_owners: std::collections::HashSet<String>,
     /// Diagnostic test signal (static part cached per size).
     test_pattern: test_pattern::TestPatternCache,
     /// Real audio mixer (sf-audio); fed equal-length blocks by the bus.
@@ -659,6 +665,8 @@ impl Shell {
             camera_formats: HashMap::new(),
             text_cache: HashMap::new(),
             test_pattern: Default::default(),
+            producer_alias: HashMap::new(),
+            orphan_owners: Default::default(),
             audio_mixer: sf_audio::Mixer::new(),
             audio_bus: sf_audio::AudioBus::new(30, 1),
             audio_timeline: sf_audio::AudioTimeline::new(),
