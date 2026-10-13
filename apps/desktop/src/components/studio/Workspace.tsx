@@ -2,6 +2,7 @@ import { useEffect, useRef, useState } from "react";
 import { useProduction } from "../../lib/productionStore";
 import AddSourceDialog from "./AddSourceDialog";
 import Mixer from "./Mixer";
+import { useMonitorPolling } from "../Monitor";
 import Monitors from "./Monitors";
 import OutputPanel from "./OutputPanel";
 import PropertiesPanel from "./PropertiesPanel";
@@ -31,6 +32,9 @@ const save = (k: string, v: number | string) => {
  * can be hidden to give the monitors the whole window.
  */
 export default function Workspace({ onOpenColorPage }: { onOpenColorPage: () => void }) {
+  // Program monitor polling lives with the monitors: nothing is fetched
+  // (or rendered by the engine) while another page is open.
+  useMonitorPolling();
   const [adding, setAdding] = useState(false);
   const [width, setWidth] = useState(() => window.innerWidth);
   useEffect(() => {

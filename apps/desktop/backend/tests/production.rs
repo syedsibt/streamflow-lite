@@ -829,3 +829,34 @@ fn scenes_reorder() {
     assert!(s.scene_move("nope", 0).is_err());
     let _ = a;
 }
+
+/// Lightweight paths: ungraded sources skip the GPU (identical pixels), a
+/// real grade still applies, nothing renders while nobody watches, a
+/// request still gets a fresh picture, and the monitor follows the UI size.
+#[test]
+fn lightweight_paths_keep_results_correct() {
+    let mut s = shell();
+    let scene = empty_scene(&mut s);
+    let red = s.source_add(&scene, "color", "Red", [200, 40, 40], None, None, None, None, 0, 0, 0).unwrap();
+    s.production_set_program(&scene).unwrap();
+    let px = decode_rgba(&s.scene_render_png(&scene, 64, 36).unwrap());
+    assert_eq!(px_at(&px, 64, 10, 10), [200, 40, 40], "pass-through is bit-exact");
+    // A grade must still take effect (not skipped).
+    s.set_param(red.input_id.as_deref().unwrap(), "exposure", 1.0).unwrap();
+    let px2 = decode_rgba(&s.scene_render_png(&scene, 64, 36).unwrap());
+    assert!(px_at(&px2, 64, 10, 10)[0] > 200, "graded output differs: {:?}", px_at(&px2, 64, 10, 10));
+
+    // Nobody watching and not encoding: ticks don't render the program…
+    for _ in 0..3 {
+        s.av_tick();
+    }
+    let monitor = s.resource_report().into_iter().find(|c| c.name == "program monitor frame").unwrap();
+    assert_eq!(monitor.entries, 0, "no picture rendered for no one");
+    // …but a request renders one on demand at the chosen size.
+    assert_eq!(s.monitor_set_display_width(590), (640, 360));
+    let m = s.monitor_snapshot(&scene).unwrap();
+    assert_eq!((m.width, m.height), (640, 360));
+    s.av_tick();
+    assert_eq!(s.resource_report().into_iter().find(|c| c.name == "program monitor frame").unwrap().entries, 1, "watched → rendered by the tick");
+    assert_eq!(s.monitor_set_display_width(5000), (1280, 720));
+}

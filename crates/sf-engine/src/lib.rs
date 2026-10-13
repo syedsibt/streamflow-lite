@@ -728,6 +728,27 @@ impl Engine {
         self.lut_errors.get(path).map(String::as_str)
     }
 
+    /// True when grading `input_id` would return its pixels unchanged and
+    /// no scope needs the frame: identity grade (looks folded in), no LUT,
+    /// no active effect, no scope subscriber. The caller can then skip the
+    /// GPU entirely (no upload / download / sync) — the result is the same
+    /// bit-exact bypass `grade_input_frame` would produce.
+    pub fn grade_is_passthrough(&self, input_id: &str) -> bool {
+        let Some(input) = self.state.inputs.iter().find(|i| i.id == input_id) else {
+            return false;
+        };
+        if self.scopes.subs.keys().any(|(id, _)| id == input_id) {
+            return false;
+        }
+        let effective = resolve_grade(&input.color.grade, &input.filters, &self.look_registry);
+        if !effective.is_identity() || effective.lut.is_some() {
+            return false;
+        }
+        !input.filters.slots().iter().any(|slot| {
+            slot.enabled && slot.intensity > 0.0 && matches!(slot.filter, Filter::Effect { .. })
+        })
+    }
+
     pub fn grade_input_frame(
         &mut self,
         input_id: &str,

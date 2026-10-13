@@ -42,6 +42,8 @@ pub struct SourceDiag {
     pub max_gap_ms: Option<f32>,
     pub decode_errors: u64,
     pub capture_errors: u64,
+    /// Not on Preview/Program: capture paused (no decoding) until shown.
+    pub paused: bool,
     /// Frames dropped at capture because newer ones arrived (live-first).
     pub dropped: u64,
     /// Picture age when rendered (smoothed), ms.
@@ -133,6 +135,8 @@ pub struct DiagnosticsView {
     pub gpu_errors: u64,
     pub last_gpu_error: Option<String>,
     pub gpu_adapter: Option<String>,
+    /// App-side caches and buffers with their current size.
+    pub caches: Vec<CacheStat>,
 }
 
 impl Shell {
@@ -189,6 +193,7 @@ impl Shell {
                 max_gap_ms: live.as_ref().map(|l| l.max_gap_ms),
                 decode_errors: live.as_ref().map(|l| l.decode_errors).unwrap_or(0),
                 capture_errors: live.as_ref().map(|l| l.capture_errors).unwrap_or(0),
+                paused: self.paused_sources.contains(&owner),
                 dropped: live.as_ref().map(|l| l.frames_dropped).unwrap_or(0),
                 age_ms: f.map(|f| f.age_ema_us as f32 / 1000.0).unwrap_or(0.0),
                 width: f.map(|f| f.width).unwrap_or(0),
@@ -288,6 +293,7 @@ impl Shell {
             gpu_errors,
             last_gpu_error,
             gpu_adapter,
+            caches: self.resource_report(),
         }
     }
 
@@ -340,5 +346,82 @@ mod tests {
             assert!(st.mem_total_mb.unwrap_or(0.0) > st.mem_used_mb.unwrap_or(0.0));
             assert!(st.gpu_percent.is_none() && st.gpu_note.is_some(), "no fake GPU value");
         }
+    }
+}
+
+/// One in-memory cache or buffer and what it holds right now.
+#[derive(Clone, Debug, Serialize)]
+pub struct CacheStat {
+    pub name: &'static str,
+    pub entries: usize,
+    pub bytes: u64,
+}
+
+impl Shell {
+    /// Every app-side cache/buffer with its current size, so abnormal growth
+    /// is visible (Diagnostics) and testable (long-run benchmark). GPU-side
+    /// pools inside the engine are not included.
+    pub fn resource_report(&self) -> Vec<CacheStat> {
+        let b = |v: &Vec<u8>| v.len() as u64;
+        let mut out = vec![
+            CacheStat {
+                name: "source frames (newest per source)",
+                entries: self.source_frames.len(),
+                bytes: self.source_frames.values().map(|f| f.data.len() as u64).sum(),
+            },
+            CacheStat {
+                name: "resized source frames",
+                entries: self.resized_frames.len(),
+                bytes: self.resized_frames.values().map(|(_, p)| b(p)).sum(),
+            },
+            CacheStat {
+                name: "decoded images",
+                entries: self.image_cache.len(),
+                bytes: self.image_cache.values().map(|i| i.data.len() as u64).sum(),
+            },
+            CacheStat {
+                name: "resized images",
+                entries: self.image_sized.len(),
+                bytes: self.image_sized.values().map(|p| b(p)).sum(),
+            },
+            CacheStat {
+                name: "text rasters",
+                entries: self.text_cache.len(),
+                bytes: self.text_cache.values().map(b).sum(),
+            },
+            CacheStat {
+                name: "test signal base",
+                entries: self.test_pattern.entries(),
+                bytes: self.test_pattern.bytes(),
+            },
+            CacheStat {
+                name: "color-tool last frames",
+                entries: self.last_frame.len(),
+                bytes: self.last_frame.values().map(|f| f.pixels.len() as u64).sum(),
+            },
+            CacheStat {
+                name: "color-tool preview PNGs",
+                entries: self.preview_cache.len(),
+                bytes: self.preview_cache.values().map(|(_, p)| b(p)).sum(),
+            },
+            CacheStat {
+                name: "program monitor frame",
+                entries: self.monitor_frame.is_some() as usize,
+                bytes: self.monitor_frame.as_ref().map(|m| m.pixels.len() as u64).unwrap_or(0),
+            },
+            CacheStat {
+                name: "pending UI events",
+                entries: self.events.len(),
+                bytes: 0,
+            },
+            CacheStat {
+                name: "frame-time history",
+                entries: self.perf_frame_times.len(),
+                bytes: (self.perf_frame_times.len() * 16) as u64,
+            },
+        ];
+        let bus: u64 = self.mixer.channels.keys().map(|id| self.audio_bus.buffered_frames(id) as u64).sum();
+        out.push(CacheStat { name: "audio bus (buffered frames ×8 B)", entries: self.mixer.channels.len(), bytes: bus * 8 });
+        out
     }
 }

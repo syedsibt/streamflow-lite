@@ -50,6 +50,11 @@ impl ScreenProducer {
     }
 
     /// Live capture statistics.
+    /// Decode only while shown (idle sources read and drop packets).
+    pub fn set_active(&self, active: bool) {
+        self.live.set_active(active);
+    }
+
     pub fn live_stats(&self) -> LiveVideoStats {
         self.live.stats()
     }

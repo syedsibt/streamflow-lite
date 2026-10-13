@@ -393,6 +393,11 @@ impl Shell {
 
     /// True while the Color Studio is polling `input_id` — the tick then
     /// keeps the frames it already produced instead of dropping them.
+    /// The Color page is showing a live preview right now.
+    pub(crate) fn studio_watch_active(&self) -> bool {
+        self.studio_watch.as_ref().is_some_and(|(_, at, _)| at.elapsed() < WATCH_TIMEOUT)
+    }
+
     pub(crate) fn studio_watching(&self, input_id: &str) -> Option<PreviewMode> {
         match &self.studio_watch {
             Some((id, at, mode)) if id == input_id && at.elapsed() < WATCH_TIMEOUT => Some(*mode),

@@ -664,12 +664,13 @@ fn transition_auto(
 /// the media tick's live monitor frame (10fps, no re-render); other scenes
 /// render on demand at monitor size.
 #[tauri::command(async, rename_all = "snake_case")]
-fn scene_preview_jpg(state: State<'_, AppState>, scene_id: String) -> CmdResult<String> {
+fn scene_preview_jpg(state: State<'_, AppState>, scene_id: String) -> CmdResult<tauri::ipc::Response> {
     // O(1) under the lock (shared frame); JPEG encode after releasing it,
-    // so a monitor poll never holds up the media tick.
+    // so a monitor poll never holds up the media tick. Raw bytes (no
+    // base64/JSON): the UI gets an ArrayBuffer.
     let frame = lock(&state)?.monitor_snapshot(&scene_id).map_err(ue)?;
     let jpg = frame.to_jpeg().map_err(ue)?;
-    Ok(jpg_data_url(&jpg))
+    Ok(tauri::ipc::Response::new(jpg))
 }
 
 /// Monitor frame only if it changed since `after_seq` (`None` otherwise):
@@ -680,13 +681,25 @@ fn monitor_frame_if_new(
     state: State<'_, AppState>,
     scene_id: String,
     after_seq: u64,
-) -> CmdResult<Option<(u64, String)>> {
+) -> CmdResult<tauri::ipc::Response> {
+    // Binary reply: empty = unchanged; else 8-byte little-endian frame
+    // number followed by the JPEG bytes (no base64/JSON on the hot path).
     let frame = lock(&state)?.monitor_snapshot(&scene_id).map_err(ue)?;
     if frame.seq <= after_seq {
-        return Ok(None);
+        return Ok(tauri::ipc::Response::new(Vec::new()));
     }
     let jpg = frame.to_jpeg().map_err(ue)?;
-    Ok(Some((frame.seq, jpg_data_url(&jpg))))
+    let mut out = Vec::with_capacity(8 + jpg.len());
+    out.extend_from_slice(&frame.seq.to_le_bytes());
+    out.extend_from_slice(&jpg);
+    Ok(tauri::ipc::Response::new(out))
+}
+
+/// The UI reports how wide (device pixels) it draws the monitors; the
+/// engine renders/encodes the monitor at the matching size.
+#[tauri::command(async, rename_all = "snake_case")]
+fn monitor_set_display_width(state: State<'_, AppState>, width: u32) -> CmdResult<(u32, u32)> {
+    Ok(lock(&state)?.monitor_set_display_width(width))
 }
 
 /// Live diagnostics: per-stage timings, fps, drops, buffers, latency
@@ -1062,6 +1075,7 @@ fn main() {
             transition_auto,
             scene_preview_jpg,
             monitor_frame_if_new,
+            monitor_set_display_width,
             diagnostics,
             stream_platforms,
             av_sync_set,

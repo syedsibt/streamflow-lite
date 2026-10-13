@@ -8,7 +8,8 @@
         "minWidth": 720,
         "title": "StreamFlow Lite",
         "width": 1440,
-        "theme": "Dark"
+        "theme": "Dark",
+        "additionalBrowserArgs": "--disable-features=msWebOOUI,msPdfOOUI,msSmartScreenProtection --disk-cache-size=1048576 --disable-gpu-shader-disk-cache --disable-background-networking --disable-component-update"
       }
     ]
   },
@@ -33,5 +34,5 @@
   },
   "identifier": "com.streamflow.lite",
   "productName": "StreamFlow Lite",
-  "version": "0.1.27"
+  "version": "0.1.28"
 }

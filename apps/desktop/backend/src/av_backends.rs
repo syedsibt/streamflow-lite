@@ -397,6 +397,21 @@ impl ProducerKind {
         }
     }
 
+    /// Live devices decode only while shown (no-op for files).
+    fn set_active(&self, _active: bool) {
+        match self {
+            ProducerKind::Media(_) => {}
+            #[cfg(any(windows, sf_wincheck))]
+            ProducerKind::Camera(p) => p.set_active(_active),
+            #[cfg(any(windows, sf_wincheck))]
+            ProducerKind::Screen(p) => p.set_active(_active),
+        }
+    }
+
+    fn is_live_device(&self) -> bool {
+        !matches!(self, ProducerKind::Media(_))
+    }
+
     /// Live capture-thread stats (devices only).
     pub(crate) fn live_stats(&self) -> Option<sf_capture::LiveVideoStats> {
         match self {
@@ -562,8 +577,57 @@ impl Shell {
     /// Capture stage of the tick: pull every video producer exactly once
     /// (newest frame — the capture threads already dropped anything older)
     /// and update per-source age / fps.
+    /// Captures shown on Preview, Program, a running transition or the
+    /// Color page keep decoding; every other live device is paused (reads
+    /// and drops packets, no decode/convert/GPU work).
+    fn update_source_activity(&mut self) {
+        let mut scenes: Vec<&str> = vec![self.program_scene_id.as_str(), self.preview_scene_id.as_str()];
+        if let Some(t) = &self.transition {
+            scenes.push(t.from_scene.as_str());
+            scenes.push(t.to_scene.as_str());
+        }
+        let watched_input = self.studio_watch.as_ref().map(|(id, _, _)| id.clone());
+        let shown: std::collections::HashSet<String> = self
+            .scenes
+            .iter()
+            .flat_map(|sc| {
+                let on_air = scenes.contains(&sc.id.as_str());
+                sc.sources.iter().filter(move |s| s.visible && on_air)
+            })
+            .chain(
+                self.scenes
+                    .iter()
+                    .flat_map(|sc| sc.sources.iter())
+                    .filter(|s| s.input_id.is_some() && s.input_id == watched_input),
+            )
+            .map(|s| self.frame_owner(&s.id).to_string())
+            .collect();
+        for (id, p) in &self.media_producers {
+            if !p.0.is_live_device() {
+                continue;
+            }
+            let active = shown.contains(id);
+            let was = !self.paused_sources.contains(id);
+            if active != was {
+                p.0.set_active(active);
+                if active {
+                    self.paused_sources.remove(id);
+                } else {
+                    self.paused_sources.insert(id.clone());
+                }
+            }
+        }
+        self.paused_sources.retain(|id| self.media_producers.contains_key(id));
+    }
+
     pub(crate) fn refresh_source_frames(&mut self, tick_us: i64) {
-        let ids: Vec<String> = self.media_producers.keys().cloned().collect();
+        self.update_source_activity();
+        let ids: Vec<String> = self
+            .media_producers
+            .keys()
+            .filter(|id| !self.paused_sources.contains(*id))
+            .cloned()
+            .collect();
         for id in ids {
             let Some(prod) = self.media_producers.get_mut(&id) else {
                 continue;
@@ -647,6 +711,11 @@ impl Shell {
             Err(_) => resize_rgba_nearest(&data, sw, sh, w, h),
         };
         let px = Arc::new(px);
+        // Bounded: during a resize drag a frozen source would otherwise
+        // keep one copy per intermediate size.
+        if self.resized_frames.len() >= 16 {
+            self.resized_frames.retain(|(sid, _, _), _| sid != source_id);
+        }
         self.resized_frames.insert(key, (seq, Arc::clone(&px)));
         Some(px)
     }
@@ -1529,11 +1598,21 @@ impl Shell {
                 self.video_settings.output_height,
             )
         } else {
-            (crate::MONITOR_W, crate::MONITOR_H)
+            self.monitor_size
         };
         let t = Instant::now();
         self.perf_gpu_us_accum = 0;
-        let frame = self.program_frame_raw(w, h);
+        // Nothing encodes and nobody looks at the monitor (window hidden,
+        // other page): don't render a picture no one will see. A UI request
+        // renders on demand, and the next tick resumes rendering.
+        let needed = encoding || self.monitor_watched() || self.transition.is_some() || self.studio_watch_active();
+        let frame = if needed {
+            self.program_frame_raw(w, h)
+        } else {
+            self.monitor_frame = None;
+            self.monitor_pending = None;
+            Err(ShellError::NoFrame("not rendered: no output and no viewer".into()))
+        };
         let render_us = t.elapsed().as_micros() as u64;
 
         // [3] audio — exactly the wall time since the previous tick.
@@ -1564,6 +1643,9 @@ impl Shell {
                 // scene is only rendered when a host asks for it
                 // (`monitor_snapshot`) — never every tick.
                 self.perf_stages_us = [capture_us, render_us, audio_us, encode_us];
+            }
+            Err(_) if !needed => {
+                self.perf_stages_us = [capture_us, 0, audio_us, 0];
             }
             Err(_) => {
                 self.perf_skipped_render += 1;

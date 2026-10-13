@@ -2166,5 +2166,5 @@ input[type="color"] { width: 64px; height: 30px; padding: 0; border: 1px solid v
 .perf-legend { display: flex; gap: 14px; font-size: 11px; padding-top: 4px; }
 .perf-legend .dim { color: var(--label-3); margin-left: auto; }
 .sheet { box-shadow: none; }
-.sheet .row .mono { max-width: 60%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; display: inline-block; vertical-align: bottom; }
+.sheet .row .mono.clip { max-width: 240px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; display: inline-block; vertical-align: bottom; }
 .workspace { grid-template-rows: minmax(0, 1fr); }

@@ -17,7 +17,11 @@ export function useMonitorPolling() {
     const loop = async () => {
       if (stop) return;
       if (!document.hidden) await pollMonitor();
-      if (!stop) timer = setTimeout(() => void loop(), 33);
+      // Under sustained load (engine missing frames) the monitor drops to
+      // 15 fps first — preview smoothness gives way before the stream.
+      const d = useProduction.getState().diag;
+      const behind = d ? d.render_fps < d.target_fps * 0.85 : false;
+      if (!stop) timer = setTimeout(() => void loop(), behind ? 66 : 33);
     };
     void loop();
     return () => {

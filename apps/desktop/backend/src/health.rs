@@ -45,6 +45,10 @@ pub fn record(line: &str) {
     let path = LOG.lock().ok().and_then(|p| p.clone());
     if let Some(path) = path {
         use std::io::Write;
+        // Bounded: rotate at 256 KB, keeping one previous file.
+        if std::fs::metadata(&path).is_ok_and(|m| m.len() > 256 * 1024) {
+            let _ = std::fs::rename(&path, path.with_extension("old.log"));
+        }
         if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(path) {
             let ts = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)

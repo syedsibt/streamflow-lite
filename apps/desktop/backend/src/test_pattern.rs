@@ -27,6 +27,13 @@ pub(crate) struct TestPatternCache {
 }
 
 impl TestPatternCache {
+    pub(crate) fn entries(&self) -> usize {
+        self.base.is_some() as usize
+    }
+    pub(crate) fn bytes(&self) -> u64 {
+        self.base.as_ref().map(|(_, _, p)| p.len() as u64).unwrap_or(0)
+    }
+
     /// The test signal at `w`×`h` for wall-clock time `now` and output
     /// frame rate `fps`.
     pub(crate) fn frame(&mut self, w: u32, h: u32, fps: u32, now: SystemTime) -> Vec<u8> {

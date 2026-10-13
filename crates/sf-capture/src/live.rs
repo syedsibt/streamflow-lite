@@ -73,6 +73,9 @@ pub struct LiveVideoStats {
 struct Shared {
     latest: Mutex<Option<CapturedFrame>>,
     stop: AtomicBool,
+    /// False while nothing shows this source: packets are read and dropped
+    /// (the device never backs up) but nothing is decoded or converted.
+    active: AtomicBool,
     stats: Mutex<LiveVideoStats>,
 }
 
@@ -93,6 +96,7 @@ impl LiveVideo {
         let shared = Arc::new(Shared {
             latest: Mutex::new(None),
             stop: AtomicBool::new(false),
+            active: AtomicBool::new(true),
             stats: Mutex::new(LiveVideoStats::default()),
         });
         let sh = Arc::clone(&shared);
@@ -107,6 +111,17 @@ impl LiveVideo {
             .spawn(move || capture_loop(demux, sh))
             .map_err(|e| CaptureError::OpenFailed(format!("cannot start capture thread: {e}")))?;
         Ok(Self { shared, info })
+    }
+
+    /// Decode only while something shows this source (see `Shared::active`).
+    /// Re-activating delivers the next frame the device sends.
+    pub fn set_active(&self, active: bool) {
+        if !self.shared.active.swap(active, Ordering::Relaxed) && active {
+            // Drop a stale frame from before the pause.
+            if let Ok(mut l) = self.shared.latest.lock() {
+                *l = None;
+            }
+        }
     }
 
     /// Newest captured frame since the last call (`None` if none arrived).
@@ -317,7 +332,8 @@ fn run_capture(demux: &mut DemuxDecoder, sh: &Arc<Shared>) {
     let mut decode_ms = 0f32;
     let mut convert_ms = 0f32;
     while !sh.stop.load(Ordering::Relaxed) {
-        let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| demux.drain_live()))
+        let decode = sh.active.load(Ordering::Relaxed);
+        let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| demux.drain_live_mode(decode)))
             .unwrap_or_else(|_| Err(CaptureError::ReadFailed("capture backend panicked".into())));
         let now = crate::clock::now_us();
         match r {
@@ -442,6 +458,44 @@ mod tests {
         )
         .expect("open live udp input");
         live
+    }
+
+    /// A paused source reads and drops packets (device keeps flowing) but
+    /// decodes nothing; resuming delivers fresh frames again.
+    #[test]
+    fn paused_source_decodes_nothing_and_resumes() {
+        let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+        let p = port(41);
+        let mut tx = live_sender(p, "mjpeg");
+        let live = open_live(p);
+        let t0 = Instant::now();
+        while live.take_latest().is_none() && t0.elapsed() < Duration::from_secs(5) {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        live.set_active(false);
+        std::thread::sleep(Duration::from_millis(300));
+        let _ = live.take_latest();
+        let before = live.stats().frames_captured;
+        std::thread::sleep(Duration::from_millis(1200));
+        let st = live.stats();
+        assert_eq!(st.frames_captured, before, "nothing decoded while paused: {st:?}");
+        assert!(live.take_latest().is_none());
+        assert!(st.device_fps > 10.0, "device packets still drained: {st:?}");
+        live.set_active(true);
+        let t1 = Instant::now();
+        let mut got = false;
+        while t1.elapsed() < Duration::from_secs(3) {
+            if live.take_latest().is_some() {
+                got = true;
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(got, "frames resume after re-activation");
+        eprintln!("resumed after {:?}", t1.elapsed());
+        drop(live);
+        let _ = tx.kill();
+        let _ = tx.wait();
     }
 
     /// The live tests each run a real-time ffmpeg sender; run them one at a

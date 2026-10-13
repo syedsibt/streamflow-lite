@@ -206,6 +206,20 @@ function patchChannel(set: any, get: () => ProductionStore, id: string, patch: P
   set({ state: { ...st, mixer: { ...st.mixer, channels: st.mixer.channels.map((c) => (c.source_id === id ? { ...c, ...patch } : c)) } } });
 }
 
+/**
+ * Monitor pictures as blob URLs (raw JPEG from the engine, no base64).
+ * Each slot keeps the shown URL and the one before it (still decoding in
+ * the <img>); anything older is revoked so blobs never pile up.
+ */
+const urlSlots: Record<string, string[]> = {};
+function swapUrl(slot: string, jpeg: ArrayBuffer | null): string | null {
+  const list = (urlSlots[slot] ??= []);
+  const url = jpeg ? URL.createObjectURL(new Blob([jpeg], { type: "image/jpeg" })) : null;
+  if (url) list.push(url);
+  while (list.length > (url ? 2 : 0)) URL.revokeObjectURL(list.shift()!);
+  return url;
+}
+
 const num = (v: unknown, d: number) => (typeof v === "number" && Number.isFinite(v) ? v : d);
 
 /** Normalize `production_state()` JSON in ONE place. */
@@ -383,12 +397,16 @@ export const useProduction = create<ProductionStore>()((set, get) => ({
   },
 
   pollMonitor: async () => {
-    const scene = get().sceneId();
+    const st = get().state;
+    const scene = st?.program_scene_id ?? st?.scenes[0]?.id ?? null;
     if (!isTauri || !scene || monitorInFlight) return;
     monitorInFlight = true;
     try {
-      const r = await api.monitorFrameIfNew(scene, get().programSeq);
-      if (r) set({ programSeq: r[0], programUrl: r[1] });
+      const buf = await api.monitorFrameIfNew(scene, get().programSeq);
+      if (buf && buf.byteLength > 8) {
+        const seq = Number(new DataView(buf).getBigUint64(0, true));
+        set({ programSeq: seq, programUrl: swapUrl("program", buf.slice(8)) });
+      }
     } catch {
       /* next poll retries */
     } finally {
@@ -477,11 +495,12 @@ export const useProduction = create<ProductionStore>()((set, get) => ({
     const st = get().state;
     const pv = st?.preview_scene_id;
     if (!pv || pv === st?.program_scene_id) {
-      if (get().previewUrl) set({ previewUrl: null });
+      if (get().previewUrl) set({ previewUrl: swapUrl("preview", null) });
       return;
     }
     try {
-      set({ previewUrl: await api.scenePreviewJpg(pv) });
+      const buf = await api.scenePreviewJpg(pv);
+      if (buf && buf.byteLength) set({ previewUrl: swapUrl("preview", buf) });
     } catch {
       /* scene vanished between polls */
     }

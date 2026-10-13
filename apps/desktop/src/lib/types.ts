@@ -516,6 +516,8 @@ export interface SourceDiag {
   max_gap_ms: number | null;
   decode_errors: number;
   capture_errors: number;
+  /** Not on Preview/Program: capture paused (no decoding) until shown. */
+  paused: boolean;
   dropped: number;
   age_ms: number;
   width: number;
@@ -594,6 +596,7 @@ export interface Diagnostics {
   gpu_errors: number;
   last_gpu_error: string | null;
   gpu_adapter: string | null;
+  caches: { name: string; entries: number; bytes: number }[];
 }
 
 /** One diagnostics poll kept for the performance chart (real values only). */

@@ -359,6 +359,50 @@ impl DemuxDecoder {
     /// Inter codecs: every packet is decoded (references stay valid) but
     /// only the newest picture is converted to RGBA.
     pub(crate) fn drain_live(&mut self) -> Result<LiveDrain, CaptureError> {
+        self.drain_live_mode(true)
+    }
+
+    /// `decode = false`: read and drop packets only (paused source).
+    pub(crate) fn drain_live_mode(&mut self, decode: bool) -> Result<LiveDrain, CaptureError> {
+        if !decode {
+            return self.discard_live();
+        }
+        self.drain_live_decode()
+    }
+
+    fn discard_live(&mut self) -> Result<LiveDrain, CaptureError> {
+        use ff::util::error::{Error, EAGAIN};
+        let mut out = LiveDrain::default();
+        let pass_start = crate::clock::now_us();
+        while out.packets < MAX_PACKETS_PER_DRAIN {
+            if out.packets > 0 && crate::clock::now_us() - pass_start > MAX_PASS_US {
+                break;
+            }
+            let mut pkt = ff::Packet::empty();
+            match pkt.read(&mut self.ictx) {
+                Ok(()) => {}
+                Err(Error::Other { errno }) if errno == EAGAIN => break,
+                Err(Error::Eof) => {
+                    out.eof = true;
+                    break;
+                }
+                Err(Error::Exit) => break,
+                Err(e) => return Err(CaptureError::ReadFailed(format!("read: {e}"))),
+            }
+            out.packets += 1;
+            if pkt.stream() == self.video_stream {
+                out.video_packets += 1;
+                // An inter-coded stream (H.264) must restart at a keyframe;
+                // flushing makes the decoder wait for the next one.
+                if !self.intra_only {
+                    self.video_decoder.flush();
+                }
+            }
+        }
+        Ok(out)
+    }
+
+    fn drain_live_decode(&mut self) -> Result<LiveDrain, CaptureError> {
         use ff::util::error::{Error, EAGAIN};
         let mut out = LiveDrain::default();
         let mut newest_pkt: Option<(ff::Packet, i64)> = None;

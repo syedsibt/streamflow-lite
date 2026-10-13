@@ -81,7 +81,7 @@ mod production;
 mod send_worker;
 mod test_pattern;
 
-pub use diagnostics::{DiagnosticsView, SourceDiag};
+pub use diagnostics::{CacheStat, DiagnosticsView, SourceDiag};
 pub use platforms::{platform_list, PlatformInfo};
 
 /// The pipeline's monotonic clock (µs) — what [`Shell::av_tick_at`]
@@ -109,6 +109,9 @@ const PREVIEW_THROTTLE: Duration = Duration::from_millis(100);
 pub const MONITOR_W: u32 = 960;
 pub const MONITOR_H: u32 = 540;
 
+/// Monitor sizes the UI can pick from (its displayed size in device pixels).
+pub const MONITOR_SIZES: [(u32, u32); 3] = [(640, 360), (960, 540), (1280, 720)];
+
 /// Stack length above which the UI gets a "GPU cost high" warning (spec §5.3).
 const STACK_WARN_LEN: usize = 6;
 
@@ -134,17 +137,18 @@ impl MonitorFrame {
 
 impl Shell {
     fn to_monitor(&mut self, frame: Frame) -> MonitorFrame {
-        let (pixels, w, h) = if frame.width == MONITOR_W && frame.height == MONITOR_H {
+        let (mw, mh) = self.monitor_size;
+        let (pixels, w, h) = if frame.width == self.monitor_size.0 && frame.height == self.monitor_size.1 {
             (frame.pixels, frame.width, frame.height)
         } else {
             // GPU resize (same filter as the program path); CPU fallback.
             let px = self
                 .engine
-                .gpu_resize_rgba(&frame.pixels, frame.width, frame.height, MONITOR_W, MONITOR_H)
+                .gpu_resize_rgba(&frame.pixels, frame.width, frame.height, mw, mh)
                 .unwrap_or_else(|_| {
-                    downscale_bilinear(&frame.pixels, frame.width, frame.height, MONITOR_W, MONITOR_H)
+                    downscale_bilinear(&frame.pixels, frame.width, frame.height, mw, mh)
                 });
-            (px, MONITOR_W, MONITOR_H)
+            (px, mw, mh)
         };
         self.monitor_seq += 1;
         MonitorFrame {
@@ -156,23 +160,61 @@ impl Shell {
         }
     }
 
-    /// Stores a program frame as the live monitor frame (downscaled).
+    /// Stores a program frame for the monitor. A frame already at monitor
+    /// size is kept as is; a full-size (encoding) frame is only downscaled
+    /// when the UI actually asks for it (`monitor_snapshot`) — nothing is
+    /// resized while the monitor is hidden or between UI polls.
     pub(crate) fn set_monitor_frame(&mut self, frame: Frame) {
-        let m = self.to_monitor(frame);
-        self.monitor_frame = Some(m);
+        if (frame.width, frame.height) == self.monitor_size {
+            let m = self.to_monitor(frame);
+            self.monitor_frame = Some(m);
+            self.monitor_pending = None;
+        } else {
+            self.monitor_pending = Some(frame);
+        }
+    }
+
+    /// Picks the monitor resolution for the size the UI displays it at
+    /// (device pixels): the smallest standard size ≥ that width. Rendering,
+    /// JPEG encoding and IPC all scale with it. Returns the size chosen.
+    pub fn monitor_set_display_width(&mut self, display_px: u32) -> (u32, u32) {
+        let pick = MONITOR_SIZES
+            .iter()
+            .copied()
+            .find(|(w, _)| *w >= display_px)
+            .unwrap_or(MONITOR_SIZES[MONITOR_SIZES.len() - 1]);
+        if pick != self.monitor_size {
+            self.monitor_size = pick;
+            self.monitor_frame = None;
+            self.monitor_pending = None;
+        }
+        pick
+    }
+
+    /// The program monitor was asked for within the last 1.5 s.
+    pub(crate) fn monitor_watched(&self) -> bool {
+        self.monitor_requested_at
+            .is_some_and(|t| t.elapsed() < Duration::from_millis(1500))
     }
 
     /// Monitor frame for a scene: the program scene is served from the
-    /// media tick (O(1), no render); any other scene renders once
+    /// media tick (O(1), resized lazily once per new frame); any other scene
+    /// (or a program the tick skipped because nobody watched) renders once
     /// at monitor size from the cached source frames (never pulls a
     /// producer, so it cannot steal live frames).
     pub fn monitor_snapshot(&mut self, scene_id: &str) -> Result<MonitorFrame, ShellError> {
         if scene_id == self.program_scene_id {
+            self.monitor_requested_at = Some(Instant::now());
+            if let Some(full) = self.monitor_pending.take() {
+                let m = self.to_monitor(full);
+                self.monitor_frame = Some(m);
+            }
             if let Some(m) = &self.monitor_frame {
                 return Ok(m.clone());
             }
         }
-        let frame = self.render_scene_frame(scene_id, MONITOR_W, MONITOR_H)?;
+        let (mw, mh) = self.monitor_size;
+        let frame = self.render_scene_frame(scene_id, mw, mh)?;
         Ok(self.to_monitor(frame))
     }
 }
@@ -503,6 +545,14 @@ pub struct Shell {
     /// of re-rendering the scene from scratch (which used to run at 2 Hz
     /// and stole the shell mutex from the media tick on every poll).
     monitor_frame: Option<MonitorFrame>,
+    /// Live devices currently paused because nothing shows them.
+    paused_sources: std::collections::HashSet<String>,
+    /// Latest full-size program frame not yet downscaled for the monitor.
+    monitor_pending: Option<Frame>,
+    /// Current monitor resolution (follows the UI's displayed size).
+    monitor_size: (u32, u32),
+    /// Last time the UI asked for the program monitor.
+    monitor_requested_at: Option<Instant>,
     /// Increments on every monitor frame (lets the UI skip unchanged ones).
     monitor_seq: u64,
     // --- production state machine (see `production` module) ---
@@ -680,6 +730,10 @@ impl Shell {
             last_frame: HashMap::new(),
             preview_cache: HashMap::new(),
             monitor_frame: None,
+            monitor_pending: None,
+            paused_sources: Default::default(),
+            monitor_requested_at: None,
+            monitor_size: (MONITOR_W, MONITOR_H),
             monitor_seq: 0,
             scenes: Vec::new(),
             preview_scene_id: String::new(),
@@ -1882,5 +1936,29 @@ mod downscale_tests {
     fn empty_input_is_safe() {
         let out = downscale_bilinear(&[], 0, 0, 480, 270);
         assert_eq!(out.len(), 480 * 270 * 4);
+    }
+}
+
+#[cfg(test)]
+mod jpeg_speed {
+    #[test]
+    #[ignore]
+    fn monitor_jpeg_cost() {
+        let mut tp = crate::test_pattern::TestPatternCache::default();
+        let px = tp.frame(super::MONITOR_W, super::MONITOR_H, 30, std::time::SystemTime::now());
+        let small = tp.frame(640, 360, 30, std::time::SystemTime::now());
+        let t = std::time::Instant::now();
+        let mut n = 0;
+        for _ in 0..60 {
+            n += super::encode_jpeg_rgba(&small, 640, 360, 82).unwrap().len();
+        }
+        let ff = t.elapsed() / 60;
+        let t = std::time::Instant::now();
+        let mut n2 = 0;
+        for _ in 0..60 {
+            n2 += super::encode_jpeg_rgba(&px, super::MONITOR_W, super::MONITOR_H, 82).unwrap().len();
+        }
+        let old = t.elapsed() / 60;
+        eprintln!("monitor JPEG: 640x360 {ff:?} ({} KB) vs 960x540 {old:?} ({} KB)", n / 60 / 1024, n2 / 60 / 1024);
     }
 }

@@ -128,7 +128,10 @@ export const api = {
   transitionAuto: (duration_ms: number, kind: TransitionKindName) =>
     cmd<unknown>("transition_auto", { duration_ms, kind }),
   /** Monitor JPEG (data URL) of any scene; program comes from the tick. */
-  scenePreviewJpg: (scene_id: string) => cmd<string>("scene_preview_jpg", { scene_id }),
+  /** Raw JPEG bytes of any scene's monitor picture. */
+  scenePreviewJpg: (scene_id: string) => cmd<ArrayBuffer>("scene_preview_jpg", { scene_id }),
+  /** Tell the engine how wide (device px) the monitors are drawn. */
+  monitorSetDisplayWidth: (width: number) => cmd<[number, number]>("monitor_set_display_width", { width }),
 
   sourceAdd: (scene_id: string, kind: SourceKind, name: string) => {
     // The backend takes flat args (kind as a snake_case string plus extras);
@@ -231,8 +234,9 @@ export const api = {
 
   productionState: () => cmd<unknown>("production_state"),
   /** Program monitor frame only when newer than `after_seq`. */
+  /** Empty = unchanged; else 8-byte LE frame number + JPEG bytes. */
   monitorFrameIfNew: (scene_id: string, after_seq: number) =>
-    cmd<[number, string] | null>("monitor_frame_if_new", { scene_id, after_seq }),
+    cmd<ArrayBuffer>("monitor_frame_if_new", { scene_id, after_seq }),
 
   mixerSetGain: (source_id: string, gain: number) =>
     cmd<void>("mixer_set_gain", { source_id, gain }),

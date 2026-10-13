@@ -3,7 +3,6 @@ import TopBar, { type StepId } from "./components/TopBar";
 import StatusBar from "./components/StatusBar";
 import DiagnosticsSheet from "./components/DiagnosticsSheet";
 import Toasts from "./components/Toasts";
-import { useMonitorPolling } from "./components/Monitor";
 import Workspace from "./components/studio/Workspace";
 import ColorView from "./components/views/ColorView";
 import { useProduction } from "./lib/productionStore";
@@ -23,8 +22,6 @@ export default function App() {
   const ready = useProduction((s) => s.ready);
   const recording = useProduction((s) => s.state?.record.state === "recording");
 
-  useMonitorPolling();
-
   useEffect(() => {
     void init();
     return () => dispose();
@@ -35,7 +32,7 @@ export default function App() {
   useEffect(() => {
     const t = setInterval(() => {
       if (!document.hidden) void refresh();
-    }, recording ? 1000 : 2000);
+    }, recording ? 1000 : 5000);
     return () => clearInterval(t);
   }, [refresh, recording]);
 

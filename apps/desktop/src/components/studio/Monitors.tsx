@@ -1,4 +1,5 @@
 import { useEffect, useRef, useState } from "react";
+import { api } from "../../lib/ipc";
 import { useProduction } from "../../lib/productionStore";
 import type { SourceTransform, SourceView, TransitionKindName } from "../../lib/types";
 import MeterCanvas from "./MeterCanvas";
@@ -171,8 +172,38 @@ function PlacementOverlay({ sources }: { sources: SourceView[] }) {
   );
 }
 
+/**
+ * Reports the drawn monitor width (device pixels) so the engine renders and
+ * encodes the monitor at that size, not larger.
+ */
+function useMonitorSize(ref: React.RefObject<HTMLDivElement | null>) {
+  useEffect(() => {
+    const el = ref.current;
+    if (!el || typeof ResizeObserver === "undefined") return;
+    let t: ReturnType<typeof setTimeout> | null = null;
+    let last = 0;
+    const ro = new ResizeObserver(() => {
+      if (t) clearTimeout(t);
+      t = setTimeout(() => {
+        const px = Math.round(el.clientWidth * (window.devicePixelRatio || 1));
+        if (Math.abs(px - last) > 16) {
+          last = px;
+          void api.monitorSetDisplayWidth(px).catch(() => {});
+        }
+      }, 300);
+    });
+    ro.observe(el);
+    return () => {
+      ro.disconnect();
+      if (t) clearTimeout(t);
+    };
+  }, [ref]);
+}
+
 /** PREVIEW | switch | PROGRAM, the heart of the workspace. */
 export default function Monitors() {
+  const pgmRef = useRef<HTMLDivElement>(null);
+  useMonitorSize(pgmRef);
   const state = useProduction((s) => s.state);
   const programUrl = useProduction((s) => s.programUrl);
   const previewUrl = useProduction((s) => s.previewUrl);
@@ -255,7 +286,7 @@ export default function Monitors() {
         </header>
         <div className="mon-row">
           <div className="mon-stage">
-            <div className={"mon-frame" + (live ? " onair" : "")}>{programUrl ? <img src={programUrl} alt="" draggable={false} /> : <div className="mon-empty">No picture</div>}</div>
+            <div ref={pgmRef} className={"mon-frame" + (live ? " onair" : "")}>{programUrl ? <img src={programUrl} alt="" draggable={false} /> : <div className="mon-empty">No picture</div>}</div>
           </div>
           <MeterCanvas channel="master" title="Program audio" />
         </div>

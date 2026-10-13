@@ -1558,6 +1558,21 @@ impl Shell {
                 }
             }
         }
+        if let Some(input_id) = &removed.input_id {
+            self.last_frame.remove(input_id);
+            self.preview_cache.remove(input_id);
+        }
+        if let SourceKind::Image { path } = &removed.kind {
+            let still_used = self
+                .scenes
+                .iter()
+                .flat_map(|s| s.sources.iter())
+                .any(|s| matches!(&s.kind, SourceKind::Image { path: p } if p == path));
+            if !still_used {
+                self.image_cache.remove(path);
+                self.image_sized.retain(|(p, _, _), _| p != path);
+            }
+        }
         for id in &release {
             self.media_producers.remove(id);
             // Dropping the LiveInput signals its capture thread to stop
@@ -1666,7 +1681,9 @@ impl Shell {
         } else {
             sf_capture::still_image::resize_rgba_premultiplied(&img.data, img.width, img.height, w, h)
         };
-        if self.image_sized.len() >= 32 {
+        // Bounded: ≤ 8 sizes and ≤ 64 MB of resized images in memory.
+        let bytes: usize = self.image_sized.values().map(|p| p.len()).sum();
+        if self.image_sized.len() >= 8 || bytes + px.len() > 64 << 20 {
             self.image_sized.clear();
         }
         let px = std::sync::Arc::new(px);
@@ -1867,7 +1884,7 @@ impl Shell {
         let px = sf_graphics::render_text_rgba(text, w, h);
         // Bound the cache: text sources are few and static; 32 entries is
         // ample and keeps memory trivially small.
-        if self.text_cache.len() >= 32 {
+        if self.text_cache.len() >= 4 {
             self.text_cache.clear();
         }
         self.text_cache.insert(key, px.clone());
@@ -1875,20 +1892,31 @@ impl Shell {
     }
 }
 
-/// Alpha "over" composite of `src` onto `canvas` (both RGBA8, same size).
-fn composite_over(canvas: &mut [u8], src: &[u8]) {
+/// Alpha "over" composite of `src` onto `canvas` (both RGBA8 straight
+/// alpha, same size). Integer math, with fast paths: fully transparent
+/// source pixels are skipped, fully opaque ones copied.
+pub(crate) fn composite_over(canvas: &mut [u8], src: &[u8]) {
     for (d, s) in canvas.chunks_exact_mut(4).zip(src.chunks_exact(4)) {
-        let sa = s[3] as f32 / 255.0;
-        let da = d[3] as f32 / 255.0;
-        let oa = sa + da * (1.0 - sa);
-        if oa > 0.0 {
-            for c in 0..3 {
-                d[c] = ((s[c] as f32 * sa + d[c] as f32 * da * (1.0 - sa)) / oa)
-                    .round()
-                    .clamp(0.0, 255.0) as u8;
-            }
-            d[3] = (oa * 255.0).round().clamp(0.0, 255.0) as u8;
+        let sa = s[3] as u32;
+        if sa == 0 {
+            continue;
         }
+        if sa == 255 {
+            d.copy_from_slice(s);
+            continue;
+        }
+        let da = d[3] as u32;
+        // out_a = sa + da·(1−sa), all in 0..255 fixed point.
+        let inv = 255 - sa;
+        let oa = sa * 255 + da * inv; // ×255
+        if oa == 0 {
+            continue;
+        }
+        for c in 0..3 {
+            let v = (s[c] as u32 * sa * 255 + d[c] as u32 * da * inv + oa / 2) / oa;
+            d[c] = v.min(255) as u8;
+        }
+        d[3] = ((oa + 127) / 255).min(255) as u8;
     }
 }
 
@@ -1968,12 +1996,6 @@ impl Shell {
         // Fast path: a single opaque video layer needs no composite — the
         // graded frame *is* the program frame (saves a full-frame blend
         // and a copy per tick).
-        let single_opaque = sources.len() == 1
-            && matches!(
-                sources[0].kind,
-                SourceKind::Media { .. } | SourceKind::Camera { .. } | SourceKind::Screen
-            )
-            && sources[0].transform.is_none_or(|t| t.is_full());
         let mut canvas: Option<Vec<u8>> = None;
         for src in &sources {
             let input_id = src
@@ -2031,67 +2053,57 @@ impl Shell {
                 )),
                 _ => std::sync::Arc::new(source_pixels(&src.kind, pw, ph)),
             };
+            // Ungraded source with nothing watching it: the grade would be a
+            // bit-exact bypass, so skip the GPU round trip (upload, download,
+            // sync) entirely and use the shared frame as is.
             let g0 = std::time::Instant::now();
-            let frame = self.engine.grade_input_frame(input_id, pw, ph, &pixels)?;
+            let graded: std::sync::Arc<Vec<u8>> = if self.engine.grade_is_passthrough(input_id) {
+                std::sync::Arc::clone(&pixels)
+            } else {
+                std::sync::Arc::new(self.engine.grade_input_frame(input_id, pw, ph, &pixels)?.pixels)
+            };
             self.perf_gpu_us_accum += g0.elapsed().as_micros() as u64;
+            let watch = self.studio_watching(input_id);
+            let opaque = is_capture
+                || matches!(src.kind, SourceKind::TestPattern | SourceKind::Color { .. })
+                || matches!(&src.kind, SourceKind::Image { path } if self.image_cache.get(path).is_some_and(|i| !i.has_alpha));
             if let Some((p, opacity, rotation)) = place {
                 let base = canvas.get_or_insert_with(|| vec![0u8; w as usize * h as usize * 4]);
-                let opaque = is_capture
-                    || matches!(src.kind, SourceKind::TestPattern | SourceKind::Color { .. })
-                    || matches!(&src.kind, SourceKind::Image { path } if self.image_cache.get(path).is_some_and(|i| !i.has_alpha));
                 if rotation.abs() > 0.01 {
-                    blit_rotated(base, w, h, &frame.pixels, &p, opacity, rotation);
+                    blit_rotated(base, w, h, &graded, &p, opacity, rotation);
                 } else {
-                    blit_placed(base, w, h, &frame.pixels, &p, opacity, opaque);
+                    blit_placed(base, w, h, &graded, &p, opacity, opaque);
                 }
-                if let Some(mode) = self.studio_watching(input_id) {
-                    let raw = (mode != crate::color_library::PreviewMode::After).then(|| Frame {
-                        width: pw,
-                        height: ph,
-                        pixels: std::sync::Arc::try_unwrap(pixels).unwrap_or_else(|a| (*a).clone()),
-                    });
-                    let input_id = input_id.clone();
-                    self.studio_tap_store(&input_id, frame, raw);
-                }
-                continue;
-            }
-            // Color Studio live tap: hand over the exact graded frame that
-            // goes to program/encoder (and the raw one for before/after).
-            let watch = self.studio_watching(input_id);
-            let out_pixels = if single_opaque {
-                if watch.is_some() {
-                    frame.pixels.clone()
+            } else if opaque || canvas.is_none() {
+                // Full-frame layer: an opaque one replaces everything below
+                // (no blend); the first layer needs no blend either.
+                let px = if watch.is_none() {
+                    std::sync::Arc::try_unwrap(std::sync::Arc::clone(&graded)).unwrap_or_else(|a| (*a).clone())
                 } else {
-                    // Moved, no copy.
-                    canvas = Some(frame.pixels);
-                    continue;
-                }
-            } else {
-                let base = canvas.take().unwrap_or_else(|| vec![0u8; w as usize * h as usize * 4]);
-                let g1 = std::time::Instant::now();
-                let blended = match self.engine.gpu_composite_over(&base, &frame.pixels, w, h) {
-                    Ok(px) => px,
-                    Err(_) => {
-                        let mut b = base;
-                        composite_over(&mut b, &frame.pixels);
-                        b
-                    }
+                    (*graded).clone()
                 };
-                self.perf_gpu_us_accum += g1.elapsed().as_micros() as u64;
-                canvas = Some(blended);
-                Vec::new()
-            };
-            if single_opaque {
-                canvas = Some(out_pixels);
+                canvas = Some(px);
+            } else {
+                // Transparent overlay (text, logo, PNG): CPU "over" with
+                // fast paths for fully transparent / opaque pixels.
+                let base = canvas.as_mut().expect("checked");
+                composite_over(base, &graded);
             }
+            // Color Studio live tap: the exact graded frame that goes to
+            // program/encoder (and the raw one for before/after).
             if let Some(mode) = watch {
                 let raw = (mode != crate::color_library::PreviewMode::After).then(|| Frame {
-                    width: w,
-                    height: h,
+                    width: pw,
+                    height: ph,
                     pixels: std::sync::Arc::try_unwrap(pixels).unwrap_or_else(|a| (*a).clone()),
                 });
                 let input_id = input_id.clone();
-                self.studio_tap_store(&input_id, frame, raw);
+                let graded_frame = Frame {
+                    width: pw,
+                    height: ph,
+                    pixels: std::sync::Arc::try_unwrap(graded).unwrap_or_else(|a| (*a).clone()),
+                };
+                self.studio_tap_store(&input_id, graded_frame, raw);
             }
         }
         Ok(Frame {

@@ -30,6 +30,7 @@ export function sourceStatus(s: SourceView, d: SourceDiag | undefined, targetFps
   if (d?.error) return { text: d.error, tone: "bad" };
   if (s.kind === "camera" || s.kind === "screen" || s.kind === "media") {
     if (!d) return { text: "Starting…", tone: "warn" };
+    if (d.paused) return { text: "Paused (not on Preview or Program, no decoding)", tone: "off" };
     if (!d.width) {
       // Never a bare "waiting": say what the device is (or isn't) doing.
       const sends = d.device_packet_fps;

@@ -226,7 +226,13 @@ export default function DiagnosticsSheet({ open, onClose }: { open: boolean; onC
               <Row title="GPU video encoder" subtitle="NVENC / Quick Sync / AMF engine" trailing={<span className="mono">{pctv(d.system.gpu_encode_percent)}</span>} />
               <Row title="Memory in use" trailing={<span className="mono">{d.system.mem_used_mb != null && d.system.mem_total_mb ? `${(d.system.mem_used_mb / 1024).toFixed(1)} of ${(d.system.mem_total_mb / 1024).toFixed(1)} GB` : "Unavailable"}</span>} />
               <Row title="Memory, StreamFlow" trailing={<span className="mono">{Math.round(d.system.ram_mb)} MB</span>} />
-              <Row title="Graphics adapter" subtitle={d.gpu_adapter?.includes("Cpu") ? "Software rendering — expect low frame rates" : undefined} trailing={<span className="mono">{d.gpu_adapter ?? "Unknown"}</span>} />
+              <Row title="Graphics adapter" subtitle={d.gpu_adapter?.includes("Cpu") ? "Software rendering — expect low frame rates" : undefined} trailing={<span className="mono clip" title={d.gpu_adapter ?? undefined}>{d.gpu_adapter ?? "Unknown"}</span>} />
+            </Section>
+
+            <Section title="Caches and buffers" footer="In-memory only, bounded, released when a source is removed. StreamFlow writes no temporary files; the browser cache is capped at 1 MB.">
+              {(d.caches ?? []).map((c) => (
+                <Row key={c.name} title={c.name} subtitle={`${c.entries} ${c.entries === 1 ? "entry" : "entries"}`} trailing={<span className="mono">{c.bytes >= 1048576 ? `${(c.bytes / 1048576).toFixed(1)} MB` : `${Math.round(c.bytes / 1024)} KB`}</span>} />
+              ))}
             </Section>
 
             <Section title="Errors" footer="Internal errors are contained and logged to %LOCALAPPDATA%\StreamFlow\streamflow-errors.log; the app keeps running.">
