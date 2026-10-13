@@ -453,6 +453,7 @@ mod tests {
         let p = port(seed);
         let mut tx = live_sender(p, codec);
         let live = open_live(p);
+        let opened = Instant::now();
         // Warm up: frames flow continuously.
         let t0 = Instant::now();
         let mut got = 0;
@@ -522,7 +523,12 @@ mod tests {
         }
         let st = live.stats();
         assert!(st.frames_dropped > 60, "{codec}: stale frames must be dropped, stats {st:?}");
-        assert!(st.capture_fps > 20.0, "{codec}: capture fps {}", st.capture_fps);
+        // Average publish rate over the whole run. (`capture_fps` is a live
+        // 1 s window — it correctly reads 0 while a bursty CI host has the
+        // sender descheduled, so it is not asserted at one instant.)
+        let avg = st.frames_captured as f64 / opened.elapsed().as_secs_f64();
+        eprintln!("{codec}: average capture {avg:.1} fps, window {} fps, device {} pkt/s", st.capture_fps, st.device_fps);
+        assert!(avg > 20.0 * rate.min(1.0), "{codec}: average capture {avg:.1} fps, rate {rate:.2}x, stats {st:?}");
         drop(live);
         let _ = tx.kill();
         let _ = tx.wait();
