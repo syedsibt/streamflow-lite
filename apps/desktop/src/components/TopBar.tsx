@@ -1,51 +1,79 @@
 import { useProduction } from "../lib/productionStore";
 
-export type StepId = "input" | "preview" | "color" | "audio" | "stream";
+export type StepId = "production" | "color";
 
-export const STEPS: { id: StepId; label: string }[] = [
-  { id: "input", label: "Input" },
-  { id: "preview", label: "Preview" },
-  { id: "color", label: "Color" },
-  { id: "audio", label: "Audio" },
-  { id: "stream", label: "Stream" },
-];
+const fmtTime = (s: number) => {
+  const h = Math.floor(s / 3600);
+  const m = Math.floor((s % 3600) / 60);
+  const sec = Math.floor(s % 60);
+  return `${h}:${String(m).padStart(2, "0")}:${String(sec).padStart(2, "0")}`;
+};
+const pct = (v: number | null | undefined) => (v == null ? "n/a" : `${Math.round(v)}%`);
 
-/** Title, the five-step workflow switch, and the live state. */
-export default function TopBar({ step, setStep }: { step: StepId; setStep: (s: StepId) => void }) {
+/** Product, workspace switch, the two on-air controls, and live load. */
+export default function TopBar({ step, setStep, onDiagnostics }: { step: StepId; setStep: (s: StepId) => void; onDiagnostics: () => void }) {
   const stream = useProduction((s) => s.state?.stream.state ?? "idle");
-  const record = useProduction((s) => s.state?.record.state ?? "idle");
+  const rec = useProduction((s) => s.state?.record.state ?? "idle");
+  const recSecs = useProduction((s) => s.state?.record.elapsed_secs ?? 0);
+  const diag = useProduction((s) => s.diag);
+  const busyStream = useProduction((s) => !!s.busy.stream);
+  const streamStart = useProduction((s) => s.streamStart);
+  const streamStop = useProduction((s) => s.streamStop);
+  const recordStart = useProduction((s) => s.recordStart);
+  const recordStop = useProduction((s) => s.recordStop);
   const live = stream === "live";
-  const busy = stream === "connecting" || stream === "reconnecting";
+  const connecting = stream === "connecting" || stream === "reconnecting";
+  const recOn = rec === "recording" || rec === "paused";
+  const sys = diag?.system;
+  const fpsLow = diag ? diag.render_fps < diag.target_fps * 0.9 : false;
 
   return (
     <header className="topbar">
       <div className="brand">StreamFlow</div>
-      <nav className="steps" role="tablist" aria-label="Workflow">
-        {STEPS.map((s, i) => (
-          <button
-            key={s.id}
-            type="button"
-            role="tab"
-            aria-selected={step === s.id}
-            className={step === s.id ? "active" : ""}
-            onClick={() => setStep(s.id)}
-            title={`${i + 1}. ${s.label}`}
-          >
-            {s.label}
+      <nav className="views" role="tablist" aria-label="Workspace">
+        {(
+          [
+            ["production", "Production"],
+            ["color", "Color grading"],
+          ] as [StepId, string][]
+        ).map(([id, label]) => (
+          <button key={id} type="button" role="tab" aria-selected={step === id} className={step === id ? "on" : ""} onClick={() => setStep(id)}>
+            {label}
           </button>
         ))}
       </nav>
-      <div className="topbar-right">
-        {record === "recording" && <span className="pill rec">REC</span>}
+      <div className="onair">
         <button
           type="button"
-          className={"pill" + (live ? " live" : busy ? " warn" : "")}
-          onClick={() => setStep("stream")}
-          title="Stream settings"
+          className={"air stream" + (live ? " on" : connecting ? " pending" : stream === "error" ? " err" : "")}
+          disabled={busyStream}
+          onClick={() => void (live || connecting ? streamStop() : streamStart())}
+          title={live ? "End the stream" : "Start streaming to the destination set in Output"}
         >
-          {live ? "LIVE" : busy ? (stream === "connecting" ? "Connecting…" : "Reconnecting…") : stream === "error" ? "Stream error" : "Offline"}
+          <i />
+          {live ? `Live ${diag ? fmtTime(diag.stream_uptime_s) : ""}` : connecting ? (stream === "connecting" ? "Connecting…" : "Reconnecting…") : busyStream ? "Starting…" : stream === "error" ? "Stream failed — retry" : "Go live"}
+        </button>
+        <button
+          type="button"
+          className={"air rec" + (rec === "recording" ? " on" : rec === "paused" ? " pending" : "")}
+          onClick={() => void (recOn ? recordStop() : recordStart())}
+          title={recOn ? "Stop recording" : "Start recording (file set in Output → Record)"}
+        >
+          <i />
+          {recOn ? `${rec === "paused" ? "Paused" : "Rec"} ${fmtTime(recSecs)}` : "Record"}
         </button>
       </div>
+      <button type="button" className="loads" onClick={onDiagnostics} title="Open diagnostics">
+        <span>
+          CPU <b>{pct(sys?.system_cpu_percent)}</b>
+        </span>
+        <span title={sys?.gpu_note ?? undefined}>
+          GPU <b>{pct(sys?.gpu_percent)}</b>
+        </span>
+        <span className={fpsLow ? "warn" : ""}>
+          FPS <b>{diag ? Math.round(diag.render_fps) : "—"}</b>
+        </span>
+      </button>
     </header>
   );
 }

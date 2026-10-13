@@ -815,3 +815,17 @@ fn image_source_overlays_with_transparency() {
         .source_add(&scene, "image", "Bad", [0, 0, 0], None, Some("/nope/x.png"), None, None, 0, 0, 0)
         .is_err());
 }
+
+#[test]
+fn scenes_reorder() {
+    let mut s = shell();
+    let a = s.scene_create("A").id;
+    let b = s.scene_create("B").id;
+    s.scene_move(&b, 0).unwrap();
+    let ids: Vec<String> = s.scene_list().into_iter().map(|x| x.id).collect();
+    assert_eq!(ids[0], b);
+    s.scene_move(&b, 99).unwrap();
+    assert_eq!(s.scene_list().last().unwrap().id, b);
+    assert!(s.scene_move("nope", 0).is_err());
+    let _ = a;
+}

@@ -1184,6 +1184,21 @@ impl Shell {
 
     /// Duplicates a scene (new ids for the scene and its sources, fresh
     /// engine inputs for real sources, fresh mixer strips).
+    /// Moves a scene to position `to` in the list (operator ordering;
+    /// keys 1–9 follow it).
+    pub fn scene_move(&mut self, scene_id: &str, to: usize) -> Result<(), ShellError> {
+        let from = self
+            .scenes
+            .iter()
+            .position(|s| s.id == scene_id)
+            .ok_or_else(|| ShellError::UnknownScene(scene_id.to_string()))?;
+        let sc = self.scenes.remove(from);
+        let to = to.min(self.scenes.len());
+        self.scenes.insert(to, sc);
+        self.emit_scene_changed();
+        Ok(())
+    }
+
     pub fn scene_duplicate(&mut self, scene_id: &str) -> Result<ProdScene, ShellError> {
         let src = self
             .find_scene(scene_id)

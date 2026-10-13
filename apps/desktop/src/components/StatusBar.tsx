@@ -1,126 +1,94 @@
 import { useEffect } from "react";
 import { useProduction } from "../lib/productionStore";
-import type { Diagnostics, ProductionStateData } from "../lib/types";
-import { Dot, type Tone } from "./ui";
+import type { PerfSample } from "../lib/types";
 
-export interface StatusItem {
-  key: string;
-  label: string;
-  value: string;
-  tone: Tone;
-  title: string;
+const pct = (v: number | null | undefined) => (v == null ? "Unavailable" : `${Math.round(v)}%`);
+
+/** Tiny line chart of the last two minutes of real samples. */
+export function Spark({ data, pick, max, cls }: { data: PerfSample[]; pick: (s: PerfSample) => number | null; max: number; cls: string }) {
+  const w = 72;
+  const h = 16;
+  const pts = data
+    .map((s, i) => {
+      const v = pick(s);
+      if (v == null) return null;
+      const x = data.length > 1 ? (i / (data.length - 1)) * w : w;
+      const y = h - Math.min(1, Math.max(0, v / max)) * (h - 1) - 0.5;
+      return `${x.toFixed(1)},${y.toFixed(1)}`;
+    })
+    .filter(Boolean);
+  return (
+    <svg className={"spark " + cls} width={w} height={h} viewBox={`0 0 ${w} ${h}`} aria-hidden="true">
+      {pts.length > 1 && <polyline points={pts.join(" ")} fill="none" strokeWidth="1.2" />}
+    </svg>
+  );
 }
 
-const r0 = (v: number) => Math.round(v);
-
-/** The seven always-visible indicators, computed from measured data only. */
-export function statusItems(d: Diagnostics | null, st: ProductionStateData | null): StatusItem[] {
-  if (!d || !st) {
-    return ["VIDEO", "AUDIO", "COLOR", "FPS", "DROPPED", "LATENCY", "STREAM"].map((k) => ({
-      key: k,
-      label: k,
-      value: "—",
-      tone: "off" as Tone,
-      title: "Waiting for the engine",
-    }));
-  }
-  const vsrc = d.sources;
-  const vErr = vsrc.find((s) => s.error);
-  const vLive = vsrc.filter((s) => s.fps > 0).length;
-  const video: StatusItem = vErr
-    ? { key: "VIDEO", label: "VIDEO", value: "Error", tone: "bad", title: `${vErr.name}: ${vErr.error}` }
-    : vsrc.length === 0
-      ? { key: "VIDEO", label: "VIDEO", value: "None", tone: "off", title: "No camera, screen or media source" }
-      : vLive > 0
-        ? { key: "VIDEO", label: "VIDEO", value: "OK", tone: "ok", title: `${vLive} source(s) delivering frames` }
-        : { key: "VIDEO", label: "VIDEO", value: "Waiting", tone: "warn", title: "Sources added, no frames yet" };
-
-  const aErr = d.audio.find((a) => a.device.startsWith("error"));
-  const audioCount = st.mixer.channels.length;
-  const audio: StatusItem = aErr
-    ? { key: "AUDIO", label: "AUDIO", value: "Error", tone: "bad", title: `${aErr.name}: ${aErr.device}` }
-    : audioCount === 0 && d.audio.length === 0
-      ? { key: "AUDIO", label: "AUDIO", value: "None", tone: "off", title: "No microphone or audio source" }
-      : st.mixer.master.mute
-        ? { key: "AUDIO", label: "AUDIO", value: "Muted", tone: "warn", title: "Master is muted" }
-        : { key: "AUDIO", label: "AUDIO", value: "OK", tone: "ok", title: "Audio is flowing to the output" };
-
-  const color: StatusItem = {
-    key: "COLOR",
-    label: "COLOR",
-    value: d.color_active ? "On" : "Off",
-    tone: d.color_active ? "ok" : "off",
-    title: d.color_active ? "A grade, LUT or filter is active on the output" : "No color processing",
-  };
-
-  const ratio = d.target_fps > 0 ? d.render_fps / d.target_fps : 0;
-  const fps: StatusItem = {
-    key: "FPS",
-    label: "FPS",
-    value: `${r0(d.render_fps)}`,
-    tone: ratio >= 0.95 ? "ok" : ratio >= 0.8 ? "warn" : "bad",
-    title: `Output ${r0(d.render_fps)} of ${d.target_fps} fps · last frame ${d.tick_ms.toFixed(1)} ms`,
-  };
-
-  const dropped = d.lagged_ticks + d.skipped_render + d.dropped_network;
-  const drop: StatusItem = {
-    key: "DROPPED",
-    label: "DROPPED",
-    value: `${dropped}`,
-    tone: dropped === 0 ? "ok" : "warn",
-    title: `Late frames (PC too slow): ${d.lagged_ticks} · encode failures: ${d.skipped_render} · network drops: ${d.dropped_network}`,
-  };
-
-  const lat = d.latency.app_total_ms;
-  const latency: StatusItem = {
-    key: "LATENCY",
-    label: "LATENCY",
-    value: lat == null ? "—" : `${r0(lat)} ms`,
-    tone: lat == null ? "off" : lat < 250 ? "ok" : lat < 600 ? "warn" : "bad",
-    title:
-      lat == null
-        ? "No live picture to measure"
-        : `App side: capture ${r0(d.latency.capture_ms ?? 0)} ms + processing ${r0(d.latency.processing_ms)} ms + send buffer ${r0(d.latency.send_buffer_ms)} ms. The platform adds its own delay.`,
-  };
-
-  const s = d.stream_status;
-  const stream: StatusItem =
-    s === "live"
-      ? { key: "STREAM", label: "STREAM", value: `${r0(d.stream_kbps)} kbps`, tone: "live", title: "Live" }
-      : s === "connecting" || s === "reconnecting"
-        ? { key: "STREAM", label: "STREAM", value: s === "connecting" ? "Connecting" : "Reconnecting", tone: "warn", title: s }
-        : s === "error"
-          ? { key: "STREAM", label: "STREAM", value: "Error", tone: "bad", title: d.stream_error ?? "Stream error" }
-          : { key: "STREAM", label: "STREAM", value: "Off", tone: "off", title: "Not streaming" };
-
-  return [video, audio, color, fps, drop, latency, stream];
-}
-
-/** Bottom status strip; click (or Enter) opens the diagnostics sheet. */
+/** Always-visible health line (measured values; "Unavailable" when the OS can't report one). */
 export default function StatusBar({ onOpen }: { onOpen: () => void }) {
-  const diag = useProduction((s) => s.diag);
-  const state = useProduction((s) => s.state);
-  const pollDiagnostics = useProduction((s) => s.pollDiagnostics);
+  const d = useProduction((s) => s.diag);
+  const st = useProduction((s) => s.state);
+  const perf = useProduction((s) => s.perf);
+  const poll = useProduction((s) => s.pollDiagnostics);
 
   useEffect(() => {
-    void pollDiagnostics();
+    void poll();
     const t = setInterval(() => {
-      if (!document.hidden) void pollDiagnostics();
+      if (!document.hidden) void poll();
     }, 1000);
     return () => clearInterval(t);
-  }, [pollDiagnostics]);
+  }, [poll]);
 
-  const items = statusItems(diag, state);
+  const sys = d?.system;
+  const dropped = d ? d.lagged_ticks + d.skipped_render + d.dropped_network : 0;
+  const lat = d?.latency.app_total_ms;
+  const camWarn = d?.sources.find((s) => s.error || (s.width > 0 && s.kind === "camera" && s.fps < d.target_fps * 0.8));
+  const stream = d?.stream_status ?? "idle";
+  const rec = st?.record.state ?? "idle";
+  const internal = d?.internal_errors ?? 0;
+
   return (
-    <button type="button" className="statusbar" onClick={onOpen} title="Open diagnostics">
-      {items.map((it) => (
-        <span key={it.key} className="status-item" title={it.title}>
-          <Dot tone={it.tone} />
-          <span className="status-label">{it.label}</span>
-          <span className="status-value">{it.value}</span>
-        </span>
-      ))}
-      <span className="status-more">Diagnostics</span>
-    </button>
+    <footer className="statusbar">
+      <button type="button" className="sb" onClick={onOpen} title={sys ? `Whole computer ${pct(sys.system_cpu_percent)} · StreamFlow ${pct(sys.cpu_percent)} of ${sys.cores} cores` : ""}>
+        CPU <b>{pct(sys?.system_cpu_percent)}</b>
+        <Spark data={perf} pick={(s) => s.cpu} max={100} cls="cpu" />
+      </button>
+      <button type="button" className="sb" onClick={onOpen} title={sys?.gpu_note ?? (sys?.gpu_encode_percent != null ? `Video encoder engine ${Math.round(sys.gpu_encode_percent)}%` : "")}>
+        GPU <b>{pct(sys?.gpu_percent)}</b>
+        <Spark data={perf} pick={(s) => s.gpu} max={100} cls="gpu" />
+      </button>
+      <span className="sb" title={sys ? `StreamFlow uses ${Math.round(sys.ram_mb)} MB` : ""}>
+        Memory <b>{sys?.mem_used_mb != null && sys.mem_total_mb ? `${(sys.mem_used_mb / 1024).toFixed(1)} / ${(sys.mem_total_mb / 1024).toFixed(1)} GB` : "Unavailable"}</b>
+      </span>
+      <button type="button" className={"sb" + (d && d.render_fps < d.target_fps * 0.9 ? " warn" : "")} onClick={onOpen}>
+        FPS <b>{d ? `${Math.round(d.render_fps)}/${d.target_fps}` : "—"}</b>
+        <Spark data={perf} pick={(s) => s.fps} max={d?.target_fps ?? 60} cls="fps" />
+      </button>
+      <button type="button" className={"sb" + (dropped ? " warn" : "")} onClick={onOpen} title={d ? `Late frames ${d.lagged_ticks} · encode failures ${d.skipped_render} · network drops ${d.dropped_network}` : ""}>
+        Dropped <b>{d ? dropped : "—"}</b>
+      </button>
+      <span className={"sb" + (lat != null && lat > 400 ? " warn" : "")} title="App side: capture + processing + send buffer (the platform adds its own delay)">
+        Latency <b>{lat != null ? `${Math.round(lat)} ms` : "—"}</b>
+      </span>
+      <span className="sb">
+        Bitrate <b>{stream === "live" && d ? `${Math.round(d.stream_kbps)} kbps` : "—"}</b>
+      </span>
+      <span className={"sb tally-s " + stream}>Stream <b>{stream === "live" ? "Live" : stream === "error" ? "Error" : stream === "idle" ? "Off" : stream}</b></span>
+      <span className={"sb tally-s " + (rec === "recording" ? "rec" : "")}>Rec <b>{rec === "recording" ? "On" : rec === "paused" ? "Paused" : "Off"}</b></span>
+      <span className="sb-grow" />
+      {camWarn && (
+        <button type="button" className="sb warn" onClick={onOpen} title={camWarn.error ?? undefined}>
+          {camWarn.name}: {camWarn.error ? "error" : `${camWarn.fps.toFixed(0)} fps`}
+        </button>
+      )}
+      {internal > 0 && (
+        <button type="button" className="sb bad" onClick={onOpen} title={d?.last_internal_error ?? ""}>
+          {internal} internal error{internal > 1 ? "s" : ""}
+        </button>
+      )}
+      <button type="button" className="sb link" onClick={onOpen}>
+        Diagnostics
+      </button>
+    </footer>
   );
 }

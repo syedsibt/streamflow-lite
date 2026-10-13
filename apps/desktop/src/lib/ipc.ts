@@ -26,6 +26,7 @@ import type {
   SourceView,
   SourceTransform,
   SceneLayout,
+  AudioMeters,
   TransitionKindName,
   UiEvent,
   VideoSettings,
@@ -161,6 +162,9 @@ export const api = {
     } else if ("media" in kind) {
       kindStr = "media";
       path = kind.media.path;
+    } else if ("image" in kind) {
+      kindStr = "image";
+      path = kind.image.path;
     } else if ("text" in kind) {
       kindStr = "text";
       text = kind.text.text;
@@ -210,6 +214,15 @@ export const api = {
     cmd<void>("source_set_visible", { scene_id, source_id, visible }),
   sourceSetTransform: (scene_id: string, source_id: string, transform: SourceTransform | null) =>
     cmd<SourceView>("source_set_transform", { scene_id, source_id, transform }),
+  sourceSetLocked: (scene_id: string, source_id: string, locked: boolean) =>
+    cmd<SourceView>("source_set_locked", { scene_id, source_id, locked }),
+  sourceDuplicate: (scene_id: string, source_id: string) =>
+    cmd<SourceView>("source_duplicate", { scene_id, source_id }),
+  sceneMove: (scene_id: string, to: number) => cmd<void>("scene_move", { scene_id, to }),
+  mixerSetPan: (source_id: string, pan: number) => cmd<unknown>("mixer_set_pan", { source_id, pan }),
+  mixerSetSolo: (source_id: string, solo: boolean) => cmd<unknown>("mixer_set_solo", { source_id, solo }),
+  mixerSetTrim: (source_id: string, trim_db: number) => cmd<unknown>("mixer_set_trim", { source_id, trim_db }),
+  audioMeters: () => cmd<AudioMeters>("audio_meters", {}),
   sceneApplyLayout: (scene_id: string, layout: SceneLayout) =>
     cmd<number>("scene_apply_layout", { scene_id, layout }),
 

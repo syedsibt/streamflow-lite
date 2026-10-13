@@ -317,6 +317,7 @@ export type SourceKind =
   | { screen: Record<string, never> }
   | { media: { path: string } }
   | { text: { text: string } }
+  | { image: { path: string } }
   | { audio_input: { device?: string | null } };
 
 /** Camera source summary for the Video panel — mirrors the backend. */
@@ -354,6 +355,10 @@ export interface SourceView {
   input_id: string | null;
   /** Placement in the canvas; null = full frame. */
   transform: SourceTransform | null;
+  /** Placement locked. */
+  locked: boolean;
+  /** Device name / file path / text, for display. */
+  detail: string | null;
 }
 
 export type FitMode = "fill" | "fit" | "stretch";
@@ -370,6 +375,8 @@ export interface SourceTransform {
   crop_bottom: number;
   fit: FitMode;
   opacity: number;
+  /** Clockwise degrees. */
+  rotation: number;
 }
 
 export type TransitionKindName = "mix" | "fade" | "wipe";
@@ -385,8 +392,19 @@ export interface SceneView {
 export interface MixerChannelView {
   source_id: string;
   name: string;
-  gain: number; // 0..2.0 multiplier, shown as 0..200%
+  gain: number; // 0..2.0 multiplier (fader)
   mute: boolean;
+  pan: number; // -1 (left) … 1 (right)
+  solo: boolean; // local monitor only
+  trim_db: number; // -20 … 20
+}
+
+/** Live meters (backend `AudioMetersView`): peak since last read + RMS, linear. */
+export interface AudioMeters {
+  channels: { id: string; peak: number; rms: number; has_signal_path: boolean }[];
+  master_peak: number;
+  master_rms: number;
+  solo_active: boolean;
 }
 
 export interface EnhancerSettings {
@@ -468,7 +486,7 @@ export interface ProductionStateData {
  * camera on Windows, media files everywhere) — their pending state comes
  * from the backend's per-platform `status` field, not this list.
  */
-export const PENDING_CAPTURE_KINDS = ["text"];
+export const PENDING_CAPTURE_KINDS: string[] = [];
 
 export function isPendingCaptureSource(s: SourceView): boolean {
   const kind = s.kind.toLowerCase();
@@ -559,7 +577,32 @@ export interface Diagnostics {
   color_active: boolean;
   av_auto: boolean;
   av_offset_ms: number;
-  system: { cpu_percent: number; ram_mb: number; cores: number };
+  system: {
+    cpu_percent: number;
+    ram_mb: number;
+    cores: number;
+    system_cpu_percent: number | null;
+    mem_used_mb: number | null;
+    mem_total_mb: number | null;
+    gpu_percent: number | null;
+    gpu_app_percent: number | null;
+    gpu_encode_percent: number | null;
+    gpu_note: string | null;
+  };
+  internal_errors: number;
+  last_internal_error: string | null;
+  gpu_errors: number;
+  last_gpu_error: string | null;
+  gpu_adapter: string | null;
+}
+
+/** One diagnostics poll kept for the performance chart (real values only). */
+export interface PerfSample {
+  t: number;
+  cpu: number | null;
+  gpu: number | null;
+  fps: number;
+  dropped: number;
 }
 
 /** Streaming platform adapter info (backend `PlatformInfo`). */

@@ -11,6 +11,44 @@ const fmtUptime = (s: number) => {
   return h > 0 ? `${h}:${String(m).padStart(2, "0")}:${String(sec).padStart(2, "0")}` : `${m}:${String(sec).padStart(2, "0")}`;
 };
 
+const pctv = (v: number | null | undefined) => (v == null ? "Unavailable" : `${Math.round(v)} %`);
+
+/** Last two minutes of real samples: CPU (whole computer), GPU, output fps. */
+function PerfChart() {
+  const perf = useProduction((s) => s.perf);
+  const target = useProduction((s) => s.diag?.target_fps ?? 30);
+  const w = 500;
+  const h = 90;
+  const line = (pick: (p: (typeof perf)[number]) => number | null, max: number) =>
+    perf
+      .map((p, i) => {
+        const v = pick(p);
+        if (v == null) return null;
+        const x = perf.length > 1 ? (i / 119) * w : 0;
+        return `${x.toFixed(1)},${(h - Math.min(1, v / max) * (h - 2) - 1).toFixed(1)}`;
+      })
+      .filter(Boolean)
+      .join(" ");
+  return (
+    <div className="perf-chart">
+      <svg viewBox={`0 0 ${w} ${h}`} preserveAspectRatio="none" role="img" aria-label="CPU, GPU and frame rate over the last two minutes">
+        {[0.25, 0.5, 0.75].map((f) => (
+          <line key={f} x1="0" x2={w} y1={h * f} y2={h * f} className="grid" />
+        ))}
+        <polyline points={line((p) => p.cpu, 100)} className="cpu" />
+        <polyline points={line((p) => p.gpu, 100)} className="gpu" />
+        <polyline points={line((p) => p.fps, target)} className="fps" />
+      </svg>
+      <div className="perf-legend">
+        <span className="cpu">CPU %</span>
+        <span className="gpu">GPU %</span>
+        <span className="fps">FPS (of {target})</span>
+        <span className="dim">last {perf.length} s</span>
+      </div>
+    </div>
+  );
+}
+
 /** Stage bar: proportional to the frame budget. */
 function Stage({ label, value, budget }: { label: string; value: number; budget: number }) {
   const pct = Math.min(100, (value / Math.max(budget, 1)) * 100);
@@ -179,10 +217,21 @@ export default function DiagnosticsSheet({ open, onClose }: { open: boolean; onC
               <Row title="Recording" trailing={<span className="mono">{d.recording ? "on" : "off"}</span>} />
             </Section>
 
-            <Section title="System">
-              <Row title="CPU (this app)" subtitle={`${d.system.cores} logical cores = 100 %`} trailing={<span className="mono">{d.system.cpu_percent.toFixed(0)} %</span>} />
-              <Row title="Memory" trailing={<span className="mono">{Math.round(d.system.ram_mb)} MB</span>} />
-              <Row title="GPU color time" subtitle="Per frame, all sources" trailing={<span className="mono">{ms(d.gpu_ms)}</span>} />
+            <Section title="System" footer={d.system.gpu_note ?? "GPU from Windows performance counters (same source as Task Manager)."}>
+              <PerfChart />
+              <Row title="CPU, whole computer" trailing={<span className="mono">{pctv(d.system.system_cpu_percent)}</span>} />
+              <Row title="CPU, StreamFlow" subtitle={`${d.system.cores} logical cores = 100 %`} trailing={<span className="mono">{d.system.cpu_percent.toFixed(0)} %</span>} />
+              <Row title="GPU, busiest engine" trailing={<span className="mono">{pctv(d.system.gpu_percent)}</span>} />
+              <Row title="GPU, StreamFlow" trailing={<span className="mono">{pctv(d.system.gpu_app_percent)}</span>} />
+              <Row title="GPU video encoder" subtitle="NVENC / Quick Sync / AMF engine" trailing={<span className="mono">{pctv(d.system.gpu_encode_percent)}</span>} />
+              <Row title="Memory in use" trailing={<span className="mono">{d.system.mem_used_mb != null && d.system.mem_total_mb ? `${(d.system.mem_used_mb / 1024).toFixed(1)} of ${(d.system.mem_total_mb / 1024).toFixed(1)} GB` : "Unavailable"}</span>} />
+              <Row title="Memory, StreamFlow" trailing={<span className="mono">{Math.round(d.system.ram_mb)} MB</span>} />
+              <Row title="Graphics adapter" subtitle={d.gpu_adapter?.includes("Cpu") ? "Software rendering — expect low frame rates" : undefined} trailing={<span className="mono">{d.gpu_adapter ?? "Unknown"}</span>} />
+            </Section>
+
+            <Section title="Errors" footer="Internal errors are contained and logged to %LOCALAPPDATA%\StreamFlow\streamflow-errors.log; the app keeps running.">
+              <Row title="Internal errors" subtitle={d.last_internal_error} trailing={<span className="mono">{d.internal_errors}</span>} />
+              <Row title="GPU errors" subtitle={d.last_gpu_error} trailing={<span className="mono">{d.gpu_errors}</span>} />
             </Section>
           </div>
         )}

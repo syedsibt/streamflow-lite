@@ -25,6 +25,8 @@ import type {
   SourceTransform,
   TransitionKindName,
   VoiceStats,
+  PerfSample,
+  MixerChannelView,
 } from "./types";
 
 interface ProductionStore {
@@ -51,6 +53,18 @@ interface ProductionStore {
   refresh: () => Promise<void>;
   pollMonitor: () => Promise<void>;
   pollDiagnostics: () => Promise<void>;
+  /** Last ~2 minutes of real diagnostics samples (1 per poll). */
+  perf: PerfSample[];
+
+  /** Source selected in the workspace (strip, preview box, properties). */
+  selectedSourceId: string | null;
+  selectSource: (id: string | null) => void;
+  sourceSetLocked: (source_id: string, locked: boolean) => Promise<void>;
+  sourceDuplicate: (source_id: string) => Promise<void>;
+  sceneMove: (scene_id: string, to: number) => Promise<void>;
+  setChannelPan: (source_id: string, pan: number) => void;
+  setChannelSolo: (source_id: string, solo: boolean) => Promise<void>;
+  setChannelTrim: (source_id: string, trim_db: number) => void;
 
   /** The scene everything is added to (program). */
   sceneId: () => string | null;
@@ -177,6 +191,21 @@ function kindToString(kind: unknown): string {
   return "unknown";
 }
 
+/** Device / file / text carried by a source kind, for display. */
+function kindDetail(kind: unknown): string | null {
+  if (!kind || typeof kind !== "object") return null;
+  const v = Object.values(kind as Record<string, any>)[0];
+  if (!v || typeof v !== "object") return null;
+  return (v.device ?? v.path ?? v.text ?? null) as string | null;
+}
+
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+function patchChannel(set: any, get: () => ProductionStore, id: string, patch: Partial<MixerChannelView>) {
+  const st = get().state;
+  if (!st) return;
+  set({ state: { ...st, mixer: { ...st.mixer, channels: st.mixer.channels.map((c) => (c.source_id === id ? { ...c, ...patch } : c)) } } });
+}
+
 const num = (v: unknown, d: number) => (typeof v === "number" && Number.isFinite(v) ? v : d);
 
 /** Normalize `production_state()` JSON in ONE place. */
@@ -196,7 +225,9 @@ function normalizeProductionState(raw: unknown): ProductionStateData {
         order: num(s.order, 0),
         status: String(s.status ?? ""),
         input_id: typeof s.input_id === "string" ? s.input_id : null,
-        transform: s.transform && typeof s.transform === "object" ? (s.transform as SourceTransform) : null,
+        transform: s.transform && typeof s.transform === "object" ? ({ rotation: 0, ...s.transform } as SourceTransform) : null,
+        locked: !!s.locked,
+        detail: kindDetail(s.kind),
       };
     }),
   }));
@@ -206,6 +237,9 @@ function normalizeProductionState(raw: unknown): ProductionStateData {
     name: nameBySource.get(source_id) ?? source_id,
     gain: num(ch?.gain, 1),
     mute: !!ch?.mute,
+    pan: num(ch?.pan, 0),
+    solo: !!ch?.solo,
+    trim_db: num(ch?.trim_db, 0),
   }));
   const sl = (r.stream_lifecycle ?? {}) as Record<string, any>;
   const rl = (r.record_lifecycle ?? {}) as Record<string, any>;
@@ -362,11 +396,68 @@ export const useProduction = create<ProductionStore>()((set, get) => ({
     }
   },
 
+  perf: [],
+  selectedSourceId: null,
+  selectSource: (id) => set({ selectedSourceId: id }),
+  sourceSetLocked: async (source_id, locked) => {
+    const scene = get().sceneId();
+    if (!scene) return;
+    try {
+      await api.sourceSetLocked(scene, source_id, locked);
+      await get().refresh();
+    } catch (e) {
+      toast(`Could not ${locked ? "lock" : "unlock"}: ${errText(e)}`);
+    }
+  },
+  sourceDuplicate: async (source_id) => {
+    const scene = get().sceneId();
+    if (!scene) return;
+    try {
+      const d = await api.sourceDuplicate(scene, source_id);
+      await get().refresh();
+      set({ selectedSourceId: d.id });
+    } catch (e) {
+      toast(`Could not duplicate: ${errText(e)}`);
+    }
+  },
+  sceneMove: async (scene_id, to) => {
+    try {
+      await api.sceneMove(scene_id, to);
+      await get().refresh();
+    } catch (e) {
+      toast(`Could not move scene: ${errText(e)}`);
+    }
+  },
+  setChannelPan: (source_id, pan) => {
+    patchChannel(set, get, source_id, { pan });
+    void api.mixerSetPan(source_id, pan).catch((e) => toast(`Pan failed: ${errText(e)}`));
+  },
+  setChannelSolo: async (source_id, solo) => {
+    patchChannel(set, get, source_id, { solo });
+    try {
+      await api.mixerSetSolo(source_id, solo);
+    } catch (e) {
+      toast(`Solo failed: ${errText(e)}`);
+    }
+  },
+  setChannelTrim: (source_id, trim_db) => {
+    patchChannel(set, get, source_id, { trim_db });
+    void api.mixerSetTrim(source_id, trim_db).catch((e) => toast(`Trim failed: ${errText(e)}`));
+  },
+
   pollDiagnostics: async () => {
     if (!isTauri || diagInFlight) return;
     diagInFlight = true;
     try {
-      set({ diag: await api.diagnostics() });
+      const d = await api.diagnostics();
+      const sample: PerfSample = {
+        t: Date.now(),
+        cpu: d.system.system_cpu_percent ?? d.system.cpu_percent ?? null,
+        gpu: d.system.gpu_percent ?? null,
+        fps: d.render_fps,
+        dropped: d.lagged_ticks + d.skipped_render + d.dropped_network,
+      };
+      set((s) => ({ diag: d, perf: [...s.perf.slice(-119), sample] }));
     } catch {
       /* next poll retries */
     } finally {

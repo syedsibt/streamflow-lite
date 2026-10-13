@@ -1,9 +1,9 @@
 import { useEffect, useState } from "react";
+type OTab = "stream" | "record" | "format";
 import { save } from "@tauri-apps/plugin-dialog";
 import { api } from "../../lib/ipc";
 import { errText, useProduction } from "../../lib/productionStore";
 import type { PlatformInfo, VideoSettings } from "../../lib/types";
-import Monitor from "../Monitor";
 import { Banner, Field, Row, Section, Segmented } from "../ui";
 
 const FALLBACK_PLATFORMS: PlatformInfo[] = [
@@ -33,7 +33,8 @@ const fmtTime = (s: number) => {
  * server), the output format, and recording. Stream and recording share
  * one encoder — starting both costs no extra encoding.
  */
-export default function StreamView() {
+export default function OutputPanel() {
+  const [otab, setOtab] = useState<OTab>("stream");
   const st = useProduction((s) => s.state);
   const platformsRaw = useProduction((s) => s.platforms);
   const platform = useProduction((s) => s.streamPlatform);
@@ -103,12 +104,23 @@ export default function StreamView() {
   const outputLocked = active || recActive;
 
   return (
-    <div className="workspace">
-      <div className="stage-area">
-        <Monitor />
+    <div className="output">
+      <div className="ptabs" role="tablist" aria-label="Output">
+        {(
+          [
+            ["stream", stream === "live" ? "Stream · live" : "Stream"],
+            ["record", rec === "recording" ? "Record · on" : "Record"],
+            ["format", "Video format"],
+          ] as [OTab, string][]
+        ).map(([id, label]) => (
+          <button key={id} type="button" role="tab" aria-selected={otab === id} className={otab === id ? "on" : ""} onClick={() => setOtab(id)}>
+            {label}
+          </button>
+        ))}
       </div>
-      <aside className="inspector">
-        <Section title="Destination" footer={info?.latency_note || undefined}>
+      <div className="pbody">
+        {otab === "stream" && (
+        <Section footer={info?.latency_note || undefined}>
           <div className="pad">
             <Segmented
               label="Platform"
@@ -169,8 +181,10 @@ export default function StreamView() {
             />
           )}
         </Section>
+        )}
 
-        <Section title="Output" footer={outputLocked ? "Resolution, encoder and bitrate apply the next time you go live or record. Frame rate applies immediately." : "Stream and recording share one encoder."}>
+        {otab === "format" && (
+        <Section footer={outputLocked ? "Resolution, encoder and bitrate apply the next time you go live or record. Frame rate applies immediately." : "Stream and recording share one encoder."}>
           {vs && (
             <>
               <Field label="Resolution">
@@ -215,6 +229,8 @@ export default function StreamView() {
                   <span className="unit">kbps</span>
                 </span>
               </Field>
+              <Row title="Keyframe interval" subtitle="Fixed at 2 seconds — what YouTube, Facebook and TikTok require" trailing={<span className="mono">2 s</span>} />
+              <Row title="Audio" subtitle="AAC, 48 kHz stereo" trailing={<span className="mono">128 kbps</span>} />
               {diag?.encoder && <Row title="Encoder in use" subtitle={diag.encoder.note ?? (diag.encoder.hardware ? "Hardware" : "Software (CPU)")} trailing={<span className="mono">{diag.encoder.name}</span>} />}
               {outErr && (
                 <div className="pad">
@@ -226,8 +242,10 @@ export default function StreamView() {
             </>
           )}
         </Section>
+        )}
 
-        <Section title="Recording">
+        {otab === "record" && (
+        <Section>
           <Field label="File">
             <span className="file-pick">
               <span className="file-name" title={recordPath || undefined}>
@@ -286,7 +304,8 @@ export default function StreamView() {
             )}
           </div>
         </Section>
-      </aside>
+        )}
+      </div>
     </div>
   );
 }

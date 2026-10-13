@@ -408,6 +408,12 @@ fn scene_delete(state: State<'_, AppState>, scene_id: String) -> CmdResult<()> {
     lock(&state)?.scene_delete(&scene_id).map_err(ue)
 }
 
+/// Moves a scene in the list.
+#[tauri::command(async, rename_all = "snake_case")]
+fn scene_move(state: State<'_, AppState>, scene_id: String, to: usize) -> CmdResult<()> {
+    lock(&state)?.scene_move(&scene_id, to).map_err(ue)
+}
+
 /// Duplicates a production scene (fresh source ids + engine inputs).
 #[tauri::command(async, rename_all = "snake_case")]
 fn scene_duplicate(state: State<'_, AppState>, scene_id: String) -> CmdResult<ProdScene> {
@@ -1066,6 +1072,7 @@ fn main() {
             mixer_set_trim,
             audio_meters,
             source_set_locked,
+            scene_move,
             source_duplicate,
             mixer_set_master_gain,
             mixer_set_master_mute,
