@@ -81,3 +81,48 @@ jobs:
           name: backend-test-log
           path: backend-test.log
           if-no-files-found: ignore
+
+  bench:
+    # CPU of a still scene (colour + image + text) before (v0.1.28) and
+    # after, same benchmark, same runner, software GPU.
+    runs-on: ubuntu-24.04
+    env:
+      CARGO_TERM_COLOR: never
+      VK_ICD_FILENAMES: /usr/share/vulkan/icd.d/lvp_icd.x86_64.json
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: System libraries
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends pkg-config clang libclang-dev \
+            libavcodec-dev libavformat-dev libavutil-dev libswscale-dev libswresample-dev \
+            libavdevice-dev libavfilter-dev mesa-vulkan-drivers libvulkan1 libasound2-dev ffmpeg
+      - uses: dtolnay/rust-toolchain@stable
+      - name: This build — still scene
+        run: |
+          for sc in static idle; do
+            BENCH_SECS=90 BENCH_SCENARIO=$sc BENCH_MONITOR_PX=590 BENCH_OUT=$GITHUB_WORKSPACE/new_$sc.csv \
+              cargo test -p sf-ui-backend --release --test bench_longrun -- --ignored --nocapture
+          done
+      - name: v0.1.28 — same benchmark
+        run: |
+          git worktree add ../old 5acb46c
+          cp apps/desktop/backend/tests/bench_longrun.rs ../old/apps/desktop/backend/tests/bench_longrun.rs
+          cd ../old
+          for sc in static idle; do
+            BENCH_SECS=90 BENCH_SCENARIO=$sc BENCH_MONITOR_PX=590 BENCH_OUT=$GITHUB_WORKSPACE/old_$sc.csv \
+              cargo test -p sf-ui-backend --release --test bench_longrun -- --ignored --nocapture
+          done
+      - name: Summary
+        run: |
+          for f in old_static new_static old_idle new_idle; do
+            echo "== $f"; cat $f.csv
+            awk -F, 'NR>2 {c+=$2; t+=$6; n++} END {printf "AVG cpu=%.1f%% tick_ms=%.2f (n=%d)\n", c/n, t/n, n}' $f.csv
+          done
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: bench
+          path: "*.csv"

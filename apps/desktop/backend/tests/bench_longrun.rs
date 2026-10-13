@@ -11,6 +11,8 @@
 //! not level off is a leak.
 //!
 //! Scenarios: `idle` = one test signal (the reporting user's screen);
+//! `static` = colour background + PNG + text (nothing moves — the v0.1.28
+//! report's screenshot);
 //! `busy` = 720p video file (with audio) + test-signal PiP + PNG logo +
 //! text, a second scene in preview, and a 20 s simulated PiP drag.
 //! `BENCH_MONITOR_PX` = drawn monitor width the UI reports (omit = default).
@@ -56,11 +58,28 @@ fn cache_bytes(s: &Shell) -> u64 {
 #[ignore]
 fn longrun_resources() {
     let secs: u64 = std::env::var("BENCH_SECS").ok().and_then(|v| v.parse().ok()).unwrap_or(120);
-    let busy = std::env::var("BENCH_SCENARIO").map(|v| v == "busy").unwrap_or(false);
+    let scenario = std::env::var("BENCH_SCENARIO").unwrap_or_else(|_| "idle".into());
+    let busy = scenario == "busy";
+    let still = scenario == "static";
     let out = std::env::var("BENCH_OUT").ok();
     let mut s = Shell::new().expect("engine");
     let a = s.scene_create("A").id;
-    let pat = s.source_add(&a, "test_pattern", "Test", [0; 3], None, None, None, None, 0, 0, 0).unwrap();
+    if still {
+        s.source_add(&a, "color", "Blue", [0, 115, 255], None, None, None, None, 0, 0, 0).unwrap();
+        let png = tmp("sf-bench-still.png");
+        let mut px = vec![0u8; 400 * 300 * 4];
+        for (i, p) in px.chunks_exact_mut(4).enumerate() {
+            p.copy_from_slice(&[(i % 400) as u8, 120, 200, 255]);
+        }
+        image::save_buffer(&png, &px, 400, 300, image::ExtendedColorType::Rgba8).unwrap();
+        s.source_add(&a, "image", "download.png", [0; 3], None, Some(&png), None, None, 0, 0, 0).unwrap();
+        s.source_add(&a, "text", "Title", [0; 3], Some("StreamFlow"), None, None, None, 0, 0, 0).unwrap();
+    }
+    let pat = if still {
+        s.scene_list().into_iter().find(|x| x.id == a).unwrap().sources[0].clone()
+    } else {
+        s.source_add(&a, "test_pattern", "Test", [0; 3], None, None, None, None, 0, 0, 0).unwrap()
+    };
     let mut b_scene = None;
     if busy {
         let media = tmp("sf-bench-720p.mp4");
@@ -100,7 +119,7 @@ fn longrun_resources() {
     let late = Arc::new(AtomicU64::new(0));
     let tick_us = Arc::new(AtomicU64::new(0));
     let ui_us = Arc::new(AtomicU64::new(0));
-    println!("scenario {} for {secs}s", if busy { "busy" } else { "idle" });
+    println!("scenario {scenario} for {secs}s");
 
     // Media tick: same absolute-deadline clock as the app.
     let tick_thread = {
@@ -134,6 +153,7 @@ fn longrun_resources() {
         std::thread::spawn(move || {
             let start = Instant::now();
             let mut n = 0u64;
+            let mut last_seq = 0u64;
             while !stop.load(Ordering::Relaxed) {
                 let t0 = Instant::now();
                 let frame = {
@@ -141,7 +161,10 @@ fn longrun_resources() {
                     let prog = g.production_state().program_scene_id.clone();
                     g.monitor_snapshot(&prog).ok()
                 };
-                if let Some(f) = frame {
+                // Like `monitor_frame_if_new`: only a new frame is encoded
+                // and sent.
+                if let Some(f) = frame.filter(|f| f.seq > last_seq) {
+                    last_seq = f.seq;
                     let _ = f.to_jpeg();
                 }
                 let _ = lock(&shell).audio_meters();
