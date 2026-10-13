@@ -63,71 +63,29 @@ unsafe extern "C" fn log_capture_cb(
     }
 }
 
+/// Serializes device enumeration. The listing captures FFmpeg's *global*
+/// log callback; two concurrent listings (the UI asks for cameras and
+/// microphones at the same time) would clear each other's capture and
+/// return empty lists.
+static ENUM_LOCK: Mutex<()> = Mutex::new(());
+
 /// List DirectShow video-capture device names.
 ///
 /// Opens the dshow input with `list_devices=1`, which makes FFmpeg print
 /// the devices and fail; we capture the log and parse the quoted names.
 pub fn list_devices() -> Result<Vec<String>, CaptureError> {
-    ensure_init();
-    let fmt_name = CString::new("dshow").unwrap();
-    let fmt = unsafe { ff::ffi::av_find_input_format(fmt_name.as_ptr()) };
-    if fmt.is_null() {
-        return Err(CaptureError::OpenFailed(
-            "FFmpeg was built without dshow support".into(),
-        ));
-    }
-
-    // Install log capture.
-    {
-        let mut buf = LOG_CAPTURE.lock().unwrap();
-        buf.clear();
-    }
-    unsafe { ff::ffi::av_log_set_callback(Some(log_capture_cb)) };
-
-    let url = CString::new("dummy").unwrap();
-    let mut dict: *mut ff::ffi::AVDictionary = ptr::null_mut();
-    let key = CString::new("list_devices").unwrap();
-    let val = CString::new("1").unwrap();
-    unsafe { ff::ffi::av_dict_set(&mut dict, key.as_ptr(), val.as_ptr(), 0) };
-
-    let mut ctx: *mut ff::ffi::AVFormatContext = ptr::null_mut();
-    let ret = unsafe {
-        ff::ffi::avformat_open_input(
-            &mut ctx,
-            url.as_ptr(),
-            fmt as *mut ff::ffi::AVInputFormat,
-            &mut dict,
-        )
-    };
-    unsafe {
-        ff::ffi::av_dict_free(&mut dict);
-        if !ctx.is_null() {
-            ff::ffi::avformat_close_input(&mut ctx);
-        }
-        // Restore default logging.
-        ff::ffi::av_log_set_callback(None);
-    }
-    // `list_devices` always "fails" the open — that is expected.
-    let _ = ret;
-
-    let buf = LOG_CAPTURE.lock().unwrap().clone();
-    Ok(parse_dshow_devices(&buf, "(video)"))
+    Ok(parse_dshow_devices(&list_devices_raw()?, "(video)"))
 }
 
 /// List DirectShow audio-capture device names (microphones, line-in, etc.).
 pub fn list_audio_devices() -> Result<Vec<String>, CaptureError> {
-    // Reuse the same enumeration: trigger list_devices and parse audio entries.
-    // We call the internal list to avoid duplicating the FFmpeg dance.
-    let buf = {
-        // Run the device listing (same as list_devices but we parse audio).
-        list_devices_raw()?
-    };
-    Ok(parse_dshow_devices(&buf, "(audio)"))
+    Ok(parse_dshow_devices(&list_devices_raw()?, "(audio)"))
 }
 
 /// Run the dshow device listing and return the raw captured log.
 fn list_devices_raw() -> Result<String, CaptureError> {
     ensure_init();
+    let _guard = ENUM_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let fmt_name = CString::new("dshow").unwrap();
     let fmt = unsafe { ff::ffi::av_find_input_format(fmt_name.as_ptr()) };
     if fmt.is_null() {
@@ -135,10 +93,7 @@ fn list_devices_raw() -> Result<String, CaptureError> {
             "FFmpeg was built without dshow support".into(),
         ));
     }
-    {
-        let mut buf = LOG_CAPTURE.lock().unwrap();
-        buf.clear();
-    }
+    LOG_CAPTURE.lock().unwrap_or_else(|e| e.into_inner()).clear();
     unsafe { ff::ffi::av_log_set_callback(Some(log_capture_cb)) };
     let url = CString::new("dummy").unwrap();
     let mut dict: *mut ff::ffi::AVDictionary = ptr::null_mut();
@@ -146,7 +101,8 @@ fn list_devices_raw() -> Result<String, CaptureError> {
     let val = CString::new("1").unwrap();
     unsafe { ff::ffi::av_dict_set(&mut dict, key.as_ptr(), val.as_ptr(), 0) };
     let mut ctx: *mut ff::ffi::AVFormatContext = ptr::null_mut();
-    let ret = unsafe {
+    // `list_devices` always "fails" the open — that is expected.
+    let _ = unsafe {
         ff::ffi::avformat_open_input(
             &mut ctx,
             url.as_ptr(),
@@ -159,10 +115,11 @@ fn list_devices_raw() -> Result<String, CaptureError> {
         if !ctx.is_null() {
             ff::ffi::avformat_close_input(&mut ctx);
         }
-        ff::ffi::av_log_set_callback(None);
+        // Restore FFmpeg's default logger (None would silence all FFmpeg
+        // logging for the rest of the session).
+        ff::ffi::av_log_set_callback(Some(ff::ffi::av_log_default_callback));
     }
-    let _ = ret;
-    Ok(LOG_CAPTURE.lock().unwrap().clone())
+    Ok(LOG_CAPTURE.lock().unwrap_or_else(|e| e.into_inner()).clone())
 }
 
 /// Parse dshow device names from captured log output.

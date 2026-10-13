@@ -94,6 +94,7 @@ fn deleting_program_scene_falls_back_sanely() {
 // ---------------------------------------------------------------------------
 
 #[test]
+#[cfg_attr(windows, ignore = "adds a camera source; on Windows this opens a real DirectShow device")]
 fn source_crud_reorder_visibility() {
     let mut s = shell();
     let scene = empty_scene(&mut s);
@@ -168,6 +169,7 @@ fn decode_rgba(png: &[u8]) -> Vec<u8> {
 }
 
 #[test]
+#[cfg_attr(windows, ignore = "adds a camera source; on Windows this opens a real DirectShow device")]
 fn scene_render_returns_valid_nonblank_png_via_real_pipeline() {
     let mut s = shell();
     let scene = empty_scene(&mut s);
@@ -644,6 +646,7 @@ fn camera_reconfigure_updates_kind_and_lists_sources() {
 }
 
 #[test]
+#[cfg_attr(windows, ignore = "adds a camera source; on Windows this opens a real DirectShow device")]
 fn camera_auto_audio_attaches() {
     let mut s = shell();
     let scene = s.scene_create("S").id;
