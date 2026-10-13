@@ -273,9 +273,25 @@ All pass. The frontend type-checks against the real React 19 types.
 
 ---
 
-## 10. Not verified here (honest)
+## 10. Windows CI (GitHub's Windows Server 2022 runner)
 
-- **No Windows hardware:**
+The repository's Windows workflow was run on this branch. It builds the
+real Tauri app (NSIS + MSI installers, portable exe) and runs the whole
+workspace test suite on Windows with FFmpeg 6.1.1 and Microsoft's
+software GPU (WARP):
+
+- **363 tests pass on Windows**, including the live-capture backlog tests,
+  the end-to-end RTMP stream + late-joining recording, the A/V aligner
+  and every GPU color test.
+- Windows-only issues found and fixed through it: DirectShow device
+  enumeration was not safe to call concurrently (now serialized); tests
+  that used `/tmp`, fake device names or Linux timing were made portable.
+- The runner has no camera, microphone or NVIDIA/Intel/AMD GPU, so those
+  still need the real PC.
+
+## 11. Not verified here (honest)
+
+- **No Windows capture hardware** (the Windows build and test suite *do* run in CI, see §10):
   - DirectShow cameras, capture cards and microphones.
   - NVENC / QSV / AMF option acceptance.
   - Real YouTube / Facebook / TikTok ingest.

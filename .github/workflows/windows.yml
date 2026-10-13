@@ -62,6 +62,9 @@ jobs:
         # Results are surfaced as annotations (visible on the run page and
         # via the API) so failures are visible without downloading logs.
         run: |
+          # The LUT integration test runs the gen-lut binary of another
+          # workspace package, which `cargo test` does not build.
+          cmd /c "cargo build -p gen-lut > build-genlut.log 2>&1"
           cmd /c "cargo test --workspace --no-fail-fast > test.log 2>&1"
           $code = $LASTEXITCODE
           $results = Select-String -Path test.log -Pattern '^test result:' | ForEach-Object { $_.Line }
