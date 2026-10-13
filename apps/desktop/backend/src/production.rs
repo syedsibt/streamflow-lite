@@ -99,6 +99,12 @@ pub enum SourceKind {
         /// Text content.
         text: String,
     },
+    /// Still image (PNG / JPEG / WebP / BMP …): logo, watermark, overlay,
+    /// background. Decoded once; transparency preserved. Not a video.
+    Image {
+        /// File path.
+        path: String,
+    },
 }
 
 impl SourceKind {
@@ -111,6 +117,7 @@ impl SourceKind {
             SourceKind::TestPattern
             | SourceKind::Color { .. }
             | SourceKind::Media { .. }
+            | SourceKind::Image { .. }
             | SourceKind::Text { .. } => true,
             #[cfg(any(windows, sf_wincheck))]
             SourceKind::Camera { .. } => true,
@@ -166,6 +173,9 @@ pub struct SourceState {
     /// Position / size / crop in the canvas. `None` = full frame.
     #[serde(default)]
     pub transform: Option<SourceTransform>,
+    /// Locked: position/size/crop can't be changed (layouts skip it).
+    #[serde(default)]
+    pub locked: bool,
 }
 
 /// How a source fills its box when the aspect ratios differ.
@@ -202,6 +212,9 @@ pub struct SourceTransform {
     pub fit: FitMode,
     #[serde(default = "one")]
     pub opacity: f32,
+    /// Clockwise rotation in degrees around the box centre.
+    #[serde(default)]
+    pub rotation: f32,
 }
 
 fn one() -> f32 {
@@ -220,6 +233,7 @@ impl SourceTransform {
         crop_bottom: 0.0,
         fit: FitMode::Fill,
         opacity: 1.0,
+        rotation: 0.0,
     };
 
     pub fn rect(x: f32, y: f32, w: f32, h: f32) -> Self {
@@ -233,6 +247,7 @@ impl SourceTransform {
         z(self.x) && z(self.y) && z(self.w - 1.0) && z(self.h - 1.0)
             && z(self.crop_left) && z(self.crop_top) && z(self.crop_right) && z(self.crop_bottom)
             && z(self.opacity - 1.0)
+            && z(self.rotation)
     }
 
     /// Clamped copy (box inside a sane range, crop leaves ≥ 2 % visible).
@@ -247,6 +262,12 @@ impl SourceTransform {
         self.crop_top = f(self.crop_top, 0.0, 0.98);
         self.crop_bottom = f(self.crop_bottom, 0.0, 0.98 - self.crop_top);
         self.opacity = f(self.opacity, 0.0, 1.0);
+        self.rotation = if self.rotation.is_finite() {
+            let r = self.rotation.rem_euclid(360.0);
+            if r > 180.0 { r - 360.0 } else { r }
+        } else {
+            0.0
+        };
         self
     }
 }
@@ -319,6 +340,72 @@ pub(crate) fn placement(t: &SourceTransform, canvas_w: u32, canvas_h: u32, src_w
         sh: scale_h.round() as u32,
         ox: (l * scale_w).round() as i64,
         oy: (tp * scale_h).round() as i64,
+    }
+}
+
+/// Rotated placement: every canvas pixel inside the rotated content box
+/// samples the content bilinearly (straight alpha), then blends "over".
+pub(crate) fn blit_rotated(canvas: &mut [u8], w: u32, h: u32, src: &[u8], p: &Placement, opacity: f32, rotation_deg: f32) {
+    let (sw, sh) = (p.sw as i64, p.sh as i64);
+    if src.len() < (sw * sh * 4) as usize || w == 0 || h == 0 {
+        return;
+    }
+    let (cw, ch) = (p.cw as f32, p.ch as f32);
+    let (mx, my) = (p.cx as f32 + cw / 2.0, p.cy as f32 + ch / 2.0);
+    let (sin, cos) = rotation_deg.to_radians().sin_cos();
+    // Bounding box of the rotated rectangle.
+    let ex = (cw / 2.0 * cos).abs() + (ch / 2.0 * sin).abs();
+    let ey = (cw / 2.0 * sin).abs() + (ch / 2.0 * cos).abs();
+    let x0 = ((mx - ex).floor() as i64).max(0);
+    let x1 = ((mx + ex).ceil() as i64).min(w as i64);
+    let y0 = ((my - ey).floor() as i64).max(0);
+    let y1 = ((my + ey).ceil() as i64).min(h as i64);
+    let op = opacity.clamp(0.0, 1.0);
+    let sample = |sx: f32, sy: f32| -> Option<[f32; 4]> {
+        let fx = sx - 0.5;
+        let fy = sy - 0.5;
+        let ix = fx.floor() as i64;
+        let iy = fy.floor() as i64;
+        let (tx, ty) = (fx - ix as f32, fy - iy as f32);
+        let mut acc = [0f32; 4];
+        let mut any = false;
+        for (dy, wy) in [(0, 1.0 - ty), (1, ty)] {
+            for (dx, wx) in [(0, 1.0 - tx), (1, tx)] {
+                let (xx, yy) = ((ix + dx).clamp(0, sw - 1), (iy + dy).clamp(0, sh - 1));
+                let wgt = wx * wy;
+                let i = ((yy * sw + xx) * 4) as usize;
+                let a = src[i + 3] as f32 / 255.0;
+                for c in 0..3 {
+                    acc[c] += src[i + c] as f32 * a * wgt;
+                }
+                acc[3] += a * wgt;
+                any = true;
+            }
+        }
+        any.then_some(acc)
+    };
+    for y in y0..y1 {
+        for x in x0..x1 {
+            // Inverse-rotate the pixel centre into the content box.
+            let (dx, dy) = (x as f32 + 0.5 - mx, y as f32 + 0.5 - my);
+            let u = dx * cos + dy * sin + cw / 2.0;
+            let v = -dx * sin + dy * cos + ch / 2.0;
+            if u < 0.0 || v < 0.0 || u >= cw || v >= ch {
+                continue;
+            }
+            let Some(acc) = sample(p.ox as f32 + u, p.oy as f32 + v) else { continue };
+            let a = acc[3] * op;
+            if a <= 0.0 {
+                continue;
+            }
+            let i = ((y * w as i64 + x) * 4) as usize;
+            let d = &mut canvas[i..i + 4];
+            for c in 0..3 {
+                let sc = acc[c] / acc[3].max(1e-6);
+                d[c] = (sc * a + d[c] as f32 * (1.0 - a)).round().clamp(0.0, 255.0) as u8;
+            }
+            d[3] = d[3].max((a * 255.0).round() as u8);
+        }
     }
 }
 
@@ -464,10 +551,20 @@ pub fn transition_progress(elapsed_ms: u64, duration_ms: u64) -> f32 {
 /// One mixer channel strip.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ChannelStrip {
-    /// Linear gain `0.0..=2.0`.
+    /// Linear gain `0.0..=2.0` (the fader).
     pub gain: f32,
     /// Mute flag.
     pub mute: bool,
+    /// Balance `-1.0` (left) … `1.0` (right).
+    #[serde(default)]
+    pub pan: f32,
+    /// Solo: the local monitor (speakers/headphones) plays only soloed
+    /// channels. The program mix (stream/record) is never affected.
+    #[serde(default)]
+    pub solo: bool,
+    /// Input trim in dB (`-20..=20`), before the fader.
+    #[serde(default)]
+    pub trim_db: f32,
 }
 
 impl Default for ChannelStrip {
@@ -475,8 +572,47 @@ impl Default for ChannelStrip {
         Self {
             gain: 1.0,
             mute: false,
+            pan: 0.0,
+            solo: false,
+            trim_db: 0.0,
         }
     }
+}
+
+/// Balance (pan) + trim on an interleaved stereo block, in place.
+pub(crate) fn apply_trim_pan(block: &mut [f32], trim_db: f32, pan: f32) {
+    let trim = 10f32.powf(trim_db.clamp(-20.0, 20.0) / 20.0);
+    let pan = pan.clamp(-1.0, 1.0);
+    let (l, r) = (trim * (1.0 - pan).min(1.0), trim * (1.0 + pan).min(1.0));
+    if (l - 1.0).abs() < 1e-6 && (r - 1.0).abs() < 1e-6 {
+        return;
+    }
+    for fr in block.chunks_exact_mut(2) {
+        fr[0] *= l;
+        fr[1] *= r;
+    }
+}
+
+/// Live meters (polled at display rate): peak held since the previous
+/// read, so short transients are never missed between polls.
+#[derive(Clone, Debug, Default, Serialize)]
+pub struct AudioMetersView {
+    pub channels: Vec<ChannelMeterView>,
+    pub master_peak: f32,
+    pub master_rms: f32,
+    /// True while any channel is soloed (monitor = solo bus).
+    pub solo_active: bool,
+}
+
+#[derive(Clone, Debug, Default, Serialize)]
+pub struct ChannelMeterView {
+    pub id: String,
+    /// Max |sample| since the last read, post-fader, linear.
+    pub peak: f32,
+    /// RMS of the latest block, post-fader, linear.
+    pub rms: f32,
+    /// The channel has an audio stream (live input or file with audio).
+    pub has_signal_path: bool,
 }
 
 /// Mixer state: master strip + one strip per source id.
@@ -1082,6 +1218,7 @@ impl Shell {
                 input_id,
                 status: s.kind.status().to_string(),
                 transform: s.transform,
+                locked: s.locked,
             });
         }
         self.scenes.push(dup.clone());
@@ -1202,6 +1339,9 @@ fn parse_source_kind(
         "media" => Ok(SourceKind::Media {
             path: path.unwrap_or("").to_string(),
         }),
+        "image" => Ok(SourceKind::Image {
+            path: path.unwrap_or("").to_string(),
+        }),
         "text" => Ok(SourceKind::Text {
             text: text.unwrap_or("").to_string(),
         }),
@@ -1290,6 +1430,21 @@ impl Shell {
         if let SourceKind::Media { path } = &kind {
             self.open_media_producer(&id, path)?;
         }
+        // Images load (and fail) up front; they start at their native
+        // pixel size relative to the output, centred.
+        let mut transform = None;
+        if let SourceKind::Image { path } = &kind {
+            let img = self.load_image(path)?;
+            let (ow, oh) = (self.video_settings.output_width.max(1) as f32, self.video_settings.output_height.max(1) as f32);
+            let (w, h) = (img.width as f32 / ow, img.height as f32 / oh);
+            let k = (1.0 / w.max(h)).min(1.0);
+            let (w, h) = (w * k, h * k);
+            let t = SourceTransform {
+                fit: FitMode::Fit,
+                ..SourceTransform::rect((1.0 - w) / 2.0, (1.0 - h) / 2.0, w, h)
+            };
+            transform = (!t.is_full()).then_some(t);
+        }
         #[cfg(any(windows, sf_wincheck))]
         if let SourceKind::Camera {
             device,
@@ -1333,7 +1488,8 @@ impl Shell {
             visible: true,
             order,
             input_id: input_id.clone(),
-            transform: None,
+            transform,
+            locked: false,
         };
         // End the scene borrow before touching the engine/mixer.
         self.find_scene_mut(scene_id)
@@ -1468,6 +1624,110 @@ impl Shell {
 }
 
 impl Shell {
+    /// Loads (once per path) a still image for an Image source.
+    pub(crate) fn load_image(&mut self, path: &str) -> Result<std::sync::Arc<sf_capture::still_image::StillImage>, ShellError> {
+        if let Some(img) = self.image_cache.get(path) {
+            return Ok(img.clone());
+        }
+        if path.trim().is_empty() {
+            return Err(ShellError::Capture("no image selected — pick a PNG, JPG or WebP file".into()));
+        }
+        let img = sf_capture::still_image::decode_image_rgba(path)
+            .map_err(|e| ShellError::Capture(e.to_string()))?;
+        let img = std::sync::Arc::new(img);
+        self.image_cache.insert(path.to_string(), img.clone());
+        Ok(img)
+    }
+
+    /// The image at `w`×`h` (premultiplied-alpha resize, cached per size).
+    pub(crate) fn image_pixels(&mut self, path: &str, w: u32, h: u32) -> Option<std::sync::Arc<Vec<u8>>> {
+        let key = (path.to_string(), w, h);
+        if let Some(px) = self.image_sized.get(&key) {
+            return Some(px.clone());
+        }
+        let img = self.load_image(path).ok()?;
+        let px = if img.width == w && img.height == h {
+            img.data.clone()
+        } else {
+            sf_capture::still_image::resize_rgba_premultiplied(&img.data, img.width, img.height, w, h)
+        };
+        if self.image_sized.len() >= 32 {
+            self.image_sized.clear();
+        }
+        let px = std::sync::Arc::new(px);
+        self.image_sized.insert(key, px.clone());
+        Some(px)
+    }
+
+    /// Locks / unlocks a source's placement.
+    pub fn source_set_locked(&mut self, scene_id: &str, source_id: &str, locked: bool) -> Result<SourceState, ShellError> {
+        let scene = self
+            .find_scene_mut(scene_id)
+            .ok_or_else(|| ShellError::UnknownScene(scene_id.to_string()))?;
+        let src = scene
+            .sources
+            .iter_mut()
+            .find(|s| s.id == source_id)
+            .ok_or_else(|| ShellError::UnknownSource(source_id.to_string()))?;
+        src.locked = locked;
+        let src = src.clone();
+        self.events.push_back(UiEvent::SourceChanged { scene_id: scene_id.to_string() });
+        Ok(src)
+    }
+
+    /// Duplicates a source inside its scene (placed on top, nudged 3 %).
+    /// Cameras / screens / files share the original capture; the grade and
+    /// filters are copied.
+    pub fn source_duplicate(&mut self, scene_id: &str, source_id: &str) -> Result<SourceState, ShellError> {
+        let orig = self
+            .find_scene(scene_id)
+            .ok_or_else(|| ShellError::UnknownScene(scene_id.to_string()))?
+            .sources
+            .iter()
+            .find(|s| s.id == source_id)
+            .cloned()
+            .ok_or_else(|| ShellError::UnknownSource(source_id.to_string()))?;
+        if matches!(orig.kind, SourceKind::AudioInput { .. }) {
+            return Err(ShellError::InvalidSetting("a microphone can't be duplicated — add it once and adjust it in the mixer".into()));
+        }
+        let id = Uuid::new_v4().to_string();
+        if matches!(orig.kind, SourceKind::Camera { .. } | SourceKind::Screen | SourceKind::Media { .. }) {
+            let owner = self.frame_owner(&orig.id).to_string();
+            self.producer_alias.insert(id.clone(), owner);
+        }
+        let input_id = orig.input_id.as_ref().map(|_| source_input_id(&id));
+        let order = self.find_scene(scene_id).map(|s| s.sources.len() as u32).unwrap_or(0);
+        let transform = orig.transform.map(|mut t| {
+            t.x += 0.03;
+            t.y += 0.03;
+            t
+        });
+        let dup = SourceState {
+            id: id.clone(),
+            name: format!("{} copy", orig.name),
+            kind: orig.kind.clone(),
+            visible: orig.visible,
+            order,
+            input_id: input_id.clone(),
+            status: orig.status.clone(),
+            transform,
+            locked: false,
+        };
+        if let (Some(new_in), Some(old_in)) = (&input_id, &orig.input_id) {
+            let st = self.engine.state_mut();
+            st.add_input(new_in, &dup.name);
+            let copied = st.inputs.iter().find(|i| &i.id == old_in).map(|i| (i.color.clone(), i.filters.clone()));
+            if let (Some((color, filters)), Some(n)) = (copied, st.inputs.iter_mut().find(|i| &i.id == new_in)) {
+                n.color = color;
+                n.filters = filters;
+            }
+        }
+        self.mixer.channels.insert(id, ChannelStrip::default());
+        self.find_scene_mut(scene_id).expect("scene exists").sources.push(dup.clone());
+        self.events.push_back(UiEvent::SourceChanged { scene_id: scene_id.to_string() });
+        Ok(dup)
+    }
+
     /// Places a source in the canvas (`None` = full frame).
     pub fn source_set_transform(
         &mut self,
@@ -1483,6 +1743,9 @@ impl Shell {
             .iter_mut()
             .find(|s| s.id == source_id)
             .ok_or_else(|| ShellError::UnknownSource(source_id.to_string()))?;
+        if src.locked {
+            return Err(ShellError::InvalidSetting(format!("'{}' is locked — unlock it to move or resize", src.name)));
+        }
         src.transform = transform.map(|t| t.sanitized()).filter(|t| !t.is_full());
         let src = src.clone();
         self.events.push_back(UiEvent::SourceChanged {
@@ -1506,6 +1769,7 @@ impl Shell {
             .iter_mut()
             .filter(|s| {
                 s.visible
+                    && !s.locked
                     && matches!(
                         s.kind,
                         SourceKind::Camera { .. } | SourceKind::Screen | SourceKind::Media { .. } | SourceKind::TestPattern
@@ -1715,14 +1979,19 @@ impl Shell {
                             Some(sz) => sz,
                             None => continue,
                         }
+                    } else if let SourceKind::Image { path } = &src.kind {
+                        match self.image_cache.get(path) {
+                            Some(img) => (img.width, img.height),
+                            None => continue,
+                        }
                     } else {
                         (w, h)
                     };
-                    Some((placement(&t, w, h, nw, nh), t.opacity))
+                    Some((placement(&t, w, h, nw, nh), t.opacity, t.rotation))
                 }
                 None => None,
             };
-            let (pw, ph) = place.map_or((w, h), |(p, _)| (p.sw, p.sh));
+            let (pw, ph) = place.map_or((w, h), |(p, _, _)| (p.sw, p.sh));
             let pixels: std::sync::Arc<Vec<u8>> = match &src.kind {
                 SourceKind::Media { .. } | SourceKind::Camera { .. } | SourceKind::Screen => {
                     // The tick's cached frame (one pull per source per
@@ -1735,6 +2004,10 @@ impl Shell {
                 SourceKind::Text { text } => {
                     std::sync::Arc::new(self.text_pixels(&src.id, text, pw, ph))
                 }
+                SourceKind::Image { path } => match self.image_pixels(path, pw, ph) {
+                    Some(px) => px,
+                    None => continue,
+                },
                 SourceKind::TestPattern => std::sync::Arc::new(self.test_pattern.frame(
                     pw,
                     ph,
@@ -1746,10 +2019,16 @@ impl Shell {
             let g0 = std::time::Instant::now();
             let frame = self.engine.grade_input_frame(input_id, pw, ph, &pixels)?;
             self.perf_gpu_us_accum += g0.elapsed().as_micros() as u64;
-            if let Some((p, opacity)) = place {
+            if let Some((p, opacity, rotation)) = place {
                 let base = canvas.get_or_insert_with(|| vec![0u8; w as usize * h as usize * 4]);
-                let opaque = is_capture || matches!(src.kind, SourceKind::TestPattern | SourceKind::Color { .. });
-                blit_placed(base, w, h, &frame.pixels, &p, opacity, opaque);
+                let opaque = is_capture
+                    || matches!(src.kind, SourceKind::TestPattern | SourceKind::Color { .. })
+                    || matches!(&src.kind, SourceKind::Image { path } if self.image_cache.get(path).is_some_and(|i| !i.has_alpha));
+                if rotation.abs() > 0.01 {
+                    blit_rotated(base, w, h, &frame.pixels, &p, opacity, rotation);
+                } else {
+                    blit_placed(base, w, h, &frame.pixels, &p, opacity, opaque);
+                }
                 if let Some(mode) = self.studio_watching(input_id) {
                     let raw = (mode != crate::color_library::PreviewMode::After).then(|| Frame {
                         width: pw,
@@ -2022,6 +2301,61 @@ impl Shell {
         let strip = strip.clone();
         self.events.push_back(UiEvent::MixerChanged);
         Ok(strip)
+    }
+
+    /// Balance `-1..=1`.
+    pub fn mixer_set_pan(&mut self, source_id: &str, pan: f32) -> Result<ChannelStrip, ShellError> {
+        let strip = self.mixer.channels.get_mut(source_id).ok_or_else(|| ShellError::UnknownSource(source_id.to_string()))?;
+        strip.pan = if pan.is_finite() { pan.clamp(-1.0, 1.0) } else { 0.0 };
+        let strip = strip.clone();
+        self.events.push_back(UiEvent::MixerChanged);
+        Ok(strip)
+    }
+
+    /// Solo (local monitor only).
+    pub fn mixer_set_solo(&mut self, source_id: &str, solo: bool) -> Result<ChannelStrip, ShellError> {
+        let strip = self.mixer.channels.get_mut(source_id).ok_or_else(|| ShellError::UnknownSource(source_id.to_string()))?;
+        strip.solo = solo;
+        let strip = strip.clone();
+        self.events.push_back(UiEvent::MixerChanged);
+        Ok(strip)
+    }
+
+    /// Input trim in dB, `-20..=20`.
+    pub fn mixer_set_trim(&mut self, source_id: &str, trim_db: f32) -> Result<ChannelStrip, ShellError> {
+        let strip = self.mixer.channels.get_mut(source_id).ok_or_else(|| ShellError::UnknownSource(source_id.to_string()))?;
+        strip.trim_db = if trim_db.is_finite() { trim_db.clamp(-20.0, 20.0) } else { 0.0 };
+        let strip = strip.clone();
+        self.events.push_back(UiEvent::MixerChanged);
+        Ok(strip)
+    }
+
+    /// Live meters since the previous call (resets the peak hold).
+    pub fn audio_meters(&mut self) -> AudioMetersView {
+        let paths: std::collections::HashSet<&String> = self
+            .audio_inputs
+            .keys()
+            .chain(self.media_producers.iter().filter(|(_, p)| sf_capture::FrameProducer::stream_info(&p.0).has_audio).map(|(id, _)| id))
+            .collect();
+        let mut channels: Vec<ChannelMeterView> = self
+            .mixer
+            .channels
+            .keys()
+            .map(|id| {
+                let (peak, rms) = self.meter_hold.get(id).copied().unwrap_or((0.0, 0.0));
+                ChannelMeterView { id: id.clone(), peak, rms, has_signal_path: paths.contains(id) }
+            })
+            .collect();
+        channels.sort_by(|a, b| a.id.cmp(&b.id));
+        let (master_peak, master_rms) = self.master_meter_hold;
+        self.meter_hold.clear();
+        self.master_meter_hold = (0.0, master_rms);
+        AudioMetersView {
+            channels,
+            master_peak,
+            master_rms,
+            solo_active: self.mixer.channels.values().any(|c| c.solo),
+        }
     }
 
     /// Mutes/unmutes a source channel.
@@ -2499,6 +2833,16 @@ mod transition_tests {
         assert_eq!(w.pixels[3 * 4], 200, "right of the edge still shows the outgoing scene");
         assert_eq!(TransitionKind::parse("wipe"), Some(TransitionKind::Wipe));
         assert_eq!(TransitionKind::parse("x"), None);
+    }
+
+    #[test]
+    fn pan_and_trim() {
+        let mut b = vec![0.5f32; 8];
+        apply_trim_pan(&mut b, 0.0, -1.0);
+        assert_eq!((b[0], b[1]), (0.5, 0.0), "hard left silences the right channel");
+        let mut b = vec![0.5f32; 8];
+        apply_trim_pan(&mut b, 6.0, 0.0);
+        assert!((b[0] - 0.5 * 10f32.powf(0.3)).abs() < 1e-4, "+6 dB trim");
     }
 
     #[test]

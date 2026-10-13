@@ -698,3 +698,44 @@ fn duplicated_scene_shares_the_capture() {
     s.source_remove(&b.id, &copy).unwrap();
     assert!(s.diagnostics().sources.is_empty());
 }
+
+/// Live meters: a media file with audio moves its channel meter and the
+/// master; the peak is held until read; solo is reported.
+#[test]
+fn live_meters_peak_hold_and_solo_flag() {
+    let media = &tmp("sf-be-meters.mp4");
+    make_test_media(media);
+    let mut s = shell();
+    let sc = s.scene_create("M").id;
+    let src = s
+        .source_add(&sc, "media", "clip", [0, 0, 0], None, Some(media), None, None, 0, 0, 0)
+        .unwrap();
+    s.production_set_program(&sc).unwrap();
+    for _ in 0..10 {
+        s.av_tick();
+    }
+    let m = s.audio_meters();
+    let ch = m.channels.iter().find(|c| c.id == src.id).expect("channel meter");
+    assert!(ch.has_signal_path);
+    assert!(ch.peak > 0.01, "meter must move: {ch:?}");
+    assert!(m.master_peak > 0.01);
+    // Peak hold resets on read.
+    let again = s.audio_meters();
+    assert!(again.channels.iter().find(|c| c.id == src.id).unwrap().peak <= ch.peak);
+    // Mute → the channel meter drops to zero on the next blocks.
+    s.mixer_set_mute(&src.id, true).unwrap();
+    for _ in 0..3 {
+        s.av_tick();
+    }
+    let _ = s.audio_meters();
+    s.av_tick();
+    let muted = s.audio_meters();
+    assert_eq!(muted.channels.iter().find(|c| c.id == src.id).unwrap().peak, 0.0, "muted channel is silent");
+    s.mixer_set_mute(&src.id, false).unwrap();
+    assert!(!s.audio_meters().solo_active);
+    s.mixer_set_solo(&src.id, true).unwrap();
+    assert!(s.audio_meters().solo_active);
+    // Pan / trim are stored and clamped.
+    assert_eq!(s.mixer_set_pan(&src.id, 3.0).unwrap().pan, 1.0);
+    assert_eq!(s.mixer_set_trim(&src.id, -50.0).unwrap().trim_db, -20.0);
+}

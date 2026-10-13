@@ -23,12 +23,13 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
   let dims = textureDimensions(src_tex);
   if (gid.x >= dims.x || gid.y >= dims.y) { return; }
 
-  var c = max(textureLoad(src_tex, gid.xy, 0).rgb, vec3f(0.0));
+  let px = textureLoad(src_tex, gid.xy, 0);
+  var c = max(px.rgb, vec3f(0.0));
   if (params.transfer > 0.5) {
     c = srgb_oetf(c);
   } else {
     c = pow(c, vec3f(1.0 / 2.4));
   }
   c = clamp(c, vec3f(0.0), vec3f(1.0));
-  textureStore(dst_tex, gid.xy, vec4f(c, 1.0));
+  textureStore(dst_tex, gid.xy, vec4f(c, clamp(px.a, 0.0, 1.0)));
 }

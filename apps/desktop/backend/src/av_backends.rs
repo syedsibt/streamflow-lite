@@ -945,8 +945,35 @@ impl Shell {
             } else {
                 self.audio_bus.pull(id, frames, &mut block);
             }
+            if let Some(strip) = self.mixer.channels.get(id) {
+                crate::production::apply_trim_pan(&mut block, strip.trim_db, strip.pan);
+            }
             blocks.push((id.clone(), block));
         }
+        // Solo bus for the local monitor (AFL: post-fader, ignores mute).
+        let soloed: Vec<(&String, f32)> = self
+            .mixer
+            .channels
+            .iter()
+            .filter(|(_, c)| c.solo)
+            .map(|(id, c)| (id, c.gain))
+            .collect();
+        self.monitor_solo = if soloed.is_empty() {
+            None
+        } else {
+            let mut bus = vec![0f32; frames * 2];
+            for (id, b) in &blocks {
+                if let Some((_, g)) = soloed.iter().find(|(sid, _)| *sid == id) {
+                    for (o, x) in bus.iter_mut().zip(b.iter()) {
+                        *o += x * g;
+                    }
+                }
+            }
+            for o in &mut bus {
+                *o = o.clamp(-1.0, 1.0);
+            }
+            Some(bus)
+        };
         let frames_in: Vec<(&str, AudioFrame)> = blocks
             .iter()
             .map(|(id, b)| (id.as_str(), AudioFrame::new(b, 2, 48_000)))
@@ -954,7 +981,11 @@ impl Shell {
         let mixed = self.audio_mixer.mix(&frames_in);
         for m in &mixed.per_source {
             self.meter_values.insert(m.id.clone(), m.peak);
+            let e = self.meter_hold.entry(m.id.clone()).or_insert((0.0, 0.0));
+            e.0 = e.0.max(m.peak);
+            e.1 = m.rms;
         }
+        self.master_meter_hold = (self.master_meter_hold.0.max(mixed.peak), mixed.rms);
         self.meters_live = true;
         mixed.samples
     }
@@ -1511,9 +1542,12 @@ impl Shell {
         let frames = self.audio_timeline.frames_until(tick_us, first_block);
         let audio = self.pump_audio(frames, tick_us);
         if let Some(monitor) = &self.audio_monitor {
+            // Solo active → the monitor hears the solo bus, never the
+            // program (which still goes to stream/record unchanged).
+            let local = self.monitor_solo.as_deref().unwrap_or(&audio);
             // After a long stall play only the newest 100 ms locally.
-            let keep = audio.len().min(4_800 * 2);
-            monitor.push(&audio[audio.len() - keep..]);
+            let keep = local.len().min(4_800 * 2);
+            monitor.push(&local[local.len() - keep..]);
         }
         let audio_us = t.elapsed().as_micros() as u64;
 

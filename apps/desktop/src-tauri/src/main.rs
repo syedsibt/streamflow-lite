@@ -460,8 +460,9 @@ fn source_add(
 
 /// Lists available camera devices (Windows DirectShow; empty elsewhere).
 #[tauri::command(async, rename_all = "snake_case")]
-fn list_cameras(state: State<'_, AppState>) -> CmdResult<Vec<String>> {
-    lock(&state).map(|s| s.list_cameras())
+fn list_cameras() -> CmdResult<Vec<String>> {
+    // No engine lock: enumeration is slow and must not stall the tick.
+    sf_ui_backend::enumerate_cameras()
 }
 
 /// Negotiated camera format for a source, e.g.
@@ -530,8 +531,8 @@ fn camera_sources(state: State<'_, AppState>) -> CmdResult<Vec<CameraSourceInfo>
 
 /// Lists available audio input devices (Windows DirectShow; empty elsewhere).
 #[tauri::command(async, rename_all = "snake_case")]
-fn list_audio_devices(state: State<'_, AppState>) -> CmdResult<Vec<String>> {
-    lock(&state).map(|s| s.list_audio_devices())
+fn list_audio_devices() -> CmdResult<Vec<String>> {
+    sf_ui_backend::enumerate_audio_devices()
 }
 
 /// Active stream encoder name.
@@ -726,6 +727,42 @@ fn mixer_set_mute(
     lock(&state)?.mixer_set_mute(&source_id, mute).map_err(ue)
 }
 
+/// Balance `-1..=1`.
+#[tauri::command(async, rename_all = "snake_case")]
+fn mixer_set_pan(state: State<'_, AppState>, source_id: String, pan: f32) -> CmdResult<ChannelStrip> {
+    lock(&state)?.mixer_set_pan(&source_id, pan).map_err(ue)
+}
+
+/// Solo (local monitor only; program unaffected).
+#[tauri::command(async, rename_all = "snake_case")]
+fn mixer_set_solo(state: State<'_, AppState>, source_id: String, solo: bool) -> CmdResult<ChannelStrip> {
+    lock(&state)?.mixer_set_solo(&source_id, solo).map_err(ue)
+}
+
+/// Input trim in dB.
+#[tauri::command(async, rename_all = "snake_case")]
+fn mixer_set_trim(state: State<'_, AppState>, source_id: String, trim_db: f32) -> CmdResult<ChannelStrip> {
+    lock(&state)?.mixer_set_trim(&source_id, trim_db).map_err(ue)
+}
+
+/// Live meters (peak since last call + RMS); polled at display rate.
+#[tauri::command(async, rename_all = "snake_case")]
+fn audio_meters(state: State<'_, AppState>) -> CmdResult<sf_ui_backend::AudioMetersView> {
+    Ok(lock(&state)?.audio_meters())
+}
+
+/// Locks / unlocks a source's placement.
+#[tauri::command(async, rename_all = "snake_case")]
+fn source_set_locked(state: State<'_, AppState>, scene_id: String, source_id: String, locked: bool) -> CmdResult<SourceState> {
+    lock(&state)?.source_set_locked(&scene_id, &source_id, locked).map_err(ue)
+}
+
+/// Duplicates a source in its scene (captures are shared, grade copied).
+#[tauri::command(async, rename_all = "snake_case")]
+fn source_duplicate(state: State<'_, AppState>, scene_id: String, source_id: String) -> CmdResult<SourceState> {
+    lock(&state)?.source_duplicate(&scene_id, &source_id).map_err(ue)
+}
+
 /// Sets the master gain (`0.0..=2.0`, clamped).
 #[tauri::command(async, rename_all = "snake_case")]
 fn mixer_set_master_gain(state: State<'_, AppState>, gain: f32) -> CmdResult<ChannelStrip> {
@@ -872,10 +909,12 @@ fn main() {
         .setup(|app| {
             // Record every panic (Diagnostics shows the last one; the log
             // is in the app's log folder) — never a silent dead engine.
-            let log = app.path().app_log_dir().ok().map(|d| {
-                let _ = std::fs::create_dir_all(&d);
-                d.join("streamflow-errors.log")
-            });
+            let log_dir = std::env::var_os("LOCALAPPDATA")
+                .map(std::path::PathBuf::from)
+                .unwrap_or_else(std::env::temp_dir)
+                .join("StreamFlow");
+            let _ = std::fs::create_dir_all(&log_dir);
+            let log = Some(log_dir.join("streamflow-errors.log"));
             sf_ui_backend::health::install_panic_hook(log);
             // Media pipeline: master tick at the Video panel's output fps
             // (30 → 33.3 ms, 60 → 16.7 ms). Renders one program frame and
@@ -901,7 +940,8 @@ fn main() {
                         // even when a tick runs late.
                         let scheduled = sf_ui_backend::media_clock_us(next_deadline);
                         let interval_us = {
-                            let mut s = lock_shell(&media_handle.state::<AppState>().0);
+                            let st = media_handle.state::<AppState>();
+                            let mut s = lock_shell(&st.0);
                             if missed_pending > 0 {
                                 s.perf_mark_lagged(missed_pending);
                                 missed_pending = 0;
@@ -937,7 +977,8 @@ fn main() {
             std::thread::spawn(move || loop {
                 std::thread::sleep(Duration::from_millis(66));
                 let events = {
-                    let mut s = lock_shell(&handle.state::<AppState>().0);
+                    let st = handle.state::<AppState>();
+                    let mut s = lock_shell(&st.0);
                     // Wall-clock transition progress; emits
                     // `production.transition_progress` / `transition_done`.
                     // AV work lives on the media thread above — this loop
@@ -1020,6 +1061,12 @@ fn main() {
             av_sync_set,
             mixer_set_gain,
             mixer_set_mute,
+            mixer_set_pan,
+            mixer_set_solo,
+            mixer_set_trim,
+            audio_meters,
+            source_set_locked,
+            source_duplicate,
             mixer_set_master_gain,
             mixer_set_master_mute,
             set_monitor_enabled,

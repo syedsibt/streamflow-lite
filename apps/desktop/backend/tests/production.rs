@@ -755,3 +755,63 @@ fn layouts_place_video_sources_bottom_first() {
     assert!(s.scene_apply_layout(&scene, "nope").is_err());
     assert_eq!(s.scene_apply_layout(&scene, "full").unwrap(), 2);
 }
+
+/// PNG logo with a transparent border: placed over a red layer, the
+/// transparent part shows red and the opaque part shows the logo.
+#[test]
+fn image_source_overlays_with_transparency() {
+    use sf_ui_backend::SourceTransform;
+    let dir = std::env::temp_dir();
+    let path = dir.join("sf-logo-test.png");
+    // 40x40: transparent, with an opaque blue 20x20 centre.
+    let mut px = vec![0u8; 40 * 40 * 4];
+    for y in 10..30 {
+        for x in 10..30 {
+            px[(y * 40 + x) * 4..(y * 40 + x) * 4 + 4].copy_from_slice(&[0, 0, 255, 255]);
+        }
+    }
+    image::save_buffer(&path, &px, 40, 40, image::ExtendedColorType::Rgba8).unwrap();
+    let mut s = shell();
+    let scene = empty_scene(&mut s);
+    s.source_add(&scene, "color", "Red", [255, 0, 0], None, None, None, None, 0, 0, 0).unwrap();
+    let logo = s
+        .source_add(&scene, "image", "Logo", [0, 0, 0], None, Some(path.to_str().unwrap()), None, None, 0, 0, 0)
+        .expect("image source");
+    assert_eq!(logo.status, "ready");
+    assert!(logo.transform.is_some(), "a small image starts at its native size");
+    // Fill the right half of the canvas with the logo box (square, fit).
+    let mut t = SourceTransform::rect(0.5, 0.0, 0.5, 1.0);
+    t.fit = sf_ui_backend::FitMode::Fit;
+    s.source_set_transform(&scene, &logo.id, Some(t)).unwrap();
+    let px = decode_rgba(&s.scene_render_png(&scene, 160, 90).unwrap());
+    // Logo box: 90x90 centred in the right half → x 115..205 clipped, y 0..90.
+    assert_eq!(px_at(&px, 160, 120, 45), [0, 0, 255], "opaque centre of the logo");
+    assert_eq!(px_at(&px, 160, 121, 3), [255, 0, 0], "transparent border shows the layer below");
+    assert_eq!(px_at(&px, 160, 20, 45), [255, 0, 0], "outside the box");
+
+    // Rotation 45°: the box corner area becomes transparent (red shows).
+    let mut r = SourceTransform::rect(0.25, 0.0, 0.5, 1.0);
+    r.fit = sf_ui_backend::FitMode::Fit;
+    r.rotation = 45.0;
+    s.source_set_transform(&scene, &logo.id, Some(r)).unwrap();
+    let px = decode_rgba(&s.scene_render_png(&scene, 160, 90).unwrap());
+    assert_eq!(px_at(&px, 160, 80, 45), [0, 0, 255], "centre still the logo");
+
+    // Lock: placement edits are refused; unlock allows them again.
+    s.source_set_locked(&scene, &logo.id, true).unwrap();
+    assert!(s.source_set_transform(&scene, &logo.id, None).is_err());
+    s.source_set_locked(&scene, &logo.id, false).unwrap();
+    s.source_set_transform(&scene, &logo.id, None).unwrap();
+
+    // Duplicate: a second independent layer on top.
+    let dup = s.source_duplicate(&scene, &logo.id).unwrap();
+    assert_ne!(dup.id, logo.id);
+    let sc = s.scene_list().into_iter().find(|x| x.id == scene).unwrap();
+    assert_eq!(sc.sources.len(), 3);
+    assert!(sc.sources.iter().find(|x| x.id == dup.id).unwrap().order > logo.order);
+
+    // A missing file fails cleanly.
+    assert!(s
+        .source_add(&scene, "image", "Bad", [0, 0, 0], None, Some("/nope/x.png"), None, None, 0, 0, 0)
+        .is_err());
+}

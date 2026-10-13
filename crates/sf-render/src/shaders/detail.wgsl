@@ -25,12 +25,13 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
   let y0 = select(gid.y, gid.y - 1u, gid.y > 0u);
   let y1 = select(gid.y, gid.y + 1u, gid.y + 1u < dims.y);
 
-  let c = textureLoad(src_tex, gid.xy, 0).rgb;
+  let px = textureLoad(src_tex, gid.xy, 0);
+  let c = px.rgb;
   let blur = 0.25 * (
       textureLoad(src_tex, vec2u(x0, gid.y), 0).rgb
     + textureLoad(src_tex, vec2u(x1, gid.y), 0).rgb
     + textureLoad(src_tex, vec2u(gid.x, y0), 0).rgb
     + textureLoad(src_tex, vec2u(gid.x, y1), 0).rgb);
   let out = c + (c - blur) * params.sharpness01 * 1.5;
-  textureStore(dst_tex, gid.xy, vec4f(out, 1.0));
+  textureStore(dst_tex, gid.xy, vec4f(out, px.a));
 }

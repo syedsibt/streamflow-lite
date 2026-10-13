@@ -49,6 +49,32 @@ mod av_backends;
 mod color_library;
 mod diagnostics;
 pub mod health;
+
+/// Camera devices, enumerated WITHOUT the engine lock (a DirectShow scan
+/// can take hundreds of ms and must never stall the media tick). Errors are
+/// returned, not hidden as an empty list.
+pub fn enumerate_cameras() -> Result<Vec<String>, String> {
+    #[cfg(any(windows, sf_wincheck))]
+    {
+        sf_capture::dshow::list_devices().map_err(|e| format!("camera list failed: {e}"))
+    }
+    #[cfg(not(any(windows, sf_wincheck)))]
+    {
+        Ok(Vec::new())
+    }
+}
+
+/// Audio input devices (see [`enumerate_cameras`]).
+pub fn enumerate_audio_devices() -> Result<Vec<String>, String> {
+    #[cfg(any(windows, sf_wincheck))]
+    {
+        sf_capture::dshow::list_audio_devices().map_err(|e| format!("microphone list failed: {e}"))
+    }
+    #[cfg(not(any(windows, sf_wincheck)))]
+    {
+        Ok(Vec::new())
+    }
+}
 mod sysmon;
 mod platforms;
 mod production;
@@ -67,7 +93,7 @@ pub fn media_clock_us(t: Instant) -> i64 {
 /// record, macros) — all headless-testable, no tauri dependency.
 pub use color_library::{encode_preview_jpeg, ColorPresetInfo, LutInfo, PreviewMode};
 pub use production::{
-    transition_progress, AvSyncView, FitMode, SourceTransform, CameraSourceInfo, ChannelStrip, EnhancerView, Macro, MacroAction,
+    transition_progress, AudioMetersView, ChannelMeterView, AvSyncView, FitMode, SourceTransform, CameraSourceInfo, ChannelStrip, EnhancerView, Macro, MacroAction,
     MacroDispatchResult, MixerView, ProdScene, ProductionStateView, RecordFormat, RecordLifecycle,
     RecordSettings, SourceKind, SourceState, StreamLifecycle, StreamPlatform, StreamSettings,
     TransitionKind, TransitionView, VideoSettings,
@@ -535,6 +561,9 @@ pub struct Shell {
     producer_alias: HashMap<String, String>,
     /// Owners removed from their scene while aliases still use them.
     orphan_owners: std::collections::HashSet<String>,
+    /// Decoded still images by path, and resized copies by (path, w, h).
+    image_cache: HashMap<String, std::sync::Arc<sf_capture::still_image::StillImage>>,
+    image_sized: HashMap<(String, u32, u32), std::sync::Arc<Vec<u8>>>,
     /// Diagnostic test signal (static part cached per size).
     test_pattern: test_pattern::TestPatternCache,
     /// Real audio mixer (sf-audio); fed equal-length blocks by the bus.
@@ -557,6 +586,11 @@ pub struct Shell {
     audio_monitor: Option<audio_monitor::AudioMonitor>,
     /// Per-source meter peaks from the last audio tick.
     meter_values: HashMap<String, f32>,
+    /// Peak-hold (max since last `audio_meters` read) + latest RMS.
+    meter_hold: HashMap<String, (f32, f32)>,
+    master_meter_hold: (f32, f32),
+    /// Local-monitor solo bus for the current tick (None = no solo).
+    monitor_solo: Option<Vec<f32>>,
     /// True once real audio has flowed through the mixer.
     meters_live: bool,
     /// Shared encoder pair + recording/stream sinks (`None` when neither
@@ -668,6 +702,8 @@ impl Shell {
             text_cache: HashMap::new(),
             test_pattern: Default::default(),
             producer_alias: HashMap::new(),
+            image_cache: HashMap::new(),
+            image_sized: HashMap::new(),
             orphan_owners: Default::default(),
             audio_mixer: sf_audio::Mixer::new(),
             audio_bus: sf_audio::AudioBus::new(30, 1),
@@ -677,6 +713,9 @@ impl Shell {
             voice_enhancers: HashMap::new(),
             audio_monitor: None,
             meter_values: HashMap::new(),
+            meter_hold: HashMap::new(),
+            master_meter_hold: (0.0, 0.0),
+            monitor_solo: None,
             meters_live: false,
             output: None,
             encoder_note: None,

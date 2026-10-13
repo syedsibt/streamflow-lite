@@ -123,7 +123,8 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
 
   // 1. Clamp + linearize (MVP: gamma 2.4; the transfer == 1 sRGB branch is
   //    implemented for completeness but the MVP always sends transfer = 0).
-  var c = clamp(textureLoad(src_tex, gid.xy, 0).rgb, vec3f(0.0), vec3f(1.0));
+  let src_px = textureLoad(src_tex, gid.xy, 0);
+  var c = clamp(src_px.rgb, vec3f(0.0), vec3f(1.0));
   if (grade.transfer > 0.5) {
     c = srgb_eotf(c);
   } else {
@@ -228,5 +229,6 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
   }
 
   // Output is linear; the encode pass handles output transfer + clamp.
-  textureStore(dst_tex, gid.xy, vec4f(c, 1.0));
+  // Alpha passes through (transparent PNG / text overlays stay transparent).
+  textureStore(dst_tex, gid.xy, vec4f(c, clamp(src_px.a, 0.0, 1.0)));
 }

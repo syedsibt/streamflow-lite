@@ -228,6 +228,7 @@ pub mod dshow;
 
 pub mod audio_in;
 mod audio_norm;
+pub mod still_image;
 
 #[cfg(any(windows, sf_wincheck))]
 pub mod gdigrab;
