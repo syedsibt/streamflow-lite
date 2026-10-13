@@ -58,8 +58,29 @@ jobs:
           Get-ChildItem "C:\ffmpeg\lib\avcodec.lib"
 
       - name: Cargo test (workspace)
-        run: cargo test --workspace
         # GPU tests need a real GPU; the runner has none. Non-blocking.
+        # Results are surfaced as annotations (visible on the run page and
+        # via the API) so failures are visible without downloading logs.
+        run: |
+          # The LUT integration test runs the gen-lut binary of another
+          # workspace package, which `cargo test` does not build.
+          cmd /c "cargo build -p gen-lut > build-genlut.log 2>&1"
+          cmd /c "cargo test --workspace --no-fail-fast > test.log 2>&1"
+          $code = $LASTEXITCODE
+          $results = Select-String -Path test.log -Pattern '^test result:' | ForEach-Object { $_.Line }
+          $failed = @(Select-String -Path test.log -Pattern '^test .* FAILED$|^error(\[|:)' | ForEach-Object { $_.Line })
+          $passed = ($results | ForEach-Object { if ($_ -match '(\d+) passed') { [int]$Matches[1] } else { 0 } } | Measure-Object -Sum).Sum
+          Write-Host "::notice title=cargo test summary::exit $code; $passed passed; $($failed.Count) failed/error lines"
+          $failed | Select-Object -First 9 | ForEach-Object { Write-Host "::warning title=cargo test::$_" }
+          # Panic messages (the line after "panicked at"), skipping the
+          # expected no-GPU failures, as notices.
+          $lines = Get-Content test.log
+          $msgs = for ($i = 0; $i -lt $lines.Count - 1; $i++) {
+            if ($lines[$i] -match "panicked at") { "$($lines[$i]) -> $($lines[$i + 1])" }
+          }
+          $msgs | Where-Object { $_ -notmatch "adapter|GPU|lavapipe|headless engine" } | Select-Object -First 9 | ForEach-Object { Write-Host "::notice title=panic::$_" }
+          Get-Content test.log -Tail 40
+          exit $code
         continue-on-error: true
 
       - name: Stage FFmpeg DLLs + wire into bundle

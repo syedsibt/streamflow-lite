@@ -1,0 +1,19 @@
+{
+  "name": "Cold",
+  "version": 1,
+  "category": "Creative",
+  "params": {
+    "temperature": 5200,
+    "tint": -5,
+    "saturation": 92,
+    "contrast": 10,
+    "highlights": -8,
+    "lift": [
+      0,
+      0.005,
+      0.02,
+      0
+    ]
+  },
+  "skin_protect": true
+}

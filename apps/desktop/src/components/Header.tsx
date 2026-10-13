@@ -1,38 +1,7 @@
-import { useRef, useState } from "react";
+import { useState } from "react";
 import { useStudio } from "../lib/store";
 import { useProduction } from "../lib/productionStore";
 import type { ColorGrade } from "../lib/types";
-
-/** Neutral (identity) grade for Before/After comparison. */
-const NEUTRAL_GRADE: ColorGrade = {
-  exposure: 0,
-  brightness: 0,
-  contrast: 0,
-  saturation: 100,
-  vibrance: 0,
-  temperature: 6500,
-  tint: 0,
-  highlights: 0,
-  shadows: 0,
-  whites: 0,
-  blacks: 0,
-  gamma: 1,
-  sharpness: 0,
-  lift: [0, 0, 0, 0],
-  gamma_wheel: [1, 1, 1, 1],
-  gain: [1, 1, 1, 1],
-  offset: [0, 0, 0, 0],
-  curves: {
-    master: { points: [[0, 0], [1, 1]] },
-    r: { points: [[0, 0], [1, 1]] },
-    g: { points: [[0, 0], [1, 1]] },
-    b: { points: [[0, 0], [1, 1]] },
-    luma: { points: [[0, 0], [1, 1]] },
-    hue_vs_sat: { points: [[0, 0], [1, 1]] },
-  },
-  lut: null,
-  skin_protect: false,
-};
 
 export default function Header() {
   const inputId = useStudio((s) => s.inputId);
@@ -54,9 +23,10 @@ export default function Header() {
   const [snapB, setSnapB] = useState<ColorGrade | null>(null);
   const [activeAB, setActiveAB] = useState<"A" | "B" | null>(null);
 
-  // Before/After: stash the working grade, show neutral, restore on toggle-off.
-  const [showingBefore, setShowingBefore] = useState(false);
-  const beforeStash = useRef<ColorGrade | null>(null);
+  // Before/After is a *preview-only* comparison: the stream keeps the graded
+  // image (the old toggle applied a neutral grade to the live input).
+  const previewMode = useStudio((s) => s.previewMode);
+  const setPreviewMode = useStudio((s) => s.setPreviewMode);
 
   const clickA = () => {
     if (activeAB === "A") return;
@@ -72,21 +42,10 @@ export default function Header() {
     setActiveAB("B");
   };
 
-  const toggleBeforeAfter = () => {
-    if (showingBefore) {
-      setShowingBefore(false);
-      if (beforeStash.current) void applyGradeSnapshot(beforeStash.current);
-    } else {
-      if (grade) beforeStash.current = grade;
-      setShowingBefore(true);
-      void applyGradeSnapshot(NEUTRAL_GRADE);
-    }
-  };
-
   return (
-    <div className="header">
-      <div className="title">Color Studio</div>
+    <div className="color-header">
       <select
+        className="source-select"
         value={inputId}
         onChange={(e) => {
           const opt = e.target.selectedOptions[0];
@@ -94,9 +53,11 @@ export default function Header() {
         }}
         title="Color Studio target: which source the filters and grades apply to"
       >
-        <option value="cam1" data-name="Camera 1">
-          Camera 1 (default)
-        </option>
+        {realSources.length === 0 && (
+          <option value={inputId} data-name="No video source">
+            No video source
+          </option>
+        )}
         {realSources.map((src) => (
           <option key={src.input_id} value={src.input_id} data-name={src.name}>
             {src.name}
@@ -118,14 +79,25 @@ export default function Header() {
       >
         B
       </button>
-      <button
-        className={showingBefore ? "active" : ""}
-        onClick={toggleBeforeAfter}
-        title="Toggle before/after"
-      >
-        Before/After
-      </button>
-      <button onClick={() => void resetSection(null)} title="Reset all color">
+      <div className="seg" role="group" aria-label="Before / after (preview only)">
+        {(["before", "split", "after"] as const).map((m) => (
+          <button
+            key={m}
+            className={previewMode === m ? "active" : ""}
+            onClick={() => setPreviewMode(m)}
+            title={
+              m === "split"
+                ? "Left: original · Right: processed (preview only — the stream is unaffected)"
+                : m === "before"
+                  ? "Original camera image (preview only — the stream keeps your grade)"
+                  : "Processed output — exactly what goes to the stream"
+            }
+          >
+            {m === "before" ? "Before" : m === "split" ? "Split" : "After"}
+          </button>
+        ))}
+      </div>
+      <button className="text-btn" onClick={() => void resetSection(null)} title="Reset all color">
         Reset
       </button>
     </div>

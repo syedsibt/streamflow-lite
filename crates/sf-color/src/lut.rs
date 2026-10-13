@@ -1,18 +1,32 @@
-//! Adobe `.cube` LUT parser (LUT tab).
+//! `.cube` LUT parser (LUT tab) — Adobe Cube LUT Specification 1.0 plus the
+//! DaVinci Resolve dialect, i.e. the files Premiere Pro / Lumetri, Resolve,
+//! Final Cut and most LUT vendors export.
 //!
-//! Supports 1D and 3D LUTs. Everything is normalized to a 33^3 RGBA lattice
-//! on load, so the GPU always uploads the same 33^3 `rgba16float` texture:
+//! Supported:
+//! * 3D LUTs (`LUT_3D_SIZE` 2..=256) and 1D LUTs (`LUT_1D_SIZE` 2..=65536).
+//! * **Input domain**: `DOMAIN_MIN`/`DOMAIN_MAX` (Adobe) and
+//!   `LUT_1D_INPUT_RANGE`/`LUT_3D_INPUT_RANGE` (Resolve). These map the
+//!   *input* signal onto the table; output values are used as written.
+//!   (An earlier version wrongly rescaled the output values.)
+//! * **Shaper + 3D** (Resolve): a file carrying both a 1D and a 3D table
+//!   applies the 1D shaper first, then the 3D cube — both are honored.
 //!
-//! * 3D sizes in {17, 25, 33, 65} are resampled to 33^3 silently (33 is kept
-//!   as-is); any other size is trilinearly resampled to 33^3 **with** a
-//!   warning (`"unsupported LUT size {n}, resampled to 33"`).
-//! * 1D LUTs are expanded to 33^3 by per-channel linear lookup over the 1D
-//!   table on the 33-step lattice.
-//! * Output values are normalized to [0, 1] via the `DOMAIN_MIN`/`DOMAIN_MAX`
-//!   mapping: `out = (v - dmin) / (dmax - dmin)` per channel.
+//! Everything is baked onto a 33^3 RGBA lattice on load, so the GPU always
+//! uploads the same 33^3 `rgba16float` texture: 33 is kept as-is; 17/25/65
+//! (the common export sizes) are resampled silently; other sizes are
+//! resampled with a warning.
+//!
+//! Not supported (clear error): `.3dl` (Autodesk/Lustre), `.look` (Adobe
+//! SpeedGrade XML), `.csp`, `.lut`, binary files — re-export those as
+//! `.cube` from Premiere/Resolve.
 //!
 //! 3D data order in the file is red-fastest: `index = r + n * (g + n * b)`,
 //! which matches the storage order of [`CubeFile::data`].
+//!
+//! Color space note: `.cube` creative LUTs (Lumetri "Creative" looks, film
+//! emulations) expect **display-referred** (Rec.709 gamma-encoded) input.
+//! The grade pass therefore samples the LUT on gamma-encoded values, not on
+//! the linear working space.
 
 /// Error from [`parse_cube`].
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
@@ -32,6 +46,9 @@ pub enum LutParseError {
     /// A known keyword line on the given 1-based line number was malformed.
     #[error("line {0}: {1}")]
     BadKeyword(usize, String),
+    /// The file is a LUT format other than `.cube`.
+    #[error("{0}")]
+    UnsupportedFormat(String),
 }
 
 /// A parsed `.cube` file, normalized and ready for GPU upload.
@@ -51,7 +68,11 @@ pub struct CubeFile {
 }
 
 /// 3D sizes the LUT tab accepts natively (resampled to 33^3 without warning).
-const NATIVE_SIZES: [usize; 4] = [17, 25, 33, 65];
+const NATIVE_SIZES: [usize; 6] = [16, 17, 25, 32, 33, 65];
+/// Largest accepted 3D size (256^3 ≈ 16.7 M entries).
+const MAX_3D_SIZE: usize = 256;
+/// Largest accepted 1D size.
+const MAX_1D_SIZE: usize = 65_536;
 /// Normalized lattice size everything is converted to.
 const NORMALIZED_SIZE: usize = 33;
 
@@ -105,12 +126,17 @@ pub fn parse_cube(text: &str) -> Result<CubeFile, LutParseError> {
     if text.trim().is_empty() {
         return Err(LutParseError::Empty);
     }
+    detect_foreign_format(text)?;
 
     let mut title: Option<String> = None;
     let mut size_1d: Option<(usize, usize)> = None; // (size, lineno)
     let mut size_3d: Option<(usize, usize)> = None;
+    // Input domains: shared (Adobe DOMAIN_*) unless a per-table Resolve
+    // INPUT_RANGE overrides it.
     let mut dmin = [0.0f32; 3];
     let mut dmax = [1.0f32; 3];
+    let mut range_1d: Option<(f32, f32)> = None;
+    let mut range_3d: Option<(f32, f32)> = None;
     let mut warnings: Vec<String> = Vec::new();
     let mut raw: Vec<[f32; 3]> = Vec::new();
 
@@ -146,6 +172,12 @@ pub fn parse_cube(text: &str) -> Result<CubeFile, LutParseError> {
             }
             "DOMAIN_MIN" => dmin = parse_domain(&mut parts, lineno, "DOMAIN_MIN")?,
             "DOMAIN_MAX" => dmax = parse_domain(&mut parts, lineno, "DOMAIN_MAX")?,
+            "LUT_1D_INPUT_RANGE" => {
+                range_1d = Some(parse_range(&mut parts, lineno, "LUT_1D_INPUT_RANGE")?)
+            }
+            "LUT_3D_INPUT_RANGE" => {
+                range_3d = Some(parse_range(&mut parts, lineno, "LUT_3D_INPUT_RANGE")?)
+            }
             _ if first
                 .chars()
                 .next()
@@ -174,106 +206,166 @@ pub fn parse_cube(text: &str) -> Result<CubeFile, LutParseError> {
         }
     }
 
-    // A 3D size takes precedence when both are (incorrectly) present.
-    if size_1d.is_some() && size_3d.is_some() {
-        warnings.push("both LUT_1D_SIZE and LUT_3D_SIZE present; using the 3D table".to_string());
+    let n1 = size_1d.map(|(n, _)| n);
+    let n3 = size_3d.map(|(n, _)| n);
+    if n1.is_none() && n3.is_none() {
+        return Err(LutParseError::MissingSize);
     }
-    enum Kind {
-        D1(usize),
-        D3(usize),
+    if let Some((n, line)) = size_3d {
+        if n > MAX_3D_SIZE {
+            return Err(LutParseError::BadKeyword(
+                line,
+                format!("LUT_3D_SIZE {n} is too large (max {MAX_3D_SIZE})"),
+            ));
+        }
     }
-    let kind = match (size_3d, size_1d) {
-        (Some((n, _)), _) => Kind::D3(n),
-        (None, Some((n, _))) => Kind::D1(n),
-        (None, None) => return Err(LutParseError::MissingSize),
-    };
-
-    let expected: usize = match kind {
-        Kind::D3(n) => n * n * n,
-        Kind::D1(n) => n,
-    };
+    if let Some((n, line)) = size_1d {
+        if n > MAX_1D_SIZE {
+            return Err(LutParseError::BadKeyword(
+                line,
+                format!("LUT_1D_SIZE {n} is too large (max {MAX_1D_SIZE})"),
+            ));
+        }
+    }
+    // Resolve shaper files list the 1D entries first, then the 3D cube.
+    let expected = n1.unwrap_or(0) + n3.map_or(0, |n| n * n * n);
     if raw.len() != expected {
         return Err(LutParseError::WrongDataCount {
             expected,
             got: raw.len(),
         });
     }
-
-    // Normalize output values through the domain mapping, per channel.
-    // (A zero-width domain is degenerate; pass values through unscaled.)
-    let mut norm: Vec<[f32; 3]> = Vec::with_capacity(raw.len());
-    for [r, g, b] in raw {
-        let vs = [r, g, b];
-        let mut o = [0.0f32; 3];
-        for c in 0..3 {
-            let range = dmax[c] - dmin[c];
-            o[c] = if range.abs() < 1e-9 {
-                vs[c] - dmin[c]
-            } else {
-                (vs[c] - dmin[c]) / range
-            };
+    let (shaper, cube): (Option<&[[f32; 3]]>, Option<&[[f32; 3]]>) = match (n1, n3) {
+        (Some(a), Some(_)) => {
+            warnings.push("1D shaper + 3D LUT: shaper applied before the cube".to_string());
+            (Some(&raw[..a]), Some(&raw[a..]))
         }
-        norm.push(o);
+        (Some(_), None) => (Some(&raw[..]), None),
+        (None, Some(_)) => (None, Some(&raw[..])),
+        (None, None) => unreachable!(),
+    };
+    if let Some(n) = n3 {
+        if !NATIVE_SIZES.contains(&n) {
+            warnings.push(format!("unsupported LUT size {n}, resampled to 33"));
+        }
     }
+    let dom = |r: Option<(f32, f32)>| -> ([f32; 3], [f32; 3]) {
+        match r {
+            Some((lo, hi)) => ([lo; 3], [hi; 3]),
+            None => (dmin, dmax),
+        }
+    };
+    let (d1_lo, d1_hi) = dom(range_1d);
+    let (d3_lo, d3_hi) = dom(range_3d);
+    // Signal value -> normalized 0..1 table coordinate for a domain.
+    let to_unit = |v: f32, lo: f32, hi: f32| -> f32 {
+        let span = hi - lo;
+        if span.abs() < 1e-9 {
+            0.0
+        } else {
+            ((v - lo) / span).clamp(0.0, 1.0)
+        }
+    };
+    let lerp1d = |table: &[[f32; 3]], c: usize, u: f32| -> f32 {
+        let n = table.len();
+        let pos = u.clamp(0.0, 1.0) * (n as f32 - 1.0);
+        let i0 = (pos.floor() as usize).min(n - 2);
+        let f = pos - i0 as f32;
+        table[i0][c] + (table[i0 + 1][c] - table[i0][c]) * f
+    };
+    let cube4: Option<Vec<[f32; 4]>> =
+        cube.map(|c| c.iter().map(|&[r, g, b]| [r, g, b, 1.0]).collect());
 
-    let n3 = NORMALIZED_SIZE;
-    let mut data: Vec<[f32; 4]> = Vec::with_capacity(n3 * n3 * n3);
-    match kind {
-        Kind::D3(n) if n == n3 => {
-            // Already at the target lattice; keep values as-is.
-            data.extend(norm.into_iter().map(|[r, g, b]| [r, g, b, 1.0]));
-        }
-        Kind::D3(n) => {
-            if !NATIVE_SIZES.contains(&n) {
-                warnings.push(format!("unsupported LUT size {n}, resampled to 33"));
-            }
-            let src: Vec<[f32; 4]> = norm.into_iter().map(|[r, g, b]| [r, g, b, 1.0]).collect();
-            for b in 0..n3 {
-                for g in 0..n3 {
-                    for r in 0..n3 {
-                        let rgb = [
-                            r as f32 / (n3 as f32 - 1.0),
-                            g as f32 / (n3 as f32 - 1.0),
-                            b as f32 / (n3 as f32 - 1.0),
-                        ];
-                        let s = trilinear_sample(&src, n, rgb);
-                        data.push([s[0], s[1], s[2], 1.0]);
+    let ns = NORMALIZED_SIZE;
+    let mut data: Vec<[f32; 4]> = Vec::with_capacity(ns * ns * ns);
+    for b in 0..ns {
+        for g in 0..ns {
+            for r in 0..ns {
+                let x = [
+                    r as f32 / (ns as f32 - 1.0),
+                    g as f32 / (ns as f32 - 1.0),
+                    b as f32 / (ns as f32 - 1.0),
+                ];
+                // 1D shaper (or the whole LUT when 1D-only).
+                let mut v = x;
+                if let Some(t) = shaper {
+                    for c in 0..3 {
+                        v[c] = lerp1d(t, c, to_unit(x[c], d1_lo[c], d1_hi[c]));
                     }
                 }
-            }
-        }
-        Kind::D1(n) => {
-            // Expand the 1D table onto the 33^3 lattice by per-channel linear
-            // lookup. The lattice coordinate *is* the normalized domain
-            // position, so table index = x * (n - 1).
-            for b in 0..n3 {
-                for g in 0..n3 {
-                    for r in 0..n3 {
-                        let coords = [
-                            r as f32 / (n3 as f32 - 1.0),
-                            g as f32 / (n3 as f32 - 1.0),
-                            b as f32 / (n3 as f32 - 1.0),
+                let out = match (&cube4, n3) {
+                    (Some(c4), Some(n)) => {
+                        let u = [
+                            to_unit(v[0], d3_lo[0], d3_hi[0]),
+                            to_unit(v[1], d3_lo[1], d3_hi[1]),
+                            to_unit(v[2], d3_lo[2], d3_hi[2]),
                         ];
-                        let mut o = [0.0f32; 3];
-                        for c in 0..3 {
-                            let pos = coords[c] * (n as f32 - 1.0);
-                            let i0 = (pos.floor() as usize).min(n - 2);
-                            let f = pos - i0 as f32;
-                            o[c] = norm[i0][c] + (norm[i0 + 1][c] - norm[i0][c]) * f;
-                        }
-                        data.push([o[0], o[1], o[2], 1.0]);
+                        trilinear_sample(c4, n, u)
                     }
-                }
+                    _ => v,
+                };
+                data.push([out[0], out[1], out[2], 1.0]);
             }
         }
     }
 
     Ok(CubeFile {
         title,
-        size: n3,
+        size: ns,
         data,
         warnings,
     })
+}
+
+fn parse_range(
+    parts: &mut std::str::SplitWhitespace<'_>,
+    lineno: usize,
+    kw: &str,
+) -> Result<(f32, f32), LutParseError> {
+    let bad = || LutParseError::BadKeyword(lineno, format!("{kw} expects 2 numbers"));
+    let lo: f32 = parts.next().ok_or_else(bad)?.parse().map_err(|_| bad())?;
+    let hi: f32 = parts.next().ok_or_else(bad)?.parse().map_err(|_| bad())?;
+    Ok((lo, hi))
+}
+
+/// Rejects other LUT formats with an actionable message instead of a
+/// confusing parse error.
+fn detect_foreign_format(text: &str) -> Result<(), LutParseError> {
+    let head: String = text.chars().take(4096).collect();
+    if head.contains('\0') {
+        return Err(LutParseError::UnsupportedFormat(
+            "this is a binary file, not a text .cube LUT".into(),
+        ));
+    }
+    let lower = head.to_ascii_lowercase();
+    let has_size = lower.contains("lut_3d_size") || lower.contains("lut_1d_size");
+    if !has_size {
+        if lower.trim_start().starts_with("<?xml") || lower.contains("<look") {
+            return Err(LutParseError::UnsupportedFormat(
+                "Adobe SpeedGrade .look (XML) LUTs are not supported — export the look as .cube (Premiere: Lumetri panel ▸ ⋯ ▸ Export .cube)".into(),
+            ));
+        }
+        if lower.contains("csplutv100") {
+            return Err(LutParseError::UnsupportedFormat(
+                ".csp LUTs are not supported — convert to .cube".into(),
+            ));
+        }
+        if lower.contains("3dmesh")
+            || lower
+                .lines()
+                .map(str::trim)
+                .find(|l| !l.is_empty() && !l.starts_with('#'))
+                .map_or(false, |l| {
+                    let toks: Vec<&str> = l.split_whitespace().collect();
+                    toks.len() > 3 && toks.iter().all(|t| t.parse::<u32>().is_ok())
+                })
+        {
+            return Err(LutParseError::UnsupportedFormat(
+                ".3dl LUTs are not supported — re-export the LUT as .cube".into(),
+            ));
+        }
+    }
+    Ok(())
 }
 
 /// Trilinear sample of a 3D LUT lattice.
@@ -465,21 +557,81 @@ mod tests {
     }
 
     #[test]
-    fn domain_mapping_normalizes_output() {
-        // DOMAIN 0..255: output 128 -> ~0.50196.
-        let mut s = String::from("LUT_3D_SIZE 2\nDOMAIN_MIN 0 0 0\nDOMAIN_MAX 255 255 255\n");
-        for _ in 0..8 {
-            s.push_str("128 128 128\n");
+    fn domain_maps_input_not_output() {
+        // DOMAIN 0..2 on an identity-shaped 2-point cube whose outputs are
+        // the input-domain lattice (0 or 2). Input 0.5 sits at 1/4 of the
+        // domain -> table coordinate 0.25 -> output 0.5 (identity). Outputs
+        // are NOT rescaled by the domain.
+        let mut s = String::from("LUT_3D_SIZE 2\nDOMAIN_MIN 0 0 0\nDOMAIN_MAX 2 2 2\n");
+        for b in 0..2 {
+            for g in 0..2 {
+                for r in 0..2 {
+                    s.push_str(&format!("{} {} {}\n", r * 2, g * 2, b * 2));
+                }
+            }
         }
         let f = parse_cube(&s).unwrap();
-        // n=2 is unsupported -> resample warning, but parse succeeds.
-        assert!(f
-            .warnings
-            .iter()
-            .any(|w| w.contains("unsupported LUT size 2")));
         let samp = trilinear_sample(&f.data, f.size, [0.5, 0.5, 0.5]);
         for c in 0..3 {
-            assert!((samp[c] - 128.0 / 255.0).abs() < 1e-4, "{samp:?}");
+            assert!((samp[c] - 0.5).abs() < 1e-4, "{samp:?}");
         }
+    }
+
+    #[test]
+    fn resolve_input_range_is_honored() {
+        // 1D LUT over input range 0..0.5 mapping to 0..1 (a 2x gain).
+        let s = "LUT_1D_SIZE 2\nLUT_1D_INPUT_RANGE 0.0 0.5\n0 0 0\n1 1 1\n";
+        let f = parse_cube(s).unwrap();
+        let samp = trilinear_sample(&f.data, f.size, [0.25, 0.25, 0.25]);
+        assert!((samp[0] - 0.5).abs() < 1e-3, "{samp:?}");
+        // Inputs above the range clamp to the last entry.
+        let samp = trilinear_sample(&f.data, f.size, [0.9, 0.9, 0.9]);
+        assert!((samp[0] - 1.0).abs() < 1e-3, "{samp:?}");
+    }
+
+    #[test]
+    fn shaper_plus_cube_applies_both() {
+        // Shaper squares the input (0, .25, 1 at 0, .5, 1); cube inverts.
+        let mut s = String::from("LUT_1D_SIZE 3\nLUT_3D_SIZE 2\n0 0 0\n0.25 0.25 0.25\n1 1 1\n");
+        for b in 0..2 {
+            for g in 0..2 {
+                for r in 0..2 {
+                    s.push_str(&format!("{} {} {}\n", 1 - r, 1 - g, 1 - b));
+                }
+            }
+        }
+        let f = parse_cube(&s).unwrap();
+        assert!(f.warnings.iter().any(|w| w.contains("shaper")));
+        let samp = trilinear_sample(&f.data, f.size, [0.5, 0.5, 0.5]);
+        // shaper(0.5) = 0.25 -> inverted = 0.75.
+        assert!((samp[0] - 0.75).abs() < 1e-3, "{samp:?}");
+    }
+
+    #[test]
+    fn foreign_formats_get_clear_errors() {
+        let e = parse_cube("<?xml version=\"1.0\"?><look></look>").unwrap_err();
+        assert!(e.to_string().contains(".look"), "{e}");
+        let e = parse_cube("0 64 128 192 256 320 384 448 512 576 640 704 768 832 896 960 1023\n0 0 0\n").unwrap_err();
+        assert!(e.to_string().contains(".3dl"), "{e}");
+        let e = parse_cube("CSPLUTV100\n3D\n").unwrap_err();
+        assert!(e.to_string().contains(".csp"), "{e}");
+    }
+
+    #[test]
+    fn premiere_style_65_cube_parses() {
+        let f = parse_cube(&identity_cube_3d(65)).unwrap();
+        assert!(f.warnings.is_empty(), "{:?}", f.warnings);
+        let s = trilinear_sample(&f.data, f.size, [0.3, 0.6, 0.9]);
+        for c in 0..3 {
+            assert!((s[c] - [0.3, 0.6, 0.9][c]).abs() < 1e-3);
+        }
+    }
+
+    #[test]
+    fn oversized_lut_is_rejected() {
+        assert!(matches!(
+            parse_cube("LUT_3D_SIZE 512\n0 0 0\n"),
+            Err(LutParseError::BadKeyword(1, _))
+        ));
     }
 }

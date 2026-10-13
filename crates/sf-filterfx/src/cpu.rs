@@ -316,48 +316,66 @@ pub fn gaussian_blur_cpu(w: u32, h: u32, src: &[f32], p: &EffectParams, u: f32) 
 /// same separable 9-tap as [`gaussian_blur_cpu`] (sigma from `radius`);
 /// `out.rgb = src.rgb + u * softness * blurred_bright`; alpha unchanged.
 pub fn bloom_cpu(w: u32, h: u32, src: &[f32], p: &EffectParams, u: f32) -> Vec<f32> {
+    // Twin of bloom.wgsl: soft-knee bright pass, 25 taps spread over the
+    // radius (step = max(radius/12, 1)), sigma = 4 taps.
     assert_eq!(src.len(), (w * h * 4) as usize);
-    let weights = gaussian_weights(p.radius);
+    let step = (p.radius / 12.0).max(1.0);
+    let mut wt = [0.0f32; 25];
+    let mut wsum = 0.0f32;
+    for (k, slot) in wt.iter_mut().enumerate() {
+        let fi = k as f32 - 12.0;
+        *slot = (-(fi * fi) / 32.0).exp();
+        wsum += *slot;
+    }
+    let offs: Vec<i32> = (0..25)
+        .map(|k| ((k as f32 - 12.0) * step + 0.5).floor() as i32)
+        .collect();
+    let knee = (p.softness * 0.5).max(0.001);
     let t = p.threshold;
+    let smooth = |e0: f32, e1: f32, x: f32| {
+        let tt = ((x - e0) / (e1 - e0)).clamp(0.0, 1.0);
+        tt * tt * (3.0 - 2.0 * tt)
+    };
+    let bright = |r: f32, g: f32, b: f32| -> [f32; 3] {
+        let l = 0.2126 * r + 0.7152 * g + 0.0722 * b;
+        let f = smooth(t - knee, t + knee, l);
+        [r * f, g * f, b * f]
+    };
     // Horizontal pass over the bright-extracted taps.
     let mut tmp = vec![0.0f32; src.len()];
     for y in 0..h {
         for x in 0..w {
-            let (mut ar, mut ag, mut ab, mut aa) = (0.0f32, 0.0f32, 0.0f32, 0.0f32);
-            for (k, i) in (-4..=4).enumerate() {
-                let sx = ((x as i32) + i).clamp(0, w as i32 - 1) as u32;
+            let mut acc = [0.0f32; 3];
+            for k in 0..25 {
+                let sx = ((x as i32) + offs[k]).clamp(0, w as i32 - 1) as u32;
                 let j = ((y * w + sx) * 4) as usize;
-                let wt = weights[k];
-                ar += wt * (src[j] - t).max(0.0);
-                ag += wt * (src[j + 1] - t).max(0.0);
-                ab += wt * (src[j + 2] - t).max(0.0);
-                aa += wt * (src[j + 3] - t).max(0.0);
+                let bb = bright(src[j], src[j + 1], src[j + 2]);
+                let ww = wt[k] / wsum;
+                for c in 0..3 {
+                    acc[c] += ww * bb[c];
+                }
             }
             let o = ((y * w + x) * 4) as usize;
-            tmp[o] = ar;
-            tmp[o + 1] = ag;
-            tmp[o + 2] = ab;
-            tmp[o + 3] = aa;
+            tmp[o..o + 3].copy_from_slice(&acc);
         }
     }
     // Vertical pass + additive composite with the source.
-    let k = u * p.softness;
     let mut out = Vec::with_capacity(src.len());
     for y in 0..h {
         for x in 0..w {
-            let (mut ar, mut ag, mut ab) = (0.0f32, 0.0f32, 0.0f32);
-            for (kk, i) in (-4..=4).enumerate() {
-                let sy = ((y as i32) + i).clamp(0, h as i32 - 1) as u32;
+            let mut acc = [0.0f32; 3];
+            for k in 0..25 {
+                let sy = ((y as i32) + offs[k]).clamp(0, h as i32 - 1) as u32;
                 let j = ((sy * w + x) * 4) as usize;
-                let wt = weights[kk];
-                ar += wt * tmp[j];
-                ag += wt * tmp[j + 1];
-                ab += wt * tmp[j + 2];
+                let ww = wt[k] / wsum;
+                for c in 0..3 {
+                    acc[c] += ww * tmp[j + c];
+                }
             }
             let i = ((y * w + x) * 4) as usize;
-            out.push(src[i] + k * ar);
-            out.push(src[i + 1] + k * ag);
-            out.push(src[i + 2] + k * ab);
+            out.push(src[i] + u * acc[0]);
+            out.push(src[i + 1] + u * acc[1]);
+            out.push(src[i + 2] + u * acc[2]);
             out.push(src[i + 3]);
         }
     }

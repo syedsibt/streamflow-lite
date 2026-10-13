@@ -1,0 +1,39 @@
+{
+  "name": "Dramatic",
+  "version": 1,
+  "category": "Cinematic",
+  "params": {
+    "exposure": -0.15,
+    "contrast": 32,
+    "saturation": 80,
+    "vibrance": -10,
+    "highlights": -25,
+    "shadows": -15,
+    "blacks": -18,
+    "whites": 8,
+    "temperature": 6300,
+    "curves": {
+      "master": {
+        "points": [
+          [
+            0,
+            0
+          ],
+          [
+            0.25,
+            0.19
+          ],
+          [
+            0.75,
+            0.82
+          ],
+          [
+            1,
+            1
+          ]
+        ]
+      }
+    }
+  },
+  "skin_protect": true
+}

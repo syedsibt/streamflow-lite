@@ -134,6 +134,20 @@ pub struct ColorGrade {
     /// Limit saturation/vibrance shifts inside skin tones.
     #[serde(default)]
     pub skin_protect: bool,
+    /// Creative "faded film": lifts and softens the blacks, gently muting
+    /// shadow color (0..100).
+    #[serde(default)]
+    pub faded_film: f32,
+    /// Skin-only warmth shift, -100..100 (applied through the skin mask —
+    /// the rest of the image is untouched).
+    #[serde(default)]
+    pub skin_warmth: f32,
+    /// Skin-only saturation, -100..100.
+    #[serde(default)]
+    pub skin_saturation: f32,
+    /// Skin-only brightness, -100..100.
+    #[serde(default)]
+    pub skin_brightness: f32,
 }
 
 impl Default for ColorGrade {
@@ -163,6 +177,10 @@ impl Default for ColorGrade {
             curves: CurveSet::default(),
             lut: None,
             skin_protect: false,
+            faded_film: 0.0,
+            skin_warmth: 0.0,
+            skin_saturation: 0.0,
+            skin_brightness: 0.0,
         }
     }
 }
@@ -219,6 +237,10 @@ impl ColorGrade {
             self.lut = over.lut.clone();
         }
         self.skin_protect |= over.skin_protect;
+        self.faded_film += over.faded_film;
+        self.skin_warmth += over.skin_warmth;
+        self.skin_saturation += over.skin_saturation;
+        self.skin_brightness += over.skin_brightness;
     }
 
     /// True when every parameter is at its neutral value.
@@ -246,6 +268,10 @@ impl ColorGrade {
             && self.offset == [0.0, 0.0, 0.0, 0.0]
             && self.curves.is_identity()
             && self.lut.is_none()
+            && self.faded_film == 0.0
+            && self.skin_warmth == 0.0
+            && self.skin_saturation == 0.0
+            && self.skin_brightness == 0.0
     }
 
     /// Normalize UI units into the GPU uniform.
@@ -293,6 +319,10 @@ impl ColorGrade {
             lut_flags,
             skin_protect: if self.skin_protect { 1.0 } else { 0.0 },
             curves_enabled: if self.curves.is_identity() { 0.0 } else { 1.0 },
+            faded_film: (self.faded_film / 100.0).clamp(0.0, 1.0),
+            skin_warmth: (self.skin_warmth / 100.0).clamp(-1.0, 1.0),
+            skin_saturation: (self.skin_saturation / 100.0).clamp(-1.0, 1.0),
+            skin_brightness: (self.skin_brightness / 100.0).clamp(-1.0, 1.0),
             _pad1: [0.0; 3],
         }
     }
@@ -300,7 +330,7 @@ impl ColorGrade {
 
 /// GPU uniform buffer for the fused grade pass.
 ///
-/// `#[repr(C)]` with explicit padding: 40 x `f32` = **160 bytes** total.
+/// `#[repr(C)]` with explicit padding: 44 x `f32` = **176 bytes** total.
 /// Byte offsets are documented on each field; `sf-render` uploads this with
 /// `bytemuck::bytes_of` and the WGSL struct must declare the fields in the
 /// same order.
@@ -345,7 +375,15 @@ pub struct GradeUniform {
     pub skin_protect: f32,
     /// 144 — 0.0/1.0.
     pub curves_enabled: f32,
-    pub _pad1: [f32; 3], // 148 — total struct size 160 bytes.
+    /// 148 — 0..1.
+    pub faded_film: f32,
+    /// 152 — -1..1.
+    pub skin_warmth: f32,
+    /// 156 — -1..1.
+    pub skin_saturation: f32,
+    /// 160 — -1..1.
+    pub skin_brightness: f32,
+    pub _pad1: [f32; 3], // 164 — total struct size 176 bytes.
 }
 
 impl Default for GradeUniform {
@@ -359,10 +397,11 @@ mod tests {
     use super::*;
 
     #[test]
-    fn uniform_is_160_bytes() {
-        assert_eq!(std::mem::size_of::<GradeUniform>(), 160);
+    fn uniform_is_176_bytes() {
+        assert_eq!(std::mem::size_of::<GradeUniform>(), 176);
         let u = ColorGrade::default().to_uniform();
-        assert_eq!(bytemuck::bytes_of(&u).len(), 160);
+        assert_eq!(bytemuck::bytes_of(&u).len(), 176);
+        assert_eq!(std::mem::size_of::<GradeUniform>() % 16, 0);
         // Spot-check the documented byte offsets.
         let base = std::ptr::addr_of!(u) as usize;
         assert_eq!(std::ptr::addr_of!(u.exposure_ev) as usize - base, 0);
@@ -372,6 +411,8 @@ mod tests {
         assert_eq!(std::ptr::addr_of!(u.sharpness) as usize - base, 128);
         assert_eq!(std::ptr::addr_of!(u.lut_flags) as usize - base, 136);
         assert_eq!(std::ptr::addr_of!(u.curves_enabled) as usize - base, 144);
+        assert_eq!(std::ptr::addr_of!(u.faded_film) as usize - base, 148);
+        assert_eq!(std::ptr::addr_of!(u.skin_brightness) as usize - base, 160);
     }
 
     #[test]
@@ -512,6 +553,10 @@ mod tests {
             curves: CurveSet::default(),
             lut: None,
             skin_protect: true,
+            faded_film: 12.0,
+            skin_warmth: 5.0,
+            skin_saturation: -4.0,
+            skin_brightness: 3.0,
         }
     }
 

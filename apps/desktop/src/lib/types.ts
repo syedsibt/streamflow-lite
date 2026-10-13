@@ -51,7 +51,28 @@ export interface ColorGrade {
   curves: CurveSet;
   lut: LutRef | null;
   skin_protect: boolean;
+  faded_film: number; // 0..100
+  skin_warmth: number; // -100..100 (skin only)
+  skin_saturation: number; // -100..100 (skin only)
+  skin_brightness: number; // -100..100 (skin only)
 }
+
+/** A LUT in the user's library (imported .cube, copied into app data). */
+export interface LutInfo {
+  id: string;
+  name: string;
+  path: string;
+  warnings: string[];
+}
+
+/** A saved color preset (grade + filter stack). */
+export interface ColorPresetInfo {
+  id: string;
+  name: string;
+}
+
+/** Color Studio preview comparison mode (preview only — never the stream). */
+export type PreviewMode = "after" | "before" | "split";
 
 export const CURVE_NAMES = [
   "master",
@@ -103,6 +124,28 @@ export interface SlotView {
   intensity: number; // 0..1
   cost: GpuCost;
   is_ai: boolean;
+  /** Current effect parameters (effects only). */
+  params?: EffectParams | null;
+  /** Look preset id (look slots only). */
+  look_id?: string | null;
+}
+
+/** sf_filters::EffectParams — sent whole by `filter_set_params`. */
+export interface EffectParams {
+  amount: number;
+  radius: number;
+  softness: number;
+  center: [number, number];
+  color: [number, number, number];
+  threshold: number;
+  zoom: number;
+  aspect: number;
+  k1: number;
+  k2: number;
+  axis: string;
+  spill: number;
+  tolerance: number;
+  key_softness: number;
 }
 
 export interface EffectKindInfo {
@@ -194,26 +237,63 @@ export interface ParamDef {
   min: number;
   max: number;
   step: number;
+  /** Value the reset button returns to. */
+  neutral?: number;
   format: (v: number) => string;
 }
 
-const f1 = (v: number) => v.toFixed(1);
+
 const f0 = (v: number) => v.toFixed(0);
 
-export const BASIC_PARAMS: ParamDef[] = [
-  { param: "exposure", label: "Exposure", min: -3, max: 3, step: 0.1, format: (v) => `${v >= 0 ? "+" : ""}${f1(v)}` },
-  { param: "brightness", label: "Brightness", min: -100, max: 100, step: 1, format: (v) => `${v >= 0 ? "+" : ""}${f0(v)}` },
-  { param: "contrast", label: "Contrast", min: -100, max: 100, step: 1, format: (v) => `${v >= 0 ? "+" : ""}${f0(v)}` },
-  { param: "saturation", label: "Saturation", min: 0, max: 200, step: 1, format: (v) => `${f0(v)}%` },
-  { param: "vibrance", label: "Vibrance", min: -100, max: 100, step: 1, format: (v) => `${v >= 0 ? "+" : ""}${f0(v)}` },
-  { param: "temperature", label: "Temp", min: 2500, max: 10000, step: 50, format: (v) => `${f0(v)}K` },
-  { param: "tint", label: "Tint", min: -100, max: 100, step: 1, format: (v) => `${v >= 0 ? "+" : ""}${f0(v)}` },
-  { param: "highlights", label: "Highlights", min: -100, max: 100, step: 1, format: (v) => `${v >= 0 ? "+" : ""}${f0(v)}` },
-  { param: "shadows", label: "Shadows", min: -100, max: 100, step: 1, format: (v) => `${v >= 0 ? "+" : ""}${f0(v)}` },
-  { param: "whites", label: "Whites", min: -100, max: 100, step: 1, format: (v) => `${v >= 0 ? "+" : ""}${f0(v)}` },
-  { param: "blacks", label: "Blacks", min: -100, max: 100, step: 1, format: (v) => `${v >= 0 ? "+" : ""}${f0(v)}` },
-  { param: "gamma", label: "Gamma", min: 0.5, max: 2.5, step: 0.05, format: f1 },
-  { param: "sharpness", label: "Sharpness", min: 0, max: 100, step: 1, format: f0 },
+const signed0 = (v: number) => `${v >= 0 ? "+" : ""}${f0(v)}`;
+
+/** Basic correction, in grading order: white balance → tone → color. */
+export const BASIC_GROUPS: { title: string; params: ParamDef[] }[] = [
+  {
+    title: "White balance",
+    params: [
+      { param: "temperature", label: "Temperature", min: 2500, max: 10000, step: 50, neutral: 6500, format: (v) => `${f0(v)} K` },
+      { param: "tint", label: "Tint", min: -100, max: 100, step: 1, neutral: 0, format: signed0 },
+    ],
+  },
+  {
+    title: "Tone",
+    params: [
+      { param: "exposure", label: "Exposure", min: -3, max: 3, step: 0.05, neutral: 0, format: (v) => `${v >= 0 ? "+" : ""}${v.toFixed(2)} EV` },
+      { param: "brightness", label: "Brightness", min: -100, max: 100, step: 1, neutral: 0, format: signed0 },
+      { param: "contrast", label: "Contrast", min: -100, max: 100, step: 1, neutral: 0, format: signed0 },
+      { param: "highlights", label: "Highlights", min: -100, max: 100, step: 1, neutral: 0, format: signed0 },
+      { param: "shadows", label: "Shadows", min: -100, max: 100, step: 1, neutral: 0, format: signed0 },
+      { param: "whites", label: "Whites", min: -100, max: 100, step: 1, neutral: 0, format: signed0 },
+      { param: "blacks", label: "Blacks", min: -100, max: 100, step: 1, neutral: 0, format: signed0 },
+    ],
+  },
+  {
+    title: "Color",
+    params: [
+      { param: "saturation", label: "Saturation", min: 0, max: 200, step: 1, neutral: 100, format: (v) => `${f0(v)}%` },
+      { param: "vibrance", label: "Vibrance", min: -100, max: 100, step: 1, neutral: 0, format: signed0 },
+    ],
+  },
+];
+
+/** Flat list (kept for callers that iterate every basic control). */
+export const BASIC_PARAMS: ParamDef[] = BASIC_GROUPS.flatMap((g) => g.params);
+
+/** Creative section (Lumetri-style). Look + intensity live in the looks strip. */
+export const CREATIVE_PARAMS: ParamDef[] = [
+  { param: "faded_film", label: "Faded Film", min: 0, max: 100, step: 1, neutral: 0, format: f0 },
+  { param: "sharpness", label: "Sharpen", min: 0, max: 100, step: 1, neutral: 0, format: f0 },
+  { param: "vibrance", label: "Vibrance", min: -100, max: 100, step: 1, neutral: 0, format: signed0 },
+  { param: "saturation", label: "Saturation", min: 0, max: 200, step: 1, neutral: 100, format: (v) => `${f0(v)}%` },
+  { param: "gamma", label: "Gamma", min: 0.5, max: 2.5, step: 0.01, neutral: 1, format: (v) => v.toFixed(2) },
+];
+
+/** Skin / portrait (applied through the skin mask only — natural ranges). */
+export const SKIN_PARAMS: ParamDef[] = [
+  { param: "skin_warmth", label: "Skin warmth", min: -100, max: 100, step: 1, neutral: 0, format: signed0 },
+  { param: "skin_saturation", label: "Skin saturation", min: -100, max: 100, step: 1, neutral: 0, format: signed0 },
+  { param: "skin_brightness", label: "Skin brightness", min: -100, max: 100, step: 1, neutral: 0, format: signed0 },
 ];
 
 /** Wheel definitions for the Pro tab: puck (hue/sat) + luma slider each. */
@@ -280,12 +360,6 @@ export interface SceneView {
   sources: SourceView[];
 }
 
-export interface TransitionView {
-  active: boolean;
-  kind: string;
-  progress: number; // 0..1
-}
-
 export interface MixerChannelView {
   source_id: string;
   name: string;
@@ -301,6 +375,34 @@ export interface EnhancerSettings {
   eq_mid_db: number;
   eq_high_db: number;
   compressor_enabled: boolean;
+  /** Real-time AI noise suppression (RNNoise, on-device). */
+  ai_denoise: boolean;
+  /** AI suppression strength 0..1. */
+  ai_strength: number;
+}
+
+/** Live per-voice-source telemetry (mics / camera audio). */
+export interface VoiceStats {
+  vad: number; // voice-activity probability 0..1
+  gain_reduction_db: number;
+  gate_closed: boolean;
+  latency_ms: number;
+  process_us: number;
+  buffered_ms: number;
+  underruns: number;
+  dropped_frames: number;
+  device: string; // "starting" | "running" | "error: …" | "stopped"
+  /** Age of the audio as played (capture → mix), ms. */
+  audio_age_ms?: number | null;
+  /** Age the A/V aligner targets (picture age + offset), ms. */
+  target_age_ms?: number | null;
+  corrections?: number;
+}
+
+/** A/V sync settings: auto alignment + manual offset (−100…+100 ms). */
+export interface AvSync {
+  auto: boolean;
+  offset_ms: number;
 }
 
 export interface MixerView {
@@ -310,6 +412,8 @@ export interface MixerView {
   meters: Record<string, number>; // per-source peak, keyed by source id
   monitor_enabled: boolean;
   enhancer: EnhancerSettings;
+  voice: Record<string, VoiceStats>;
+  av_sync: AvSync;
 }
 
 export interface StreamStateView {
@@ -324,35 +428,14 @@ export interface RecordStateView {
   message?: string | null; // set when state === "error"
 }
 
-/**
- * Macro action as the backend expects it: internally-tagged
- * (`#[serde(tag = "action")]`), e.g. `{ action: "cut" }` or
- * `{ action: "auto_transition", duration_ms: 500 }`.
- */
-export type MacroActionInput =
-  | { action: "cut" }
-  | { action: "auto_transition"; duration_ms: number }
-  | { action: "toggle_stream" }
-  | { action: "toggle_record" }
-  | { action: "apply_look"; look_id: string; intensity: number };
-
-export interface MacroView {
-  id: string;
-  name: string;
-  hotkey: string;
-  action: string;
-}
-
 /** Full `production_state()` response. */
 export interface ProductionStateData {
   scenes: SceneView[];
   preview_scene_id: string | null;
   program_scene_id: string | null;
-  transition: TransitionView;
   mixer: MixerView;
   stream: StreamStateView;
   record: RecordStateView;
-  macros: MacroView[];
   video_settings: VideoSettings;
 }
 
@@ -372,4 +455,87 @@ export function isPendingCaptureSource(s: SourceView): boolean {
     PENDING_CAPTURE_KINDS.some((k) => kind.includes(k)) ||
     status.includes("pending")
   );
+}
+
+// ---------------------------------------------------------------------------
+// Diagnostics (backend `DiagnosticsView`) — every value is measured.
+// ---------------------------------------------------------------------------
+
+export interface SourceDiag {
+  id: string;
+  name: string;
+  kind: string;
+  fps: number;
+  device_fps: number | null;
+  dropped: number;
+  age_ms: number;
+  width: number;
+  height: number;
+  format: string | null;
+  error: string | null;
+}
+
+export interface AudioDiag {
+  id: string;
+  name: string;
+  device: string;
+  buffered_ms: number;
+  audio_age_ms: number | null;
+  target_age_ms: number | null;
+  underruns: number;
+  dropped_frames: number;
+  corrections: number;
+}
+
+export interface EncoderDiag {
+  name: string;
+  hardware: boolean;
+  fps: number;
+  encode_ms: number;
+  skipped_slots: number;
+  note: string | null;
+}
+
+export interface LatencyDiag {
+  capture_ms: number | null;
+  processing_ms: number;
+  send_buffer_ms: number;
+  app_total_ms: number | null;
+  platform_note: string;
+}
+
+export interface Diagnostics {
+  render_fps: number;
+  target_fps: number;
+  tick_ms: number;
+  capture_ms: number;
+  render_ms: number;
+  gpu_ms: number;
+  audio_ms: number;
+  encode_ms: number;
+  lagged_ticks: number;
+  skipped_render: number;
+  dropped_network: number;
+  sources: SourceDiag[];
+  audio: AudioDiag[];
+  encoder: EncoderDiag | null;
+  stream_status: string;
+  stream_error: string | null;
+  stream_kbps: number;
+  stream_uptime_s: number;
+  recording: boolean;
+  latency: LatencyDiag;
+  color_active: boolean;
+  av_auto: boolean;
+  av_offset_ms: number;
+  system: { cpu_percent: number; ram_mb: number; cores: number };
+}
+
+/** Streaming platform adapter info (backend `PlatformInfo`). */
+export interface PlatformInfo {
+  id: string; // "youtube" | "facebook" | "tiktok" | "custom_rtmp"
+  name: string;
+  default_server: string | null;
+  key_help: string;
+  latency_note: string;
 }

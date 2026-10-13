@@ -1,0 +1,16 @@
+{
+  "name": "Glow",
+  "version": 1,
+  "category": "Creative",
+  "params": {
+    "exposure": 0.1,
+    "contrast": -6,
+    "highlights": 12,
+    "whites": 15,
+    "shadows": 6,
+    "temperature": 6900,
+    "vibrance": 6,
+    "faded_film": 8
+  },
+  "skin_protect": true
+}

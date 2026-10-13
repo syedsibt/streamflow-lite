@@ -1,0 +1,18 @@
+{
+  "name": "Dreamy",
+  "version": 1,
+  "category": "Creative",
+  "params": {
+    "exposure": 0.12,
+    "contrast": -10,
+    "highlights": -8,
+    "whites": 14,
+    "shadows": 8,
+    "saturation": 92,
+    "temperature": 6900,
+    "tint": 5,
+    "faded_film": 10,
+    "vibrance": 6
+  },
+  "skin_protect": true
+}

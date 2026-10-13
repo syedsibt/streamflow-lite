@@ -1,0 +1,15 @@
+{
+  "name": "Clean Skin",
+  "version": 1,
+  "category": "Portrait",
+  "params": {
+    "contrast": 6,
+    "highlights": -10,
+    "shadows": 8,
+    "temperature": 6550,
+    "skin_warmth": 2,
+    "skin_saturation": -15,
+    "skin_brightness": 14
+  },
+  "skin_protect": true
+}

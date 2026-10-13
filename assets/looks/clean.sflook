@@ -1,0 +1,15 @@
+{
+  "name": "Clean",
+  "version": 1,
+  "category": "Social",
+  "params": {
+    "contrast": 8,
+    "vibrance": 10,
+    "highlights": -12,
+    "shadows": 10,
+    "whites": 6,
+    "blacks": -4,
+    "temperature": 6450
+  },
+  "skin_protect": true
+}

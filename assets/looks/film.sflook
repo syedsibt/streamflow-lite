@@ -1,0 +1,33 @@
+{
+  "name": "Film",
+  "version": 1,
+  "category": "Cinematic",
+  "params": {
+    "contrast": 10,
+    "saturation": 90,
+    "temperature": 6900,
+    "highlights": -20,
+    "whites": -10,
+    "blacks": 6,
+    "faded_film": 22,
+    "curves": {
+      "master": {
+        "points": [
+          [
+            0,
+            0.03
+          ],
+          [
+            0.5,
+            0.5
+          ],
+          [
+            1,
+            0.97
+          ]
+        ]
+      }
+    }
+  },
+  "skin_protect": true
+}

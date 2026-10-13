@@ -1,0 +1,292 @@
+import { useEffect, useState } from "react";
+import { save } from "@tauri-apps/plugin-dialog";
+import { api } from "../../lib/ipc";
+import { errText, useProduction } from "../../lib/productionStore";
+import type { PlatformInfo, VideoSettings } from "../../lib/types";
+import Monitor from "../Monitor";
+import { Banner, Field, Row, Section, Segmented } from "../ui";
+
+const FALLBACK_PLATFORMS: PlatformInfo[] = [
+  { id: "youtube", name: "YouTube", default_server: "rtmp://a.rtmp.youtube.com/live2", key_help: "YouTube Studio → Go live → Stream key", latency_note: "" },
+  { id: "facebook", name: "Facebook", default_server: "rtmps://live-api-s.facebook.com:443/rtmp/", key_help: "Live Producer → Stream key", latency_note: "" },
+  { id: "tiktok", name: "TikTok", default_server: null, key_help: "TikTok LIVE Center → Server URL + Stream key", latency_note: "" },
+  { id: "custom_rtmp", name: "Custom", default_server: null, key_help: "rtmp:// or rtmps:// server and key", latency_note: "" },
+];
+
+const ENCODERS = [
+  { id: "auto", label: "Automatic (best available)" },
+  { id: "h264_nvenc", label: "NVIDIA NVENC" },
+  { id: "h264_qsv", label: "Intel Quick Sync" },
+  { id: "h264_amf", label: "AMD AMF" },
+  { id: "libx264", label: "x264 (CPU)" },
+];
+
+const fmtTime = (s: number) => {
+  const h = Math.floor(s / 3600);
+  const m = Math.floor((s % 3600) / 60);
+  const sec = Math.floor(s % 60);
+  return `${h}:${String(m).padStart(2, "0")}:${String(sec).padStart(2, "0")}`;
+};
+
+/**
+ * STREAM: where the show goes (YouTube, Facebook, TikTok or any RTMP(S)
+ * server), the output format, and recording. Stream and recording share
+ * one encoder — starting both costs no extra encoding.
+ */
+export default function StreamView() {
+  const st = useProduction((s) => s.state);
+  const platformsRaw = useProduction((s) => s.platforms);
+  const platform = useProduction((s) => s.streamPlatform);
+  const url = useProduction((s) => s.streamUrl);
+  const key = useProduction((s) => s.streamKey);
+  const streamError = useProduction((s) => s.streamError);
+  const busyStream = useProduction((s) => !!s.busy.stream);
+  const setPlatform = useProduction((s) => s.setStreamPlatform);
+  const setUrl = useProduction((s) => s.setStreamUrl);
+  const setKey = useProduction((s) => s.setStreamKey);
+  const streamStart = useProduction((s) => s.streamStart);
+  const streamStop = useProduction((s) => s.streamStop);
+  const clearStreamError = useProduction((s) => s.clearStreamError);
+  const recordPath = useProduction((s) => s.recordPath);
+  const recordFormat = useProduction((s) => s.recordFormat);
+  const recordError = useProduction((s) => s.recordError);
+  const setRecordPath = useProduction((s) => s.setRecordPath);
+  const setRecordFormat = useProduction((s) => s.setRecordFormat);
+  const recordStart = useProduction((s) => s.recordStart);
+  const recordStop = useProduction((s) => s.recordStop);
+  const recordPause = useProduction((s) => s.recordPause);
+  const recordResume = useProduction((s) => s.recordResume);
+  const clearRecordError = useProduction((s) => s.clearRecordError);
+  const refresh = useProduction((s) => s.refresh);
+  const diag = useProduction((s) => s.diag);
+
+  const [showKey, setShowKey] = useState(false);
+  const [vs, setVs] = useState<VideoSettings | null>(null);
+  const [outErr, setOutErr] = useState<string | null>(null);
+
+  const platforms = platformsRaw.length ? platformsRaw : FALLBACK_PLATFORMS;
+  const info = platforms.find((p) => p.id === platform) ?? platforms[0];
+  const stream = st?.stream.state ?? "idle";
+  const active = stream === "live" || stream === "connecting" || stream === "reconnecting";
+  const rec = st?.record.state ?? "idle";
+  const recActive = rec === "recording" || rec === "paused";
+
+  useEffect(() => {
+    if (st?.video_settings) setVs(st.video_settings);
+  }, [st?.video_settings]);
+
+  const applyOutput = async (next: VideoSettings) => {
+    setVs(next);
+    setOutErr(null);
+    try {
+      await api.videoSettingsSet(next);
+      await refresh();
+    } catch (e) {
+      setOutErr(errText(e));
+    }
+  };
+
+  const chooseFile = async () => {
+    try {
+      const ext = recordFormat === "mkv" ? "mkv" : "mp4";
+      const picked = await save({
+        title: "Save recording as",
+        defaultPath: `StreamFlow ${new Date().toISOString().slice(0, 16).replace("T", " ").replace(":", "-")}.${ext}`,
+        filters: [{ name: ext.toUpperCase(), extensions: [ext] }],
+      });
+      if (typeof picked === "string") setRecordPath(picked);
+    } catch (e) {
+      useProduction.setState({ recordError: `File picker unavailable: ${errText(e)}` });
+    }
+  };
+
+  const outputLocked = active || recActive;
+
+  return (
+    <div className="workspace">
+      <div className="stage-area">
+        <Monitor />
+      </div>
+      <aside className="inspector">
+        <Section title="Destination" footer={info?.latency_note || undefined}>
+          <div className="pad">
+            <Segmented
+              label="Platform"
+              value={platform}
+              onChange={(v) => !active && setPlatform(v)}
+              options={platforms.map((p) => ({ value: p.id, label: p.name === "Custom RTMP" ? "Custom" : p.name }))}
+            />
+          </div>
+          <Field label="Server" hint={info?.default_server ? "Leave empty to use the default server." : undefined}>
+            <input
+              type="text"
+              value={url}
+              disabled={active}
+              spellCheck={false}
+              placeholder={info?.default_server ?? "rtmp://…"}
+              onChange={(e) => setUrl(e.target.value)}
+            />
+          </Field>
+          <Field label="Stream key" hint={info?.key_help}>
+            <span className="inline-controls">
+              <input
+                type={showKey ? "text" : "password"}
+                value={key}
+                disabled={active}
+                spellCheck={false}
+                autoComplete="off"
+                placeholder="Paste your stream key"
+                onChange={(e) => setKey(e.target.value)}
+              />
+              <button type="button" className="btn small secondary" onClick={() => setShowKey((v) => !v)}>
+                {showKey ? "Hide" : "Show"}
+              </button>
+            </span>
+          </Field>
+          {streamError && (
+            <div className="pad">
+              <Banner tone="error" onClose={clearStreamError}>
+                {streamError}
+              </Banner>
+            </div>
+          )}
+          <div className="pad actions">
+            {active ? (
+              <button type="button" className="btn big danger" onClick={() => void streamStop()}>
+                {stream === "live" ? "End stream" : "Cancel"}
+              </button>
+            ) : (
+              <button type="button" className="btn big go" disabled={busyStream} onClick={() => void streamStart()}>
+                {busyStream ? "Starting…" : "Go live"}
+              </button>
+            )}
+          </div>
+          {stream === "live" && diag && (
+            <Row
+              title="Live"
+              subtitle={`${Math.round(diag.stream_kbps)} kbps · ${diag.encoder?.name ?? ""}`}
+              trailing={<span className="mono">{fmtTime(diag.stream_uptime_s)}</span>}
+            />
+          )}
+        </Section>
+
+        <Section title="Output" footer={outputLocked ? "Resolution, encoder and bitrate apply the next time you go live or record. Frame rate applies immediately." : "Stream and recording share one encoder."}>
+          {vs && (
+            <>
+              <Field label="Resolution">
+                <Segmented
+                  label="Resolution"
+                  size="small"
+                  value={`${vs.output_width}x${vs.output_height}`}
+                  onChange={(v) => {
+                    const [w, h] = v.split("x").map(Number);
+                    void applyOutput({ ...vs, output_width: w, output_height: h });
+                  }}
+                  options={[
+                    { value: "1280x720", label: "720p" },
+                    { value: "1920x1080", label: "1080p" },
+                  ]}
+                />
+              </Field>
+              <Field label="Frame rate">
+                <Segmented label="Frame rate" size="small" value={vs.output_fps} onChange={(v) => void applyOutput({ ...vs, output_fps: v })} options={[30, 60].map((f) => ({ value: f, label: `${f} fps` }))} />
+              </Field>
+              <Field label="Encoder">
+                <select value={vs.encoder} onChange={(e) => void applyOutput({ ...vs, encoder: e.target.value })}>
+                  {ENCODERS.map((o) => (
+                    <option key={o.id} value={o.id}>
+                      {o.label}
+                    </option>
+                  ))}
+                </select>
+              </Field>
+              <Field label="Bitrate" hint="YouTube 1080p30: 4500–9000 kbps · 720p30: 2500–4000 kbps">
+                <span className="inline-controls">
+                  <input
+                    type="number"
+                    min={500}
+                    max={50000}
+                    step={250}
+                    value={vs.bitrate_kbps}
+                    onChange={(e) => setVs({ ...vs, bitrate_kbps: Number(e.target.value) })}
+                    onBlur={() => void applyOutput(vs)}
+                    onKeyDown={(e) => e.key === "Enter" && void applyOutput(vs)}
+                  />
+                  <span className="unit">kbps</span>
+                </span>
+              </Field>
+              {diag?.encoder && <Row title="Encoder in use" subtitle={diag.encoder.note ?? (diag.encoder.hardware ? "Hardware" : "Software (CPU)")} trailing={<span className="mono">{diag.encoder.name}</span>} />}
+              {outErr && (
+                <div className="pad">
+                  <Banner tone="error" onClose={() => setOutErr(null)}>
+                    {outErr}
+                  </Banner>
+                </div>
+              )}
+            </>
+          )}
+        </Section>
+
+        <Section title="Recording">
+          <Field label="File">
+            <span className="file-pick">
+              <span className="file-name" title={recordPath || undefined}>
+                {recordPath ? recordPath.split(/[\\/]/).pop() : "Not chosen"}
+              </span>
+              <button type="button" className="btn small secondary" disabled={recActive} onClick={() => void chooseFile()}>
+                Choose…
+              </button>
+            </span>
+          </Field>
+          <Field label="Format">
+            <Segmented
+              label="Format"
+              size="small"
+              value={recordFormat}
+              onChange={(v) => !recActive && setRecordFormat(v)}
+              options={[
+                { value: "mp4", label: "MP4", title: "Fragmented MP4 — survives a crash" },
+                { value: "mkv", label: "MKV" },
+              ]}
+            />
+          </Field>
+          {recordError && (
+            <div className="pad">
+              <Banner tone="error" onClose={clearRecordError}>
+                {recordError}
+              </Banner>
+            </div>
+          )}
+          <div className="pad actions spread">
+            {!recActive ? (
+              <button type="button" className="btn rec-btn" onClick={() => void recordStart()}>
+                Start recording
+              </button>
+            ) : (
+              <>
+                <span className="mono rec-time">
+                  {rec === "paused" ? "Paused · " : ""}
+                  {fmtTime(st?.record.elapsed_secs ?? 0)}
+                </span>
+                <span className="btn-group">
+                  {rec === "recording" ? (
+                    <button type="button" className="btn small secondary" onClick={() => void recordPause()}>
+                      Pause
+                    </button>
+                  ) : (
+                    <button type="button" className="btn small secondary" onClick={() => void recordResume()}>
+                      Resume
+                    </button>
+                  )}
+                  <button type="button" className="btn small danger" onClick={() => void recordStop()}>
+                    Stop
+                  </button>
+                </span>
+              </>
+            )}
+          </div>
+        </Section>
+      </aside>
+    </div>
+  );
+}

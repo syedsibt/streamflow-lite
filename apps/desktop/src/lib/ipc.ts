@@ -16,8 +16,10 @@ import type {
   Filter,
   FilterTarget,
   LookInfo,
-  MacroActionInput,
-  MacroView,
+  LutInfo,
+  ColorPresetInfo,
+  EffectParams,
+  PreviewMode,
   SceneView,
   SlotView,
   SourceKind,
@@ -25,6 +27,9 @@ import type {
   UiEvent,
   VideoSettings,
   CameraSourceInfo,
+  Diagnostics,
+  PlatformInfo,
+  AvSync,
 } from "./types";
 
 declare global {
@@ -87,21 +92,27 @@ export const api = {
   scopesUnsubscribe: (input_id: string, kind: string) =>
     cmd<void>("scopes_unsubscribe", { input_id, kind }),
 
-  /** PNG data URL, ~10 Hz throttled by the backend. */
-  previewGetFrame: (input_id: string, width: number, height: number) =>
-    cmd<string>("preview_get_frame", { input_id, width, height }),
+  /** JPEG data URL of the live processed frame (same as program/encoder). */
+  previewGetFrame: (input_id: string, width: number, height: number, mode: PreviewMode = "after") =>
+    cmd<string>("preview_get_frame", { input_id, width, height, mode }),
+  lookClear: (target: FilterTarget) => cmd<void>("look_clear", { target }),
+  filterSetParams: (target: FilterTarget, slot_id: string, params: EffectParams) =>
+    cmd<void>("filter_set_params", { target, slot_id, params }),
+  lutImport: (path: string) => cmd<LutInfo>("lut_import", { path }),
+  lutLibrary: () => cmd<LutInfo[]>("lut_library"),
+  lutRemove: (id: string) => cmd<void>("lut_remove", { id }),
+  colorPresetSave: (input_id: string, name: string) =>
+    cmd<ColorPresetInfo>("color_preset_save", { input_id, name }),
+  colorPresetList: () => cmd<ColorPresetInfo[]>("color_preset_list"),
+  colorPresetApply: (input_id: string, id: string) =>
+    cmd<ColorGrade>("color_preset_apply", { input_id, id }),
+  colorPresetDelete: (id: string) => cmd<void>("color_preset_delete", { id }),
 
   // -------------------------------------------------------------------------
   // Production (command names and snake_case args must match the Rust
   // signatures in `apps/desktop/src-tauri/src/main.rs` exactly)
   // -------------------------------------------------------------------------
 
-  sceneCreate: (name: string) => cmd<SceneView>("scene_create", { name }),
-  sceneRename: (scene_id: string, name: string) =>
-    cmd<void>("scene_rename", { scene_id, name }),
-  sceneDelete: (scene_id: string) => cmd<void>("scene_delete", { scene_id }),
-  sceneDuplicate: (scene_id: string) =>
-    cmd<SceneView>("scene_duplicate", { scene_id }),
   sceneList: () => cmd<SceneView[]>("scene_list"),
 
   sourceAdd: (scene_id: string, kind: SourceKind, name: string) => {
@@ -175,9 +186,8 @@ export const api = {
   videoSettingsSet: (settings: VideoSettings) =>
     cmd<void>("video_settings_set", { settings }),
   listAudioDevices: () => cmd<string[]>("list_audio_devices", {}),
-  perfStats: () => cmd<number[]>("perf_stats", {}),
-  perfStages: () => cmd<number[]>("perf_stages", {}),
-  streamEncoderName: () => cmd<string>("stream_encoder_name", {}),
+  /** Measured pipeline diagnostics (stages, fps, drops, latency, CPU/RAM). */
+  diagnostics: () => cmd<Diagnostics>("diagnostics", {}),
   sourceRemove: (scene_id: string, source_id: string) =>
     cmd<void>("source_remove", { scene_id, source_id }),
   sourceReorder: (scene_id: string, order: string[]) =>
@@ -189,15 +199,9 @@ export const api = {
     cmd<boolean>("media_set_paused", { source_id, paused }),
 
   productionState: () => cmd<unknown>("production_state"),
-  productionSetPreview: (scene_id: string) =>
-    cmd<void>("production_set_preview", { scene_id }),
-  productionSetProgram: (scene_id: string) =>
-    cmd<void>("production_set_program", { scene_id }),
-  transitionCut: () => cmd<void>("transition_cut"),
-  transitionAuto: (duration_ms: number, kind: string) =>
-    cmd<void>("transition_auto", { duration_ms, kind }),
-  scenePreviewJpg: (scene_id: string) =>
-    cmd<string>("scene_preview_jpg", { scene_id }),
+  /** Program monitor frame only when newer than `after_seq`. */
+  monitorFrameIfNew: (scene_id: string, after_seq: number) =>
+    cmd<[number, string] | null>("monitor_frame_if_new", { scene_id, after_seq }),
 
   mixerSetGain: (source_id: string, gain: number) =>
     cmd<void>("mixer_set_gain", { source_id, gain }),
@@ -213,6 +217,9 @@ export const api = {
     cmd<EnhancerSettings>("set_enhancer_settings", { settings }),
   sourceAudioDevice: (source_id: string) =>
     cmd<string | null>("source_audio_device", { source_id }),
+  avSyncSet: (auto: boolean, offset_ms: number) =>
+    cmd<AvSync>("av_sync_set", { auto, offset_ms }),
+  streamPlatforms: () => cmd<PlatformInfo[]>("stream_platforms", {}),
 
   streamSetSettings: (url: string, key: string, platform: string) =>
     cmd<void>("stream_set_settings", { url, key, platform }),
@@ -226,11 +233,6 @@ export const api = {
   recordPause: () => cmd<void>("record_pause"),
   recordResume: () => cmd<void>("record_resume"),
 
-  macroAdd: (name: string, hotkey: string, action: MacroActionInput) =>
-    cmd<string>("macro_add", { name, hotkey, action }),
-  macroRemove: (macro_id: string) => cmd<void>("macro_remove", { macro_id }),
-  macroList: () => cmd<MacroView[]>("macro_list"),
-  macroDispatch: (hotkey: string) => cmd<void>("macro_dispatch", { hotkey }),
 };
 
 /** Subscribe to the single "sf-event" channel; routes on the spec event tag. */

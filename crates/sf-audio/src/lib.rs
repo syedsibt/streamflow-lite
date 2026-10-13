@@ -49,10 +49,25 @@
 //! mixer is fully deterministic: identical inputs produce bit-identical
 //! outputs (the only mutable state is the `dropped_blocks` counter).
 //!
-//! ## AI insert points (future work — documented, not implemented)
+//! ## Real-time pipeline around the mixer
 //!
-//! - **#1 Per-source PRE-gain** (see the marker in `mix`): per-source AI
-//!   denoise / voice-clarity / de-esser processors slot in here. They receive
+//! ```text
+//! mic device ─► LiveInput (own thread) ─┐
+//! media file ─► paced pull ─────────────┼─► AudioBus (per-source jitter FIFO,
+//!                                       │    exact samples per tick)
+//!                                       └─► voice sources: Enhancer
+//!                                           (RNNoise AI denoise → gate → EQ →
+//!                                            compressor), 20 ms fixed latency
+//!                                       ─► Mixer::mix (equal-length blocks)
+//!                                       ─► encoder / monitor / meters
+//! ```
+//!
+//! ## AI insert points
+//!
+//! - **#1 Per-source PRE-gain** (see the marker in `mix`): implemented by the
+//!   host — the desktop backend runs one [`Enhancer`] per voice source on the
+//!   bus block *before* it reaches `mix`. Other per-source processors
+//!   (de-esser, voice clarity) slot in the same way. They receive
 //!   the raw contract-normalized frame and return a processed frame of
 //!   identical length. Inserting *before* the gain multiply means the fader
 //!   still controls the processed output, and the [`SourceMeter`] still
@@ -63,8 +78,15 @@
 
 use std::collections::HashMap;
 
+pub mod bus;
+pub mod denoise;
 pub mod enhancer;
-pub use enhancer::{Enhancer, EnhancerSettings};
+pub mod live_input;
+pub mod rnnoise;
+pub use bus::{AudioBus, AudioTimeline, BusConfig, SampleClock, SourceBusStats, ALIGN_TOLERANCE_US, MAX_ALIGN_DELAY_US};
+pub use denoise::NoiseSuppressor;
+pub use enhancer::{Enhancer, EnhancerSettings, EnhancerStats};
+pub use live_input::{LiveInput, LiveStatus, TimedChunk};
 
 /// Sample rate (Hz) every input must carry. Anything else is skipped for the
 /// block and counted in [`Mixer::dropped_blocks`].

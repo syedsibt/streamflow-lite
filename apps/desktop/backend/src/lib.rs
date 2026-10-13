@@ -46,12 +46,25 @@ pub use sf_color::{LutPosition, LutRef};
 /// media sources). Keeps `production.rs` focused on the state machines.
 mod audio_monitor;
 mod av_backends;
+mod color_library;
+mod diagnostics;
+mod platforms;
 mod production;
 mod send_worker;
+
+pub use diagnostics::{DiagnosticsView, SourceDiag};
+pub use platforms::{platform_list, PlatformInfo};
+
+/// The pipeline's monotonic clock (µs) — what [`Shell::av_tick_at`]
+/// expects. Hosts convert their tick deadline with this.
+pub fn media_clock_us(t: Instant) -> i64 {
+    sf_capture::clock::instant_us(t)
+}
 /// Production state machine (scenes, sources, transitions, mixer, stream,
 /// record, macros) — all headless-testable, no tauri dependency.
+pub use color_library::{encode_preview_jpeg, ColorPresetInfo, LutInfo, PreviewMode};
 pub use production::{
-    transition_progress, CameraSourceInfo, ChannelStrip, EnhancerView, Macro, MacroAction,
+    transition_progress, AvSyncView, CameraSourceInfo, ChannelStrip, EnhancerView, Macro, MacroAction,
     MacroDispatchResult, MixerView, ProdScene, ProductionStateView, RecordFormat, RecordLifecycle,
     RecordSettings, SourceKind, SourceState, StreamLifecycle, StreamPlatform, StreamSettings,
     TransitionKind, TransitionView, VideoSettings,
@@ -64,104 +77,74 @@ const PREVIEW_THROTTLE: Duration = Duration::from_millis(100);
 /// Program/preview monitor size. The media tick refreshes the program monitor
 /// frame at this size every tick; the UI polls it at ~10fps. 480x270 keeps
 /// JPEG encode + IPC cheap while looking sharp in the monitor panes.
-pub const MONITOR_W: u32 = 480;
-pub const MONITOR_H: u32 = 270;
-
-/// A monitor frame is fresh enough to serve while under this age; older than
-/// this the command falls back to rendering on demand.
-const MONITOR_FRESH: Duration = Duration::from_millis(150);
+pub const MONITOR_W: u32 = 960;
+pub const MONITOR_H: u32 = 540;
 
 /// Stack length above which the UI gets a "GPU cost high" warning (spec §5.3).
 const STACK_WARN_LEN: usize = 6;
 
-/// Program monitor frame: small RGBA composite refreshed by the media tick.
+/// Program / preview monitor frame: small RGBA composite refreshed by the
+/// media tick. Shared (`Arc`) so a UI command can take it under the shell
+/// lock in O(1) and JPEG-encode it *after* releasing the lock.
 #[derive(Clone)]
 pub struct MonitorFrame {
     pub width: u32,
     pub height: u32,
-    pub pixels: Vec<u8>,
+    pub pixels: std::sync::Arc<Vec<u8>>,
     pub at: Instant,
+    /// Monotonic frame number (UI skips unchanged frames).
+    pub seq: u64,
+}
+
+impl MonitorFrame {
+    /// JPEG bytes (quality 82). Call outside the shell lock.
+    pub fn to_jpeg(&self) -> Result<Vec<u8>, ShellError> {
+        encode_jpeg_rgba(&self.pixels, self.width, self.height, 82)
+    }
 }
 
 impl Shell {
-    /// Stores a program frame as the live monitor frame, downscaling to
-    /// monitor size when needed.
-    pub(crate) fn set_monitor_frame(&mut self, frame: Frame) {
+    fn to_monitor(&mut self, frame: Frame) -> MonitorFrame {
         let (pixels, w, h) = if frame.width == MONITOR_W && frame.height == MONITOR_H {
             (frame.pixels, frame.width, frame.height)
         } else {
-            (
-                downscale_bilinear(
-                    &frame.pixels,
-                    frame.width,
-                    frame.height,
-                    MONITOR_W,
-                    MONITOR_H,
-                ),
-                MONITOR_W,
-                MONITOR_H,
-            )
+            // GPU resize (same filter as the program path); CPU fallback.
+            let px = self
+                .engine
+                .gpu_resize_rgba(&frame.pixels, frame.width, frame.height, MONITOR_W, MONITOR_H)
+                .unwrap_or_else(|_| {
+                    downscale_bilinear(&frame.pixels, frame.width, frame.height, MONITOR_W, MONITOR_H)
+                });
+            (px, MONITOR_W, MONITOR_H)
         };
-        self.monitor_frame = Some(MonitorFrame {
+        self.monitor_seq += 1;
+        MonitorFrame {
             width: w,
             height: h,
-            pixels,
+            pixels: std::sync::Arc::new(pixels),
             at: Instant::now(),
-        });
-    }
-
-    /// JPEG bytes for the live program monitor, when the cached frame is
-    /// fresh. The monitor commands serve this instead of re-rendering the
-    /// scene (no mutex stall, no duplicate camera pull).
-    pub(crate) fn monitor_jpeg(&self) -> Option<Vec<u8>> {
-        Self::monitor_frame_jpeg(&self.monitor_frame)
-    }
-
-    /// JPEG bytes for the live preview-scene monitor, when cached fresh.
-    pub(crate) fn preview_monitor_jpeg(&self) -> Option<Vec<u8>> {
-        Self::monitor_frame_jpeg(&self.preview_monitor_frame)
-    }
-
-    fn monitor_frame_jpeg(m: &Option<MonitorFrame>) -> Option<Vec<u8>> {
-        let m = m.as_ref()?;
-        if m.at.elapsed() > MONITOR_FRESH {
-            return None;
+            seq: self.monitor_seq,
         }
-        encode_jpeg(
-            &Frame {
-                width: m.width,
-                height: m.height,
-                pixels: m.pixels.clone(),
-            },
-            82,
-        )
-        .ok()
     }
 
-    /// Stores a preview-scene frame as the live monitor frame, downscaling
-    /// to monitor size when needed. Called by the media tick every tick.
-    pub(crate) fn set_preview_monitor_frame(&mut self, frame: Frame) {
-        let (pixels, w, h) = if frame.width == MONITOR_W && frame.height == MONITOR_H {
-            (frame.pixels, frame.width, frame.height)
-        } else {
-            (
-                downscale_bilinear(
-                    &frame.pixels,
-                    frame.width,
-                    frame.height,
-                    MONITOR_W,
-                    MONITOR_H,
-                ),
-                MONITOR_W,
-                MONITOR_H,
-            )
-        };
-        self.preview_monitor_frame = Some(MonitorFrame {
-            width: w,
-            height: h,
-            pixels,
-            at: Instant::now(),
-        });
+    /// Stores a program frame as the live monitor frame (downscaled).
+    pub(crate) fn set_monitor_frame(&mut self, frame: Frame) {
+        let m = self.to_monitor(frame);
+        self.monitor_frame = Some(m);
+    }
+
+    /// Monitor frame for a scene: the program scene is served from the
+    /// media tick (O(1), no render); any other scene renders once
+    /// at monitor size from the cached source frames (never pulls a
+    /// producer, so it cannot steal live frames).
+    pub fn monitor_snapshot(&mut self, scene_id: &str) -> Result<MonitorFrame, ShellError> {
+        if scene_id == self.program_scene_id {
+            if let Some(m) = &self.monitor_frame {
+                return Ok(m.clone());
+            }
+        }
+        let frame = self.render_scene_frame(scene_id, MONITOR_W, MONITOR_H)?;
+        Ok(self.to_monitor(frame))
     }
 }
 
@@ -240,6 +223,12 @@ pub enum ShellError {
     /// Invalid video/setting value from the UI.
     #[error("invalid setting: {0}")]
     InvalidSetting(String),
+    /// LUT import/load failure (bad or unsupported file).
+    #[error("{0}")]
+    Lut(String),
+    /// Color preset save/load failure.
+    #[error("preset error: {0}")]
+    Preset(String),
 }
 
 impl ShellError {
@@ -455,6 +444,13 @@ pub struct SlotView {
     pub cost: String,
     /// True for AI kinds (may grey out without a model).
     pub is_ai: bool,
+    /// Current effect parameters (`None` for looks) — lets the Glow / Skin
+    /// panels show the live values after a preset is applied.
+    #[serde(default)]
+    pub params: Option<sf_filters::EffectParams>,
+    /// Look preset id for look slots.
+    #[serde(default)]
+    pub look_id: Option<String>,
 }
 
 /// The shell binding: owns the engine, look registry, per-input frames,
@@ -478,10 +474,8 @@ pub struct Shell {
     /// of re-rendering the scene from scratch (which used to run at 2 Hz
     /// and stole the shell mutex from the media tick on every poll).
     monitor_frame: Option<MonitorFrame>,
-    /// Preview-scene monitor frame, refreshed by the media tick alongside
-    /// the program monitor. The UI serves this instead of re-rendering the
-    /// preview scene (and re-pulling cameras) on every poll.
-    preview_monitor_frame: Option<MonitorFrame>,
+    /// Increments on every monitor frame (lets the UI skip unchanged ones).
+    monitor_seq: u64,
     // --- production state machine (see `production` module) ---
     /// Production scenes.
     scenes: Vec<production::ProdScene>,
@@ -499,6 +493,8 @@ pub struct Shell {
     video_settings: production::VideoSettings,
     /// Stream output lifecycle.
     stream_lifecycle: production::StreamLifecycle,
+    /// When the current stream session started (uptime).
+    stream_started_at: Option<Instant>,
     /// Record settings.
     record_settings: production::RecordSettings,
     /// Active/paused recording runtime (`None` when idle).
@@ -511,13 +507,18 @@ pub struct Shell {
     /// Open media-file producers keyed by source id. The `Send` wrapper is
     /// sound: every producer is only touched through the shell's `Mutex`.
     media_producers: HashMap<String, av_backends::SendProducer>,
-    /// Open microphone/line-in producers keyed by source id (Windows
-    /// dshow audio). Separate from `media_producers`: audio inputs have
+    /// Live audio inputs (microphone / line-in / camera audio) keyed by
+    /// source id. Each runs its device reads on its own thread
+    /// (`sf_audio::LiveInput`) so a blocking device read can never stall
+    /// the media tick. Separate from `media_producers`: audio inputs have
     /// no video frames, so they never touch the video pull path.
-    #[cfg(windows)]
-    audio_producers: HashMap<String, sf_capture::audio_in::AudioInputProducer>,
-    /// Last decoded video frame per media source (freeze on end-of-stream).
-    media_last_frame: HashMap<String, (u32, u32, Vec<u8>)>,
+    audio_inputs: HashMap<String, sf_audio::LiveInput>,
+    /// Newest frame per video source, pulled ONCE per tick and shared by
+    /// every consumer (program, preview, Color Studio, other scenes).
+    source_frames: HashMap<String, av_backends::SourceFrame>,
+    /// Resized copies of cached source frames, keyed by (source, w, h) and
+    /// valid for one source frame `seq`.
+    resized_frames: HashMap<(String, u32, u32), (u64, std::sync::Arc<Vec<u8>>)>,
     /// Negotiated camera format per camera source id, e.g.
     /// `"mjpeg 1920x1080 @30fps (via mjpeg)"` — what the camera actually
     /// gave, for diagnostics.
@@ -525,10 +526,21 @@ pub struct Shell {
     /// Rasterized text overlays keyed by (source_id, text, w, h). Text
     /// rarely changes, so it renders once — not on every tick.
     text_cache: HashMap<(String, String, u32, u32), Vec<u8>>,
-    /// Real audio mixer (sf-audio); fed by media-source audio chunks.
+    /// Real audio mixer (sf-audio); fed equal-length blocks by the bus.
     audio_mixer: sf_audio::Mixer,
-    /// Free offline enhancer (gate → EQ → compressor) on the master mix.
-    audio_enhancer: sf_audio::Enhancer,
+    /// Clocked audio bus: per-source jitter FIFOs, exact samples per tick
+    /// (keeps the audio timeline locked to video PTS).
+    audio_bus: sf_audio::AudioBus,
+    /// Wall-clock audio timeline: samples per tick = elapsed real time.
+    audio_timeline: sf_audio::AudioTimeline,
+    /// A/V sync settings (auto alignment + manual offset).
+    av_sync: production::AvSyncView,
+    /// Voice enhancer settings (AI denoise → gate → EQ → compressor),
+    /// shared by every voice source.
+    enhancer_settings: sf_audio::EnhancerSettings,
+    /// One stateful enhancer per live voice source (mic / camera audio),
+    /// applied PRE-fader. Media files are never processed.
+    voice_enhancers: HashMap<String, sf_audio::Enhancer>,
     /// Local speaker monitor (None = off). Opened on demand so a missing
     /// audio device can never break startup.
     audio_monitor: Option<audio_monitor::AudioMonitor>,
@@ -536,22 +548,23 @@ pub struct Shell {
     meter_values: HashMap<String, f32>,
     /// True once real audio has flowed through the mixer.
     meters_live: bool,
-    /// Active recording session (`None` when idle).
-    active_recording: Option<av_backends::ActiveRecording>,
-    /// Active streaming session (`None` when idle).
-    active_stream: Option<av_backends::ActiveStream>,
+    /// Shared encoder pair + recording/stream sinks (`None` when neither
+    /// is active).
+    output: Option<av_backends::OutputEngine>,
+    /// Why the selected encoder was not used (fallback note).
+    encoder_note: Option<String>,
     /// Performance monitoring: frame timestamps for FPS calc.
     perf_frame_times: VecDeque<Instant>,
     /// Last av_tick duration (render time).
     perf_last_tick_us: u64,
     /// Total av_tick time in current second (for CPU% estimate).
     perf_tick_accum_us: u64,
-    /// Window start for CPU% calculation.
-    perf_window_start: Instant,
     /// Last bytes_sent for bitrate calc.
     perf_last_bytes: u64,
     /// Last bitrate sample time.
     perf_last_br_time: Instant,
+    /// Last computed upload rate (kbps).
+    perf_last_kbps: f32,
     /// Frames skipped because render/encode couldn't keep up (blueprint
     /// `skipped_render`: our PC too slow — distinct from network drops).
     perf_skipped_render: u64,
@@ -567,6 +580,21 @@ pub struct Shell {
     /// [render (capture+grade+composite), audio pump, record encode/write,
     /// stream encode/send] — blueprint "measure before claiming".
     perf_stages_us: [u64; 4],
+    /// GPU (grade + composite) time spent in the current tick, µs.
+    perf_gpu_us_accum: u64,
+    /// Smoothed age of the program's main live picture at render, µs.
+    last_program_video_age_us: Option<i64>,
+    /// Real process CPU / memory sampler.
+    sys: diagnostics::SysSampler,
+    /// Color Studio live tap: the input the Color Studio is watching and
+    /// when it last asked. While watched, `render_scene_frame` hands the
+    /// exact graded frame it composited (and the raw frame, for
+    /// before/after) to the tap — moved, not copied, and no second grade.
+    studio_watch: Option<(String, Instant, PreviewMode)>,
+    /// Last tapped (graded, raw) frames for the watched input.
+    studio_tap: Option<color_library::StudioTap>,
+    /// Per-user data folder (LUT library, color presets).
+    data_dir: PathBuf,
 }
 
 impl Shell {
@@ -577,49 +605,7 @@ impl Shell {
     ///
     /// Returns [`ShellError::Engine`] when no GPU adapter/device opens.
     pub fn new() -> Result<Self, ShellError> {
-        let mut shell = Self {
-            engine: Engine::new_headless()?,
-            events: VecDeque::new(),
-            last_frame: HashMap::new(),
-            preview_cache: HashMap::new(),
-            monitor_frame: None,
-            preview_monitor_frame: None,
-            scenes: Vec::new(),
-            preview_scene_id: String::new(),
-            program_scene_id: String::new(),
-            transition: None,
-            mixer: production::MixerState::default(),
-            stream_settings: production::StreamSettings::default(),
-            video_settings: production::VideoSettings::default(),
-            stream_lifecycle: production::StreamLifecycle::Idle,
-            record_settings: production::RecordSettings::default(),
-            record_runtime: None,
-            record_error: None,
-            macros: Vec::new(),
-            media_producers: HashMap::new(),
-            #[cfg(windows)]
-            audio_producers: HashMap::new(),
-            media_last_frame: HashMap::new(),
-            camera_formats: HashMap::new(),
-            text_cache: HashMap::new(),
-            audio_mixer: sf_audio::Mixer::new(),
-            audio_enhancer: sf_audio::Enhancer::new(48_000),
-            audio_monitor: None,
-            meter_values: HashMap::new(),
-            meters_live: false,
-            active_recording: None,
-            active_stream: None,
-            perf_frame_times: VecDeque::new(),
-            perf_last_tick_us: 0,
-            perf_tick_accum_us: 0,
-            perf_window_start: Instant::now(),
-            perf_last_bytes: 0,
-            perf_last_br_time: Instant::now(),
-            perf_skipped_render: 0,
-            perf_dropped_network: 0,
-            perf_lagged_ticks: 0,
-            perf_stages_us: [0; 4],
-        };
+        let mut shell = Self::blank(Engine::new_headless()?);
         shell.init_production();
         // A default input so the UI is usable immediately (the engine
         // itself starts empty; capture will add real inputs later).
@@ -634,13 +620,22 @@ impl Shell {
 
     /// Test constructor with an explicit looks directory.
     pub fn new_with_looks_dir(looks_dir: &std::path::Path) -> Result<Self, ShellError> {
-        let mut shell = Self {
-            engine: Engine::new_headless()?,
+        let mut shell = Self::blank(Engine::new_headless()?);
+        shell.init_production();
+        if let Ok(reg) = LookRegistry::load_dir(looks_dir) {
+            *shell.engine.look_registry_mut() = reg;
+        }
+        Ok(shell)
+    }
+
+    fn blank(engine: Engine) -> Self {
+        Self {
+            engine,
             events: VecDeque::new(),
             last_frame: HashMap::new(),
             preview_cache: HashMap::new(),
             monitor_frame: None,
-            preview_monitor_frame: None,
+            monitor_seq: 0,
             scenes: Vec::new(),
             preview_scene_id: String::new(),
             program_scene_id: String::new(),
@@ -649,39 +644,45 @@ impl Shell {
             stream_settings: production::StreamSettings::default(),
             video_settings: production::VideoSettings::default(),
             stream_lifecycle: production::StreamLifecycle::Idle,
+            stream_started_at: None,
             record_settings: production::RecordSettings::default(),
             record_runtime: None,
             record_error: None,
             macros: Vec::new(),
             media_producers: HashMap::new(),
-            #[cfg(windows)]
-            audio_producers: HashMap::new(),
-            media_last_frame: HashMap::new(),
+            audio_inputs: HashMap::new(),
+            source_frames: HashMap::new(),
+            resized_frames: HashMap::new(),
             camera_formats: HashMap::new(),
             text_cache: HashMap::new(),
             audio_mixer: sf_audio::Mixer::new(),
-            audio_enhancer: sf_audio::Enhancer::new(48_000),
+            audio_bus: sf_audio::AudioBus::new(30, 1),
+            audio_timeline: sf_audio::AudioTimeline::new(),
+            av_sync: production::AvSyncView::default(),
+            enhancer_settings: sf_audio::EnhancerSettings::default(),
+            voice_enhancers: HashMap::new(),
             audio_monitor: None,
             meter_values: HashMap::new(),
             meters_live: false,
-            active_recording: None,
-            active_stream: None,
+            output: None,
+            encoder_note: None,
             perf_frame_times: VecDeque::new(),
             perf_last_tick_us: 0,
             perf_tick_accum_us: 0,
-            perf_window_start: Instant::now(),
             perf_last_bytes: 0,
             perf_last_br_time: Instant::now(),
+            perf_last_kbps: 0.0,
             perf_skipped_render: 0,
             perf_dropped_network: 0,
             perf_lagged_ticks: 0,
             perf_stages_us: [0; 4],
-        };
-        shell.init_production();
-        if let Ok(reg) = LookRegistry::load_dir(looks_dir) {
-            *shell.engine.look_registry_mut() = reg;
+            perf_gpu_us_accum: 0,
+            last_program_video_age_us: None,
+            sys: diagnostics::SysSampler::new(),
+            studio_watch: None,
+            studio_tap: None,
+            data_dir: color_library::default_data_dir(),
         }
-        Ok(shell)
     }
 
     /// Direct (test) access to the engine.
@@ -786,11 +787,16 @@ impl Shell {
         position: &str,
         intensity: f32,
     ) -> Result<(), ShellError> {
-        let pos = match position {
+        // The UI sends "Before"/"After": compare case-insensitively (the
+        // old exact match silently forced every LUT to "after").
+        let pos = match position.to_ascii_lowercase().as_str() {
             "before" => LutPosition::Before,
-            "after" => LutPosition::After,
             _ => LutPosition::After,
         };
+        // Validate before attaching: a bad file is rejected with a clear
+        // message and the current LUT stays (never a broken grade).
+        color_library::validate_lut_file(path)?;
+        self.engine.invalidate_lut(path);
         let grade = self.grade_mut(input_id)?;
         grade.lut = Some(LutRef {
             file: path.to_string(),
@@ -816,6 +822,17 @@ impl Shell {
             Some("wheels") => reset_wheels(grade),
             Some("curves") => grade.curves = Default::default(),
             Some("lut") => grade.lut = None,
+            Some("creative") => {
+                grade.faded_film = 0.0;
+                grade.vibrance = 0.0;
+                grade.saturation = 100.0;
+                grade.sharpness = 0.0;
+            }
+            Some("skin") => {
+                grade.skin_warmth = 0.0;
+                grade.skin_saturation = 0.0;
+                grade.skin_brightness = 0.0;
+            }
             _ => *grade = ColorGrade::default(),
         }
         let snapshot = grade.clone();
@@ -843,6 +860,17 @@ fn apply_param(grade: &mut ColorGrade, param: &str, value: f32) -> Result<(), Sh
         "blacks" => grade.blacks = cl(value, -100.0, 100.0),
         "gamma" => grade.gamma = cl(value, 0.5, 2.5),
         "sharpness" => grade.sharpness = cl(value, 0.0, 100.0),
+        "faded_film" => grade.faded_film = cl(value, 0.0, 100.0),
+        "skin_warmth" => grade.skin_warmth = cl(value, -100.0, 100.0),
+        "skin_saturation" => grade.skin_saturation = cl(value, -100.0, 100.0),
+        "skin_brightness" => grade.skin_brightness = cl(value, -100.0, 100.0),
+        "skin_protect" => grade.skin_protect = value >= 0.5,
+        // Live LUT blend (no reload): slider drags update the uniform only.
+        "lut_intensity" => {
+            if let Some(l) = grade.lut.as_mut() {
+                l.intensity = cl(value, 0.0, 1.0);
+            }
+        }
         _ => {
             // Wheel channels: `<wheel>_<r|g|b|master>`.
             let (wheel, ch) = param
@@ -871,7 +899,9 @@ fn apply_param(grade: &mut ColorGrade, param: &str, value: f32) -> Result<(), Sh
 fn reset_single_param(grade: &mut ColorGrade, param: &str) -> Result<(), ShellError> {
     let neutral = match param {
         "exposure" | "brightness" | "contrast" | "vibrance" | "tint" | "highlights" | "shadows"
-        | "whites" | "blacks" | "sharpness" => 0.0,
+        | "whites" | "blacks" | "sharpness" | "faded_film" | "skin_warmth" | "skin_saturation"
+        | "skin_brightness" | "skin_protect" => 0.0,
+        "lut_intensity" => 1.0,
         "saturation" => 100.0,
         "temperature" => 6500.0,
         "gamma" => 1.0,
@@ -1136,13 +1166,32 @@ impl Shell {
         if self.engine.look_registry_mut().get(look_id).is_none() {
             return Err(ShellError::UnknownLook(look_id.to_string()));
         }
+        // One active look per stack (filter-app semantics): picking another
+        // look swaps the existing look slot in place — same slot id, so the
+        // intensity slider keeps driving it — instead of stacking looks
+        // (which compounded them and hit the 2-look limit on the 3rd click).
+        let new_filter = Filter::Look {
+            preset_id: look_id.to_string(),
+            intensity: 1.0,
+        };
+        let existing = self
+            .stack(&target)?
+            .slots()
+            .iter()
+            .find(|s| matches!(s.filter, Filter::Look { .. }))
+            .map(|s| s.id);
+        if let Some(id) = existing {
+            let stack = self.stack_mut(&target)?;
+            stack.replace_filter(&id, new_filter, intensity)?;
+            let _ = stack.toggle(&id, true);
+            self.events
+                .push_back(UiEvent::FilterStackChanged { target });
+            return Ok(id);
+        }
         let id = Uuid::new_v4();
         let slot = FilterSlot {
             id,
-            filter: Filter::Look {
-                preset_id: look_id.to_string(),
-                intensity: 1.0,
-            },
+            filter: new_filter,
             enabled: true,
             intensity: intensity.clamp(0.0, 1.0),
             mask: None,
@@ -1160,6 +1209,38 @@ impl Shell {
         self.events
             .push_back(UiEvent::FilterStackChanged { target });
         Ok(id)
+    }
+
+    /// Removes the active look (if any) from a stack.
+    pub fn look_clear(&mut self, target: FilterTarget) -> Result<(), ShellError> {
+        let ids: Vec<Uuid> = self
+            .stack(&target)?
+            .slots()
+            .iter()
+            .filter(|s| matches!(s.filter, Filter::Look { .. }))
+            .map(|s| s.id)
+            .collect();
+        let stack = self.stack_mut(&target)?;
+        for id in &ids {
+            stack.remove(id);
+        }
+        self.events
+            .push_back(UiEvent::FilterStackChanged { target });
+        Ok(())
+    }
+
+    /// Updates an effect slot's parameters live (Glow threshold/radius/
+    /// softness, skin smoothing, …).
+    pub fn filter_set_params(
+        &mut self,
+        target: FilterTarget,
+        slot_id: Uuid,
+        params: sf_filters::EffectParams,
+    ) -> Result<(), ShellError> {
+        self.stack_mut(&target)?.set_effect_params(&slot_id, params)?;
+        self.events
+            .push_back(UiEvent::FilterStackChanged { target });
+        Ok(())
     }
 
     /// Serializable snapshot of a stack for the Filters tab.
@@ -1190,9 +1271,11 @@ impl Shell {
                     intensity: slot.intensity,
                     cost: "low".to_string(),
                     is_ai: false,
+                    params: None,
+                    look_id: Some(preset_id.clone()),
                 }
             }
-            Filter::Effect { kind, params: _ } => SlotView {
+            Filter::Effect { kind, params } => SlotView {
                 id: slot.id,
                 label: effect_label(kind),
                 kind: format!("{kind:?}").to_lowercase(),
@@ -1200,6 +1283,8 @@ impl Shell {
                 intensity: slot.intensity,
                 cost: cost_name(kind.cost()),
                 is_ai: kind.is_ai(),
+                params: Some(params.clone()),
+                look_id: None,
             },
         }
     }
@@ -1352,15 +1437,15 @@ impl Shell {
     }
     /// Active stream encoder name (e.g. "h264_nvenc"), or empty when idle.
     pub fn stream_encoder_name(&self) -> String {
-        self.active_stream
+        self.output
             .as_ref()
-            .map(|a| a.encoder_name().to_string())
+            .map(|o| o.encoder_name().to_string())
             .unwrap_or_default()
     }
 
-    /// Returns (fps, render_ms, cpu_percent_estimate, stream_kbps,
+    /// Returns (fps, render_ms, cpu_percent, stream_kbps,
     /// skipped_render, dropped_network, lagged_ticks).
-    /// CPU% is estimated as (tick time / wall time) over the last second.
+    /// CPU% is the real process CPU time over wall time, all cores = 100 %.
     /// stream_kbps is the RTMP upload bitrate (0 when not streaming).
     /// skipped_render counts frames the render/encode stage couldn't keep up
     /// with; dropped_network counts packets the network couldn't take;
@@ -1375,33 +1460,9 @@ impl Shell {
         }
         let fps = self.perf_frame_times.len() as f32;
         let render_ms = self.perf_last_tick_us as f32 / 1000.0;
-        // CPU% estimate: reset window every second.
-        let elapsed = now.duration_since(self.perf_window_start).as_micros() as f32;
-        let cpu_pct = if elapsed > 0.0 {
-            (self.perf_tick_accum_us as f32 / elapsed * 100.0).min(100.0)
-        } else {
-            0.0
-        };
-        if elapsed >= 1_000_000.0 {
-            self.perf_window_start = now;
-            self.perf_tick_accum_us = 0;
-        }
-        // Stream bitrate: bytes sent since last call.
-        let kbps = if let Some(a) = self.active_stream.as_ref() {
-            let bytes = a.bytes_sent();
-            let dt = now.duration_since(self.perf_last_br_time).as_secs_f32();
-            let br = if dt > 0.1 {
-                (bytes - self.perf_last_bytes) as f32 * 8.0 / dt / 1000.0
-            } else {
-                0.0
-            };
-            self.perf_last_bytes = bytes;
-            self.perf_last_br_time = now;
-            br.max(0.0)
-        } else {
-            self.perf_last_bytes = 0;
-            0.0
-        };
+        // Real process CPU (all threads, normalized to the machine).
+        let cpu_pct = self.sys.sample().cpu_percent;
+        let kbps = self.upload_kbps(now);
         (
             fps,
             render_ms,
@@ -1411,6 +1472,29 @@ impl Shell {
             self.perf_dropped_network as f32,
             self.perf_lagged_ticks as f32,
         )
+    }
+
+    /// Upload bitrate since the last call (kbps), rate-limited to ≥ 0.5 s
+    /// windows so concurrent pollers don't zero it.
+    pub(crate) fn upload_kbps(&mut self, now: Instant) -> f32 {
+        let Some(bytes) = self
+            .output
+            .as_ref()
+            .and_then(|o| o.stream.as_ref())
+            .map(|s| s.bytes_sent())
+        else {
+            self.perf_last_bytes = 0;
+            self.perf_last_kbps = 0.0;
+            return 0.0;
+        };
+        let dt = now.duration_since(self.perf_last_br_time).as_secs_f32();
+        if dt >= 0.5 {
+            let delta = bytes.saturating_sub(self.perf_last_bytes);
+            self.perf_last_kbps = delta as f32 * 8.0 / dt / 1000.0;
+            self.perf_last_bytes = bytes;
+            self.perf_last_br_time = now;
+        }
+        self.perf_last_kbps
     }
 
     /// Last tick's stage timings in milliseconds:
@@ -1458,25 +1542,10 @@ impl Shell {
                     })
                     .map(|src| src.id.clone())
             })?;
-        // When the program feed is live (recording/streaming), the media
-        // tick already caches each program frame in `media_last_frame`.
-        // Serve the preview from that cache (downscaled) so the preview
-        // never consumes/steals live producer frames from the program feed:
-        // independent, lightweight preview per the realtime blueprint.
-        let program_live = self.active_recording.is_some() || self.active_stream.is_some();
-        if program_live {
-            if let Some((w, h, px)) = self.media_last_frame.get(&source_id).cloned() {
-                if w == width && h == height {
-                    return Some(px);
-                }
-                return Some(av_backends::resize_rgba_nearest(
-                    &px, w, h, width, height,
-                ));
-            }
-        }
-        // Idle (or no program frame yet): the preview is the only consumer,
-        // so pulling directly is safe.
+        // Served from the per-tick source cache: never pulls the producer,
+        // so the preview can't steal live frames from the program feed.
         self.pull_media_frame(&source_id, width, height)
+            .map(|px| std::sync::Arc::try_unwrap(px).unwrap_or_else(|a| (*a).clone()))
     }
 }
 
@@ -1538,21 +1607,25 @@ fn encode_png(frame: &Frame) -> Result<Vec<u8>, ShellError> {
 /// program/preview monitors: ~10x smaller than PNG for camera frames, so a
 /// 10fps monitor poll stays cheap over IPC.
 pub(crate) fn encode_jpeg(frame: &Frame, quality: u8) -> Result<Vec<u8>, ShellError> {
+    encode_jpeg_rgba(&frame.pixels, frame.width, frame.height, quality)
+}
+
+/// JPEG-encodes raw RGBA8 pixels (alpha dropped).
+pub fn encode_jpeg_rgba(
+    pixels: &[u8],
+    width: u32,
+    height: u32,
+    quality: u8,
+) -> Result<Vec<u8>, ShellError> {
     use image::codecs::jpeg::JpegEncoder;
     use image::{ExtendedColorType, ImageEncoder};
-    // JPEG has no alpha: flatten onto black (monitors never need transparency).
-    let mut rgb = Vec::with_capacity(frame.width as usize * frame.height as usize * 3);
-    for px in frame.pixels.chunks_exact(4) {
+    let mut rgb = Vec::with_capacity(width as usize * height as usize * 3);
+    for px in pixels.chunks_exact(4) {
         rgb.extend_from_slice(&px[0..3]);
     }
     let mut buf = Vec::new();
     JpegEncoder::new_with_quality(&mut buf, quality)
-        .write_image(
-            &rgb,
-            frame.width,
-            frame.height,
-            ExtendedColorType::Rgb8,
-        )
+        .write_image(&rgb, width, height, ExtendedColorType::Rgb8)
         .map_err(|e| ShellError::Png(e.to_string()))?;
     Ok(buf)
 }

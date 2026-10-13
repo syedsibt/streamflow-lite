@@ -1,0 +1,49 @@
+{
+  "name": "Movie",
+  "version": 1,
+  "category": "Cinematic",
+  "params": {
+    "contrast": 22,
+    "saturation": 85,
+    "vibrance": 10,
+    "temperature": 6400,
+    "highlights": -18,
+    "shadows": -6,
+    "blacks": -10,
+    "lift": [
+      -0.004,
+      0.002,
+      0.01,
+      0
+    ],
+    "gain": [
+      1.04,
+      1.01,
+      0.95,
+      1.0
+    ],
+    "curves": {
+      "master": {
+        "points": [
+          [
+            0,
+            0
+          ],
+          [
+            0.25,
+            0.19
+          ],
+          [
+            0.75,
+            0.82
+          ],
+          [
+            1,
+            1
+          ]
+        ]
+      }
+    }
+  },
+  "skin_protect": true
+}

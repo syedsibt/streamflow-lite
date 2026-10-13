@@ -13,8 +13,6 @@
 //! ([`AUDIO_SAMPLE_RATE`] / [`AUDIO_CHANNELS`]). The engine's audio mixer
 //! expects exactly this layout, so capture normalizes once at the source.
 
-use std::time::{SystemTime, UNIX_EPOCH};
-
 use ffmpeg_next as ff;
 
 use super::demux::{ensure_init, DemuxDecoder};
@@ -27,11 +25,11 @@ const MAX_CATCHUP_DECODE: usize = 8;
 /// the catch-up budget, resync the clock (drop the backlog).
 const RESYNC_BEHIND_US: i64 = 100_000;
 
+/// Playback clock: the pipeline's monotonic clock (immune to wall-clock
+/// jumps — the old `SystemTime` clock could freeze or skip playback when
+/// Windows adjusted the time).
 fn now_us() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_micros() as u64)
-        .unwrap_or(0)
+    super::clock::now_us().max(0) as u64
 }
 
 /// Normalized audio sample rate (Hz) produced by [`MediaFileProducer::next_audio`].
@@ -49,6 +47,9 @@ pub struct DecodedAudio {
     pub sample_rate: u32,
     /// Presentation timestamp in microseconds.
     pub pts_us: i64,
+    /// Capture time of the first sample on [`crate::clock::now_us`]
+    /// (device timestamps mapped for live inputs; decode time for files).
+    pub captured_at_us: i64,
 }
 
 impl DecodedAudio {
@@ -81,8 +82,6 @@ pub struct MediaFileProducer {
     paused: bool,
     /// A frame decoded ahead of the clock, held for the next pull.
     pending: Option<CapturedFrame>,
-    /// Last frame handed out (shown while paused or when stalled).
-    last: Option<CapturedFrame>,
 }
 
 impl MediaFileProducer {
@@ -115,7 +114,6 @@ impl MediaFileProducer {
             play_offset_us: 0,
             paused: false,
             pending: None,
-            last: None,
         })
     }
 
@@ -156,6 +154,7 @@ impl MediaFileProducer {
             channels: AUDIO_CHANNELS,
             sample_rate: AUDIO_SAMPLE_RATE,
             pts_us: a.pts_us,
+            captured_at_us: a.captured_at_us,
             samples: a.samples,
         }))
     }
@@ -210,7 +209,7 @@ impl FrameProducer for MediaFileProducer {
                 current = Some(p);
             } else {
                 self.pending = Some(p);
-                return Ok(self.last.clone());
+                return Ok(None);
             }
         }
 
@@ -233,14 +232,20 @@ impl FrameProducer for MediaFileProducer {
         }
         // If the whole catch-up budget still leaves us behind the clock,
         // resync the clock to the newest frame instead of melting CPU.
-        if let Some(ref c) = current {
+        if let Some(c) = current.as_mut() {
+            // A file frame is "captured" when it becomes due for display
+            // (it may have been decoded ahead): latency diagnostics then
+            // measure the pipeline, not the file's decode lookahead.
+            c.captured_at_us = now as i64;
             if target_us - c.pts_us > RESYNC_BEHIND_US {
                 self.play_offset_us = c.pts_us.max(0) as u64;
                 self.play_start_us = Some(now);
             }
-            self.last = Some(c.clone());
         }
-        Ok(current.or_else(|| self.last.clone()))
+        // Only *new* frames are returned (no per-call full-frame clone of
+        // the previous picture); the single per-tick consumer keeps the
+        // last frame itself.
+        Ok(current)
     }
 
     fn stream_info(&self) -> StreamInfo {
@@ -369,6 +374,7 @@ mod tests {
             channels: 2,
             sample_rate: 48_000,
             pts_us: 0,
+            captured_at_us: 0,
         };
         assert_eq!(a.frames(), 48_000);
         assert_eq!(a.duration_us(), 1_000_000);
@@ -376,10 +382,11 @@ mod tests {
 
     #[test]
     fn newest_drain_decodes_only_last_frame() {
-        // Exercises DemuxDecoder::next_video_newest (the live capture
-        // path): packets are discarded without decoding, only the newest
-        // packet is decoded. Uses MJPEG (one packet == one frame), like a
-        // real capture device.
+        // Exercises DemuxDecoder::drain_live (the live capture path):
+        // everything queued is read in one non-blocking pass, stale MJPEG
+        // packets are discarded without decoding, only the newest is
+        // decoded. A file stands in for a device whose queue holds 30
+        // frames (e.g. after a stall).
         use crate::demux::DemuxDecoder;
         use std::path::PathBuf;
         use std::process::Command;
@@ -398,12 +405,16 @@ mod tests {
         let ictx = ff::format::input(&PathBuf::from(&path_str)).expect("open mjpeg file");
         let mut demux = DemuxDecoder::from_input(ictx, 33_333).expect("demux");
         demux.set_live(true);
-        // Drains the whole 1s file (EOF ends the packet loop), decodes only
-        // the newest packet: exactly one frame comes out.
-        let f = demux.next_video_newest().expect("drain").expect("frame");
+        demux.set_nonblocking();
+        assert!(demux.intra_only(), "MJPEG is intra-only");
+        let d = demux.drain_live().expect("drain");
+        let f = d.frame.expect("newest frame");
         assert_eq!((f.width, f.height), (320, 240));
-        // At EOF there are no more packets: clean None, not an error.
-        assert!(demux.next_video_newest().expect("eof").is_none());
+        assert_eq!(d.packets, 30);
+        assert_eq!(d.dropped, 29, "29 stale frames dropped without decoding");
+        assert!(d.eof);
+        // Newest frame = last frame of the file.
+        assert!(f.pts_us >= 950_000, "pts {}", f.pts_us);
     }
 
     #[test]
@@ -421,7 +432,15 @@ mod tests {
         p.set_paused(false);
         assert!(!p.is_paused());
         // Resumes from the same position: a frame is due immediately.
-        let f1 = p.next_frame().expect("resumed pull").expect("frame");
+        let f1 = (0..50)
+            .find_map(|_| {
+                let f = p.next_frame().expect("resumed pull");
+                if f.is_none() {
+                    std::thread::sleep(std::time::Duration::from_millis(5));
+                }
+                f
+            })
+            .expect("frame after resume");
         assert!(f1.pts_us >= f0.pts_us);
     }
 }

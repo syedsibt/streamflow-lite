@@ -25,7 +25,7 @@ The UI only sends parameters; the engine applies everything on the GPU.
 | `sf-filters` | Look presets (`.sflook`), `FilterStack` rules, effect kind/param models |
 | `sf-filterfx` | Effect-filter GPU passes (WGSL) + CPU references |
 | `sf-scopes` | GPU scopes: waveform, vectorscope, histogram, false color, zebra |
-| `sf-audio` | Audio engine (AI denoise, leveling — later phases) |
+| `sf-audio` | Audio engine: clocked bus (exact samples per tick), live-input capture threads, mixer, real-time voice chain (RNNoise AI denoise → gate → EQ → compressor, 20 ms fixed latency) |
 | `sf-encode` | Hardware encoders (NVENC/QuickSync/AMF via wgpu-interop or FFmpeg) |
 | `sf-output` | Streaming / recording outputs |
 | `sf-replay` | Replay buffer |
@@ -213,3 +213,56 @@ Rules: slider drag → realtime GPU update, IPC throttled to 60 Hz; double-click
 = reset; per-camera color tab + "Apply to all cameras"; compact mode shows only
 Exposure, Temp, Saturation, Look picker; accent `#3B82F6`, dark theme, scopes use
 natural channel colors.
+
+## Audio pipeline (real-time)
+
+```text
+mic / camera audio ─► LiveInput thread (dshow, 20 ms packets) ─┐
+media file audio  ─► paced pull (fills one block + 10 ms) ─────┼─► AudioBus
+                                                               │   per-source jitter FIFO,
+                                                               │   exact frames per tick
+                                                               │   (1600 @ 30 fps), silence on
+                                                               │   underrun, trim > 100 ms
+voice sources only ─► Enhancer: RNNoise AI denoise → voice-aware gate → EQ → compressor
+                    ─► Mixer (equal-length blocks) ─► AAC encoder / monitor / meters
+```
+
+* Enhancement runs on-device. A cloud/HTTP enhancement API cannot sit in a
+  live audio path: each 33 ms block must be finished before the next one, and
+  a network round-trip (100–500 ms + jitter) would either delay the whole
+  stream by that much or drop audio.
+* RNNoise is vendored in `crates/sf-audio/src/rnnoise` (from `nnnoiseless`
+  0.5.2, BSD-3) with a built-in 960-point FFT, so `sf-audio` keeps zero
+  dependencies. It is verified against Xiph's reference output.
+* Fixed latencies: device packet 10–20 ms, bus queue typically 10–45 ms,
+  AI stage 20 ms. Nothing can accumulate: the bus trims past 100 ms, the
+  monitor past 120 ms.
+
+## Color pipeline (Color Studio = a processing layer of the live pipeline)
+
+```text
+camera frame (display RGB8)
+  └─ grade_input_frame (one fused GPU compute pass, per input)
+       linearize (γ2.4)
+       → [Input LUT, display-referred]          (LUT "before")
+       → exposure → white balance → shadow/mid/highlight wheels
+       → tone (contrast, highlights, shadows, whites, blacks) → gamma
+       → saturation / vibrance (skin-protected) → skin warmth/sat/brightness
+       → curves (display-referred: RGB, R, G, B, luma, hue-vs-sat)
+       → faded film (display-referred)
+       → [Creative LUT, display-referred, intensity blend]   (LUT "after")
+     → sharpen → effect slots (Glow, skin smoothing, …) in stack order
+  └─ composite → program frame ─┬─ main preview / monitors
+                                ├─ encoder → YouTube / Facebook / TikTok
+                                └─ Color Studio preview (live tap, moved —
+                                   no second grade, no second camera pull)
+```
+
+* Looks/filters are **parameter presets** folded into the same grade pass
+  (`resolve_grade`): intensity scales every parameter (and curves) toward
+  identity. One active look per input.
+* `.cube` LUTs and curves operate on **display-referred** values (what
+  Premiere/Resolve LUTs and curve editors assume); grading math stays linear.
+* Non-destructive: the camera frame is never modified; all state is
+  parameters (saved as presets in the user data folder).
+* A bad/missing LUT is skipped (reported), never failing the live frame.

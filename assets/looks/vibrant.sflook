@@ -1,0 +1,11 @@
+{
+  "name": "Vibrant",
+  "version": 1,
+  "category": "Social",
+  "params": {
+    "vibrance": 35,
+    "saturation": 108,
+    "contrast": 12
+  },
+  "skin_protect": true
+}

@@ -84,6 +84,24 @@ impl Curve {
     pub fn is_identity(&self) -> bool {
         self.points == default_curve_points()
     }
+
+    /// The curve blended toward the identity diagonal by `t` (0 = identity,
+    /// 1 = unchanged) — used for look/preset intensity.
+    pub fn scaled(&self, t: f32) -> Curve {
+        let t = t.clamp(0.0, 1.0);
+        if t >= 1.0 {
+            return self.clone();
+        }
+        let mut pts: Vec<[f32; 2]> = self
+            .points
+            .iter()
+            .map(|&[x, y]| [x, (x + (y - x) * t).clamp(0.0, 1.0)])
+            .collect();
+        if t <= 0.0 {
+            pts = default_curve_points();
+        }
+        Curve { points: pts }
+    }
 }
 
 /// A curve with precomputed Fritsch–Carlson tangents, ready for evaluation.
@@ -175,6 +193,18 @@ pub struct CurveSet {
 
 impl CurveSet {
     /// True when every curve is the neutral diagonal.
+    /// Every curve blended toward identity by `t` (see [`Curve::scaled`]).
+    pub fn scaled(&self, t: f32) -> CurveSet {
+        CurveSet {
+            master: self.master.scaled(t),
+            r: self.r.scaled(t),
+            g: self.g.scaled(t),
+            b: self.b.scaled(t),
+            luma: self.luma.scaled(t),
+            hue_vs_sat: self.hue_vs_sat.scaled(t),
+        }
+    }
+
     pub fn is_identity(&self) -> bool {
         self.master.is_identity()
             && self.r.is_identity()
@@ -203,7 +233,19 @@ impl CurveSet {
             let solved = SolvedCurve::new(curve);
             let base = (4 + ch) * BAKED_CURVE_SIZE;
             for i in 0..BAKED_CURVE_SIZE {
-                data[base + i] = solved.eval(i as f32 / (BAKED_CURVE_SIZE as f32 - 1.0));
+                let x = i as f32 / (BAKED_CURVE_SIZE as f32 - 1.0);
+                let y = solved.eval(x);
+                data[base + i] = if ch == 1 {
+                    // Hue-vs-sat is a *multiplier*, edited in the same
+                    // diagonal editor as the other curves: the deviation
+                    // from the diagonal sets it (diagonal = 1.0 = no change,
+                    // +0.5 above = 2x, -0.5 below = 0x). Baking the raw y
+                    // value used to multiply saturation by the hue itself
+                    // whenever any other curve was edited.
+                    (1.0 + 2.0 * (y - x)).max(0.0)
+                } else {
+                    y
+                };
             }
         }
         BakedCurves { data }
@@ -251,8 +293,9 @@ mod tests {
             assert!((baked.sample(0, 0, x) - x).abs() < 1e-6, "R at {x}");
             assert!((baked.sample(0, 3, x) - x).abs() < 1e-6, "master at {x}");
             assert!((baked.sample(1, 0, x) - x).abs() < 1e-6, "luma at {x}");
+            // Hue-vs-sat bakes a saturation *multiplier*: identity = 1.0.
             assert!(
-                (baked.sample(1, 1, x) - x).abs() < 1e-6,
+                (baked.sample(1, 1, x) - 1.0).abs() < 1e-5,
                 "hue_vs_sat at {x}"
             );
         }

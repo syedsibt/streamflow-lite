@@ -1,77 +1,51 @@
-//! Windows microphone / line-in capture via FFmpeg's `dshow` audio device.
+//! Windows microphone / line-in / capture-card audio via FFmpeg's `dshow`
+//! audio device.
 //!
 //! # OBS parity
-//! OBS captures audio through WASAPI (`plugins/win-wasapi`): an
-//! event-driven `IAudioClient` capture thread, with microphones on
-//! `eCapture` and desktop audio on `eRender` +
-//! `AUDCLNT_STREAMFLAGS_LOOPBACK`, pushing timestamped buffers through
-//! `obs_source_output_audio`. We reach the same physical devices through
-//! FFmpeg's dshow audio input (`audio="Device Name"`) and normalize to the
-//! engine's 48 kHz stereo f32 format with the same decode+resample
-//! machinery media files use.
+//! OBS captures audio through WASAPI on a dedicated thread and stamps each
+//! buffer with its capture time. We reach the same physical devices
+//! through FFmpeg's dshow audio input (`audio="Device Name"`), normalize to
+//! the engine's 48 kHz stereo f32, and stamp every chunk with its capture
+//! time on the pipeline clock ([`crate::clock`]), so the mixer can align
+//! audio with video captured at the same moment.
 //!
-//! # Realtime rules (the blueprint's core: never let frames accumulate)
-//! * The chunk queue is bounded (8) and newest-wins: a slow consumer drops
-//!   backlog instead of growing memory.
-//! * Every read is bounded by a 25 ms interrupt deadline — a stalled
-//!   device reports "no audio yet", never hangs the media tick.
+//! # Realtime rules
+//! * Reads are **non-blocking** (`AVFMT_FLAG_NONBLOCK`): dshow ignores the
+//!   interrupt callback, so the previous blocking read could hang its thread
+//!   forever on an unplugged device (and the old `packets()` loop could
+//!   never time out). [`AudioInputProducer::next_audio`] returns `Ok(None)`
+//!   immediately when the device has nothing queued.
+//! * DirectShow's default capture buffer is ~500 ms; `audio_buffer_size=20`
+//!   requests 20 ms packets so each word arrives promptly.
+//! * The internal queue is bounded (newest wins).
 //!
 //! # Status
-//! Code-complete; **hardware-unverified** — no Windows microphone exists on
-//! the CI/dev machines. The open path follows FFmpeg's documented `dshow`
-//! audio API; decode/resample is the tested machinery from `demux.rs`.
+//! Code-complete; **hardware-unverified** here (no Windows audio device on
+//! the dev machines). Non-blocking read semantics are unit-tested on Linux
+//! with a live network input (same FFmpeg read path).
 
 use std::collections::VecDeque;
-use std::ffi::CString;
-use std::os::raw::{c_int, c_void};
-use std::ptr;
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
+#[cfg(any(windows, sf_wincheck))]
+use std::time::Duration;
 
 use ffmpeg_next as ff;
 
-use super::demux::{ensure_init, pts_to_us};
+use super::clock::{now_us, ClockMapper};
+use super::demux::pts_to_us;
 use super::media::{DecodedAudio, AUDIO_CHANNELS, AUDIO_SAMPLE_RATE};
 use super::CaptureError;
 
-/// Max queued audio chunks. dshow delivers small packets; 8 chunks is
-/// ~170 ms of 48 kHz audio — plenty for a 33 ms tick, bounded forever.
+/// Max queued audio chunks (~170 ms of 20 ms packets), newest wins.
 const MAX_QUEUE: usize = 8;
-
-/// A live device that stops delivering must not hang the tick.
-const READ_TIMEOUT_US: u64 = 25_000;
 /// Opening a missing/unplugged device must fail fast, not hang.
-const OPEN_TIMEOUT_US: u64 = 5_000_000;
+#[cfg(any(windows, sf_wincheck))]
+const OPEN_TIMEOUT: Duration = Duration::from_secs(5);
+/// Bound on packets consumed per call.
+const MAX_PACKETS_PER_CALL: usize = 64;
 
-fn now_us() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_micros() as u64)
-        .unwrap_or(0)
-}
-
-struct ReadDeadline {
-    deadline_us: AtomicU64,
-}
-
-unsafe extern "C" fn interrupt_cb(opaque: *mut c_void) -> c_int {
-    if opaque.is_null() {
-        return 0;
-    }
-    let rd = unsafe { &*(opaque as *const ReadDeadline) };
-    let dl = rd.deadline_us.load(Ordering::Relaxed);
-    if dl != 0 && now_us() >= dl {
-        1 // abort the blocking read
-    } else {
-        0
-    }
-}
-
-/// Live microphone / line-in audio producer (Windows dshow).
+/// Live audio input producer (Windows dshow), non-blocking.
 pub struct AudioInputProducer {
     ictx: ff::format::context::Input,
-    deadline: Arc<ReadDeadline>,
     audio_stream: usize,
     decoder: ff::decoder::Audio,
     resampler: ff::software::resampling::Context,
@@ -79,17 +53,19 @@ pub struct AudioInputProducer {
     queue: VecDeque<DecodedAudio>,
     samples_out: u64,
     device_name: String,
+    clock: ClockMapper,
 }
 
-// SAFETY: FFmpeg contexts have no thread affinity; the backend serializes
-// all producer access through the shell `Mutex`.
+// SAFETY: FFmpeg contexts have no thread affinity; the producer is owned
+// by exactly one capture thread at a time.
 unsafe impl Send for AudioInputProducer {}
 
 impl AudioInputProducer {
     /// Open the named dshow audio device (`list_audio_devices` names).
-    /// `None` picks the first available device (OBS "default" equivalent).
+    /// `None` picks the first available device.
+    #[cfg(any(windows, sf_wincheck))]
     pub fn open(device: Option<&str>) -> Result<Self, CaptureError> {
-        ensure_init();
+        super::demux::ensure_init();
         let name = match device {
             Some(d) if !d.is_empty() => d.to_string(),
             _ => super::dshow::list_audio_devices()?
@@ -97,69 +73,30 @@ impl AudioInputProducer {
                 .next()
                 .ok_or_else(|| CaptureError::OpenFailed("no audio input devices found".into()))?,
         };
-        let fmt_name = CString::new("dshow").unwrap();
-        let fmt = unsafe { ff::ffi::av_find_input_format(fmt_name.as_ptr()) };
-        if fmt.is_null() {
-            return Err(CaptureError::OpenFailed(
-                "FFmpeg was built without dshow support".into(),
-            ));
-        }
-        let url = CString::new(format!("audio={name}"))
-            .map_err(|_| CaptureError::OpenFailed("device name contains NUL".into()))?;
-
-        let deadline = Arc::new(ReadDeadline {
-            deadline_us: AtomicU64::new(now_us() + OPEN_TIMEOUT_US),
-        });
-        let mut ctx: *mut ff::ffi::AVFormatContext =
-            unsafe { ff::ffi::avformat_alloc_context() };
-        if ctx.is_null() {
-            return Err(CaptureError::OpenFailed("avformat_alloc_context failed".into()));
-        }
+        let url = format!("audio={name}");
+        let mut ictx = super::live::open_input(
+            Some("dshow"),
+            &url,
+            // 20 ms device packets instead of DirectShow's ~500 ms default.
+            &[("audio_buffer_size", "20")],
+            OPEN_TIMEOUT,
+        )
+        .map_err(|e| CaptureError::OpenFailed(format!("cannot open audio device '{name}': {e}")))?;
         unsafe {
-            (*ctx).interrupt_callback.callback = Some(interrupt_cb);
-            (*ctx).interrupt_callback.opaque = Arc::as_ptr(&deadline) as *mut c_void;
+            (*ictx.as_mut_ptr()).flags |= ff::ffi::AVFMT_FLAG_NONBLOCK;
         }
-        let mut dict: *mut ff::ffi::AVDictionary = ptr::null_mut();
-        let mut set_opt = |k: &str, v: &str| unsafe {
-            let key = CString::new(k).unwrap();
-            let val = CString::new(v).unwrap();
-            ff::ffi::av_dict_set(&mut dict, key.as_ptr(), val.as_ptr(), 0);
-        };
-        // Live: no internal buffering (the lag lesson from cameras), tiny probe.
-        set_opt("fflags", "nobuffer");
-        set_opt("probesize", "32");
-        set_opt("analyzeduration", "0");
-        let ret = unsafe {
-            ff::ffi::avformat_open_input(
-                &mut ctx,
-                url.as_ptr(),
-                fmt as *mut ff::ffi::AVInputFormat,
-                &mut dict,
-            )
-        };
-        unsafe { ff::ffi::av_dict_free(&mut dict) };
-        if ret < 0 || ctx.is_null() {
-            // `avformat_open_input` frees `ctx` on failure; do not touch it.
-            return Err(CaptureError::OpenFailed(format!(
-                "cannot open audio device '{name}'"
-            )));
+        Self::from_input(ictx, name)
+    }
+
+    /// Build from an already-open live input (any FFmpeg input with an
+    /// audio stream). Used by [`Self::open`] and by tests.
+    pub fn from_input(
+        mut ictx: ff::format::context::Input,
+        device_name: String,
+    ) -> Result<Self, CaptureError> {
+        unsafe {
+            (*ictx.as_mut_ptr()).flags |= ff::ffi::AVFMT_FLAG_NONBLOCK;
         }
-        let si_ret = unsafe { ff::ffi::avformat_find_stream_info(ctx, ptr::null_mut()) };
-        // Open phase done — disarm; per-read timeouts are armed in `next_audio`.
-        deadline.deadline_us.store(0, Ordering::Relaxed);
-        if si_ret < 0 {
-            unsafe { ff::ffi::avformat_close_input(&mut ctx) };
-            return Err(CaptureError::OpenFailed(
-                "avformat_find_stream_info failed".into(),
-            ));
-        }
-        // The interrupt callback stays installed for the context's lifetime;
-        // `deadline` (Arc) is owned by `Self`, so the opaque pointer stays
-        // valid until drop.
-        //
-        // SAFETY: `ctx` is a valid open input context owned by us now;
-        // `Input::wrap` takes ownership and closes it on drop.
-        let ictx = unsafe { ff::format::context::Input::wrap(ctx) };
         let audio_stream = ictx
             .streams()
             .best(ff::media::Type::Audio)
@@ -183,17 +120,16 @@ impl AudioInputProducer {
             AUDIO_SAMPLE_RATE,
         )
         .map_err(|e| CaptureError::OpenFailed(format!("swresample setup: {e}")))?;
-
         Ok(Self {
             ictx,
-            deadline,
             audio_stream: audio_index,
             decoder,
             resampler,
             audio_tb: (tb.numerator(), tb.denominator()),
             queue: VecDeque::with_capacity(MAX_QUEUE),
             samples_out: 0,
-            device_name: name,
+            device_name,
+            clock: ClockMapper::new(),
         })
     }
 
@@ -202,38 +138,36 @@ impl AudioInputProducer {
         &self.device_name
     }
 
-    /// Pull the next normalized audio chunk (48 kHz stereo f32).
-    /// `Ok(None)` = no chunk available within the read timeout.
+    /// Next normalized chunk (48 kHz stereo f32) with its capture time.
+    /// Never blocks: `Ok(None)` when the device has nothing queued yet.
+    /// `Err(EndOfStream)` when the device ended (unplugged).
     pub fn next_audio(&mut self) -> Result<Option<DecodedAudio>, CaptureError> {
+        use ff::util::error::{Error, EAGAIN};
         if let Some(c) = self.queue.pop_front() {
             return Ok(Some(c));
         }
-        // Bounded read: the interrupt callback aborts a stalled device.
-        // Collect a small burst of packets first (ending the `&self.ictx`
-        // borrow) so decoding can take `&mut self`.
-        self.deadline
-            .deadline_us
-            .store(now_us() + READ_TIMEOUT_US, Ordering::Relaxed);
-        let mut burst: Vec<ff::Packet> = Vec::new();
-        for (stream, packet) in self.ictx.packets() {
-            if stream.index() == self.audio_stream {
-                burst.push(packet);
-                if burst.len() >= 4 {
-                    break;
-                }
+        for _ in 0..MAX_PACKETS_PER_CALL {
+            let mut pkt = ff::Packet::empty();
+            match pkt.read(&mut self.ictx) {
+                Ok(()) => {}
+                Err(Error::Other { errno }) if errno == EAGAIN => break,
+                Err(Error::Exit) => break,
+                Err(Error::Eof) => return Err(CaptureError::EndOfStream),
+                Err(e) => return Err(CaptureError::ReadFailed(format!("audio read: {e}"))),
             }
-        }
-        self.deadline.deadline_us.store(0, Ordering::Relaxed);
-        for packet in &burst {
+            if pkt.stream() != self.audio_stream {
+                continue;
+            }
+            let read_at = now_us();
             self.decoder
-                .send_packet(packet)
+                .send_packet(&pkt)
                 .map_err(|e| CaptureError::ReadFailed(format!("audio send_packet: {e}")))?;
-            self.drain_decoder()?;
+            self.drain_decoder(read_at)?;
         }
         Ok(self.queue.pop_front())
     }
 
-    fn drain_decoder(&mut self) -> Result<(), CaptureError> {
+    fn drain_decoder(&mut self, read_at: i64) -> Result<(), CaptureError> {
         loop {
             let mut decoded = ff::util::frame::audio::Audio::empty();
             match self.decoder.receive_frame(&mut decoded) {
@@ -267,7 +201,7 @@ impl AudioInputProducer {
                 (self.samples_out * 1_000_000 / AUDIO_SAMPLE_RATE as u64) as i64,
             );
             self.samples_out += out.samples() as u64;
-            // Newest-wins: never accumulate backlog.
+            let captured_at_us = self.clock.map(pts_us, read_at);
             if self.queue.len() >= MAX_QUEUE {
                 self.queue.pop_front();
             }
@@ -276,6 +210,7 @@ impl AudioInputProducer {
                 channels: AUDIO_CHANNELS,
                 sample_rate: AUDIO_SAMPLE_RATE,
                 pts_us,
+                captured_at_us,
             });
         }
         Ok(())

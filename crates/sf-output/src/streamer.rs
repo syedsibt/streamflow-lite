@@ -113,7 +113,14 @@ pub trait Transport {
 /// encoder's codec parameters (SPS/PPS in extradata → FLV sequence header).
 pub struct RealTransport {
     target: StreamTarget,
+    // Field order matters: `octx` (whose interrupt callback points into
+    // `deadline`) must drop before `deadline`.
     octx: Option<ff::format::context::Output>,
+    /// I/O deadline (ms on [`mono_ms`], `i64::MAX` = none) read by the
+    /// FFmpeg interrupt callback: every connect/write/close is bounded, so a
+    /// dead network can never wedge the send thread (FFmpeg's TCP layer
+    /// otherwise waits forever on a stalled socket).
+    deadline: std::sync::Arc<std::sync::atomic::AtomicI64>,
     video_params: ff::codec::parameters::Parameters,
     audio_params: Option<ff::codec::parameters::Parameters>,
     video_stream: usize,
@@ -130,11 +137,66 @@ impl RealTransport {
         Self {
             target,
             octx: None,
+            deadline: std::sync::Arc::new(std::sync::atomic::AtomicI64::new(i64::MAX)),
             video_params,
             audio_params,
             video_stream: 0,
             audio_stream: None,
             header_written: false,
+        }
+    }
+
+    fn arm(&self, ms: i64) {
+        self.deadline
+            .store(mono_ms() + ms, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    fn disarm(&self) {
+        self.deadline
+            .store(i64::MAX, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// `avformat_alloc_output_context2` + `avio_open2` with our interrupt
+    /// callback installed *before* the open (ffmpeg-next's `output_as_with`
+    /// opens without one, so a black-holed RTMP host could block connect
+    /// forever).
+    fn open_output(
+        &self,
+        url: &str,
+        options: ff::Dictionary,
+    ) -> Result<ff::format::context::Output, String> {
+        use std::ffi::CString;
+        let c_url = CString::new(url).map_err(|_| "URL contains a NUL byte".to_string())?;
+        let c_fmt = CString::new("flv").expect("static");
+        unsafe {
+            let mut ps: *mut ff::ffi::AVFormatContext = std::ptr::null_mut();
+            let r = ff::ffi::avformat_alloc_output_context2(
+                &mut ps,
+                std::ptr::null_mut(),
+                c_fmt.as_ptr(),
+                c_url.as_ptr(),
+            );
+            if r < 0 || ps.is_null() {
+                return Err(format!("{}", ff::Error::from(r)));
+            }
+            (*ps).interrupt_callback = ff::ffi::AVIOInterruptCB {
+                callback: Some(deadline_interrupt_cb),
+                opaque: std::sync::Arc::as_ptr(&self.deadline) as *mut std::os::raw::c_void,
+            };
+            let mut opts = options.disown();
+            let r = ff::ffi::avio_open2(
+                &mut (*ps).pb,
+                c_url.as_ptr(),
+                ff::ffi::AVIO_FLAG_WRITE,
+                &(*ps).interrupt_callback,
+                &mut opts,
+            );
+            ff::Dictionary::own(opts);
+            if r < 0 {
+                ff::ffi::avformat_free_context(ps);
+                return Err(format!("{}", ff::Error::from(r)));
+            }
+            Ok(ff::format::context::Output::wrap(ps))
         }
     }
 
@@ -165,8 +227,19 @@ impl Transport for RealTransport {
         // Explicit "flv": the RTMP URL has no file extension to guess from.
         // For a local .flv path (tests) this is the identical mux code path.
         let url = self.target.url().to_string();
-        let mut octx = ff::format::output_as(&url, "flv")
-            .map_err(|e| TransportError::ConnectionFailed(format!("{url_redacted}: {e}")))?;
+        let mut opts = ff::Dictionary::new();
+        if url.contains("://") {
+            // Network: Nagle off (small audio packets leave immediately)
+            // and a hard 5 s bound on every socket read/write.
+            opts.set("tcp_nodelay", "1");
+            opts.set("rw_timeout", "5000000");
+        }
+        self.arm(CONNECT_TIMEOUT_MS);
+        let opened = self.open_output(&url, opts);
+        self.disarm();
+        let mut octx = opened.map_err(|e| {
+            TransportError::ConnectionFailed(format!("{url_redacted}: {}", scrub(&e, &url)))
+        })?;
         Self::add_stream(&mut octx, &self.video_params)?;
         self.video_stream = 0;
         if let Some(ap) = &self.audio_params {
@@ -184,8 +257,16 @@ impl Transport for RealTransport {
             // See Recorder: shift negative B-frame DTS to zero.
             let mut dict = ff::Dictionary::new();
             dict.set("avoid_negative_ts", "make_zero");
-            octx.write_header_with(dict)
-                .map_err(|e| TransportError::SendFailed(format!("flv header: {e}")))?;
+            // Live: never seek back to patch duration/filesize at the end.
+            dict.set("flvflags", "no_duration_filesize");
+            self.deadline.store(
+                mono_ms() + WRITE_TIMEOUT_MS,
+                std::sync::atomic::Ordering::Relaxed,
+            );
+            let r = octx.write_header_with(dict);
+            self.deadline
+                .store(i64::MAX, std::sync::atomic::Ordering::Relaxed);
+            r.map_err(|e| TransportError::SendFailed(format!("flv header: {e}")))?;
             self.header_written = true;
         }
         let stream_index = match packet.stream_index {
@@ -200,19 +281,65 @@ impl Transport for RealTransport {
         fp.set_pts(Some(super::rescale_us_to_tb(packet.pts_us, FLV_TIME_BASE)));
         fp.set_dts(Some(super::rescale_us_to_tb(packet.dts_us, FLV_TIME_BASE)));
         fp.set_stream(stream_index);
-        fp.write(octx)
-            .map_err(|e| TransportError::SendFailed(format!("{e}")))?;
+        // Interleaved: the muxer orders audio/video by dts (FLV/RTMP
+        // servers expect it); the wait is at most one packet of the other
+        // stream (~21 ms of audio).
+        self.deadline.store(
+            mono_ms() + WRITE_TIMEOUT_MS,
+            std::sync::atomic::Ordering::Relaxed,
+        );
+        let r = fp.write_interleaved(octx);
+        self.deadline
+            .store(i64::MAX, std::sync::atomic::Ordering::Relaxed);
+        r.map_err(|e| TransportError::SendFailed(format!("{e}")))?;
         Ok(())
     }
 
     fn close(&mut self) -> Result<(), TransportError> {
         if let Some(mut octx) = self.octx.take() {
-            super::write_trailer(&mut octx)
-                .map_err(|e| TransportError::SendFailed(format!("flv trailer: {e}")))?;
+            let r = if self.header_written {
+                self.arm(CLOSE_TIMEOUT_MS);
+                let r = super::write_trailer(&mut octx);
+                self.disarm();
+                r
+            } else {
+                Ok(())
+            };
+            drop(octx);
+            r.map_err(|e| TransportError::SendFailed(format!("flv trailer: {e}")))?;
         }
         self.header_written = false;
         Ok(())
     }
+}
+
+/// Bound on connect + RTMP handshake.
+const CONNECT_TIMEOUT_MS: i64 = 10_000;
+/// Bound on one packet write (a stalled socket fails the send → reconnect).
+const WRITE_TIMEOUT_MS: i64 = 5_000;
+/// Bound on the trailer at stop.
+const CLOSE_TIMEOUT_MS: i64 = 2_000;
+
+fn mono_ms() -> i64 {
+    static EPOCH: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+    EPOCH.get_or_init(std::time::Instant::now).elapsed().as_millis() as i64
+}
+
+/// FFmpeg interrupt callback: abort blocking I/O once the deadline passed.
+unsafe extern "C" fn deadline_interrupt_cb(opaque: *mut std::os::raw::c_void) -> std::os::raw::c_int {
+    if opaque.is_null() {
+        return 0;
+    }
+    let d = &*(opaque as *const std::sync::atomic::AtomicI64);
+    (mono_ms() > d.load(std::sync::atomic::Ordering::Relaxed)) as std::os::raw::c_int
+}
+
+/// Remove the URL (which may embed the key) from an FFmpeg error string.
+fn scrub(msg: &str, url: &str) -> String {
+    if url.is_empty() {
+        return msg.to_string();
+    }
+    msg.replace(url, &redact_url(url))
 }
 
 /// Test transport with scripted outcomes. Records every call.
@@ -576,6 +703,51 @@ mod tests {
         let arg = s.transport().last_connect_arg.clone().unwrap();
         assert!(!arg.contains("SECRETKEY"), "key leaked to transport: {arg}");
         assert!(arg.contains("•••"));
+    }
+
+    /// A host that accepts TCP but never answers the RTMP handshake must
+    /// fail the connect within the bound — not hang the send thread.
+    #[test]
+    fn connect_to_silent_server_times_out() {
+        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = l.local_addr().unwrap().port();
+        let _keep = std::thread::spawn(move || {
+            let _conns: Vec<_> = l.incoming().take(2).collect();
+            std::thread::sleep(std::time::Duration::from_secs(30));
+        });
+        let (venc, aenc) = test_encoders();
+        let mut t = RealTransport::new(
+            StreamTarget::Rtmp(format!("rtmp://127.0.0.1:{port}/live/SECRETKEY")),
+            venc.parameters(),
+            Some(aenc.parameters()),
+        );
+        let t0 = std::time::Instant::now();
+        let r = t.connect("Rtmp(•••)");
+        let took = t0.elapsed();
+        assert!(r.is_err(), "silent server must not connect");
+        let msg = format!("{r:?}");
+        assert!(!msg.contains("SECRETKEY"), "key leaked: {msg}");
+        assert!(
+            took < std::time::Duration::from_millis(CONNECT_TIMEOUT_MS as u64 + 3_000),
+            "connect hung for {took:?}"
+        );
+    }
+
+    fn test_encoders() -> (VideoEncoder, AudioEncoder) {
+        let venc = VideoEncoder::open_with_encoder(
+            EncoderId::H264Libx264,
+            VideoEncoderOpts {
+                width: 160,
+                height: 96,
+                fps_num: 30,
+                fps_den: 1,
+                bitrate_bps: 500_000,
+                gop: 60,
+                preset: "ultrafast".to_string(),
+            },
+        )
+        .expect("open video");
+        (venc, AudioEncoder::open().expect("open audio"))
     }
 
     /// FLV muxing through the exact libavformat code path `RealTransport`

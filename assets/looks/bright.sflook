@@ -1,0 +1,13 @@
+{
+  "name": "Bright",
+  "version": 1,
+  "category": "Social",
+  "params": {
+    "exposure": 0.3,
+    "shadows": 18,
+    "highlights": -10,
+    "whites": 10,
+    "vibrance": 10
+  },
+  "skin_protect": true
+}

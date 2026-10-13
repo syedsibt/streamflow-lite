@@ -94,6 +94,7 @@ fn deleting_program_scene_falls_back_sanely() {
 // ---------------------------------------------------------------------------
 
 #[test]
+#[cfg_attr(windows, ignore = "adds a camera source; on Windows this opens a real DirectShow device")]
 fn source_crud_reorder_visibility() {
     let mut s = shell();
     let scene = empty_scene(&mut s);
@@ -168,6 +169,7 @@ fn decode_rgba(png: &[u8]) -> Vec<u8> {
 }
 
 #[test]
+#[cfg_attr(windows, ignore = "adds a camera source; on Windows this opens a real DirectShow device")]
 fn scene_render_returns_valid_nonblank_png_via_real_pipeline() {
     let mut s = shell();
     let scene = empty_scene(&mut s);
@@ -374,7 +376,9 @@ fn stream_lifecycle_fails_cleanly_and_redacts_key() {
     })
     .expect("async start must not fail synchronously");
     let mut lifecycle = s.production_state().stream_lifecycle;
-    for _ in 0..200 {
+    // Up to 20 s: Windows reports a refused localhost connection only after
+    // its SYN retries.
+    for _ in 0..800 {
         s.stream_drain_worker();
         lifecycle = s.production_state().stream_lifecycle;
         if matches!(lifecycle, StreamLifecycle::Error { .. }) {
@@ -406,7 +410,8 @@ fn stream_lifecycle_fails_cleanly_and_redacts_key() {
 #[test]
 fn record_lifecycle_records_for_real() {
     let mut s = shell();
-    let out = "/tmp/sf-prod-record.mp4";
+    let out = std::env::temp_dir().join("sf-prod-record.mp4").to_string_lossy().into_owned();
+    let out = out.as_str();
     let _ = std::fs::remove_file(out);
     s.record_set_settings(out, "mp4", "High").unwrap();
     assert!(s.record_set_settings("/tmp/x", "avi", "High").is_err());
@@ -611,6 +616,7 @@ fn video_settings_rejects_bad_values() {
 }
 
 #[test]
+#[cfg_attr(windows, ignore = "uses fake camera names; on Windows these open real DirectShow devices")]
 fn camera_reconfigure_updates_kind_and_lists_sources() {
     let mut s = shell();
     let scene = empty_scene(&mut s);
@@ -642,6 +648,7 @@ fn camera_reconfigure_updates_kind_and_lists_sources() {
 }
 
 #[test]
+#[cfg_attr(windows, ignore = "adds a camera source; on Windows this opens a real DirectShow device")]
 fn camera_auto_audio_attaches() {
     let mut s = shell();
     let scene = s.scene_create("S").id;

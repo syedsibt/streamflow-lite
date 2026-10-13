@@ -12,3 +12,8 @@ ffmpeg-next = "6"
 # (Windows uses the mf_camera scaffold instead.)
 [target.'cfg(target_os = "linux")'.dependencies]
 v4l = "0.14"
+
+[lints.rust]
+# `sf_wincheck`: type-check the Windows capture paths on Linux CI
+# (`RUSTFLAGS="--cfg sf_wincheck"`); never set in real builds.
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(sf_wincheck)'] }

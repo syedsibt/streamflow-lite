@@ -112,17 +112,17 @@ impl SourceKind {
             | SourceKind::Color { .. }
             | SourceKind::Media { .. }
             | SourceKind::Text { .. } => true,
-            #[cfg(windows)]
+            #[cfg(any(windows, sf_wincheck))]
             SourceKind::Camera { .. } => true,
-            #[cfg(not(windows))]
+            #[cfg(not(any(windows, sf_wincheck)))]
             SourceKind::Camera { .. } => false,
-            #[cfg(windows)]
+            #[cfg(any(windows, sf_wincheck))]
             SourceKind::AudioInput { .. } => true,
-            #[cfg(not(windows))]
+            #[cfg(not(any(windows, sf_wincheck)))]
             SourceKind::AudioInput { .. } => false,
-            #[cfg(windows)]
+            #[cfg(any(windows, sf_wincheck))]
             SourceKind::Screen => true,
-            #[cfg(not(windows))]
+            #[cfg(not(any(windows, sf_wincheck)))]
             SourceKind::Screen => false,
         }
     }
@@ -273,12 +273,20 @@ pub struct MixerView {
     pub meters: HashMap<String, f32>,
     /// True while local speaker monitoring is active.
     pub monitor_enabled: bool,
-    /// Audio enhancer (gate → EQ → compressor) settings.
+    /// Voice enhancer (AI denoise → gate → EQ → compressor) settings.
     pub enhancer: EnhancerView,
+    /// Live per-voice-source enhancer telemetry + bus health, keyed by
+    /// source id (only live inputs: mics / camera audio).
+    #[serde(default)]
+    pub voice: HashMap<String, VoiceStatsView>,
+    /// A/V sync settings.
+    #[serde(default)]
+    pub av_sync: AvSyncView,
 }
 
-/// UI-facing audio-enhancer settings (mirror of
-/// `sf_audio::EnhancerSettings`; free offline DSP, no APIs).
+/// UI-facing voice-enhancer settings (mirror of
+/// `sf_audio::EnhancerSettings`). Runs locally in real time — RNNoise AI
+/// denoise + DSP; no network API in the audio path.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct EnhancerView {
     pub enabled: bool,
@@ -288,19 +296,84 @@ pub struct EnhancerView {
     pub eq_mid_db: f32,
     pub eq_high_db: f32,
     pub compressor_enabled: bool,
+    /// AI noise suppression on/off (older saved state: on).
+    #[serde(default = "default_true")]
+    pub ai_denoise: bool,
+    /// AI suppression strength 0..1 (older saved state: full).
+    #[serde(default = "default_one")]
+    pub ai_strength: f32,
+}
+
+fn default_true() -> bool {
+    true
+}
+
+fn default_one() -> f32 {
+    1.0
+}
+
+/// Live telemetry for one voice source.
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct VoiceStatsView {
+    /// Voice-activity probability from the AI stage (0..1).
+    pub vad: f32,
+    /// Compressor gain reduction, dB.
+    pub gain_reduction_db: f32,
+    /// Gate currently closed (silencing).
+    pub gate_closed: bool,
+    /// Latency added by the enhancer chain, ms (20 with AI denoise).
+    pub latency_ms: f32,
+    /// CPU time of the last enhancer block, µs.
+    pub process_us: u32,
+    /// Audio queued in the bus for this source, ms.
+    pub buffered_ms: f32,
+    /// Underruns (silence inserted) since the source opened.
+    pub underruns: u64,
+    /// Sample frames dropped to stay live.
+    pub dropped_frames: u64,
+    /// Device health: "starting" | "running" | "error: …" | "stopped".
+    pub device: String,
+    /// Age of the audio as played (capture → mix), ms.
+    #[serde(default)]
+    pub audio_age_ms: Option<f32>,
+    /// Age the A/V aligner targets (picture age + offset), ms.
+    #[serde(default)]
+    pub target_age_ms: Option<f32>,
+    /// Alignment corrections applied so far.
+    #[serde(default)]
+    pub corrections: u64,
+}
+
+/// A/V sync settings. `auto` (default): live audio is played at the
+/// measured age of the picture it belongs to; `offset_ms` (−100…+100,
+/// positive = audio later) fine-tunes on top. With `auto` off,
+/// `offset_ms` (≥ 0) is a plain audio delay.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+pub struct AvSyncView {
+    pub auto: bool,
+    pub offset_ms: i32,
+}
+
+impl Default for AvSyncView {
+    fn default() -> Self {
+        Self {
+            auto: true,
+            offset_ms: 0,
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
 // Streaming
 // ---------------------------------------------------------------------------
 
-/// Stream destination platform.
-#[derive(Clone, Copy, Debug, Serialize, Deserialize)]
+/// Stream destination platform (adapters in `crate::platforms`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum StreamPlatform {
     Youtube,
-    Twitch,
     Facebook,
+    Tiktok,
     CustomRtmp,
 }
 
@@ -808,6 +881,57 @@ fn remap_slot_ids(stack: &FilterStack) -> FilterStack {
 // ---------------------------------------------------------------------------
 
 /// Engine input id for a real source.
+/// Name-based camera ↔ audio device pairing (see `auto_camera_audio`).
+pub(crate) fn match_camera_audio(camera: &str, devices: &[String]) -> Option<String> {
+    const GENERIC: &[&str] = &[
+        "video", "audio", "capture", "device", "camera", "webcam", "usb", "hd", "digital",
+        "interface", "input", "line", "microphone", "mic", "the", "and", "with", "high",
+        "definition", "integrated", "stream", "source", "in",
+    ];
+    let words = |s: &str| -> Vec<String> {
+        s.to_lowercase()
+            .split(|c: char| !c.is_alphanumeric())
+            .filter(|w| w.len() >= 3 && !GENERIC.contains(w))
+            .map(str::to_string)
+            .collect()
+    };
+    let cam = words(camera);
+    if cam.is_empty() {
+        return None;
+    }
+    devices
+        .iter()
+        .map(|d| (cam.iter().filter(|w| words(d).contains(w)).count(), d))
+        .filter(|(n, _)| *n > 0)
+        .max_by_key(|(n, _)| *n)
+        .map(|(_, d)| d.clone())
+}
+
+#[cfg(test)]
+mod camera_audio_tests {
+    use super::match_camera_audio;
+
+    #[test]
+    fn pairs_capture_card_audio_by_name_only() {
+        let devs = vec![
+            "Microphone (Realtek(R) Audio)".to_string(),
+            "Elgato HD60 X Audio".to_string(),
+            "Digital Audio Interface (USB3.0 Capture)".to_string(),
+        ];
+        assert_eq!(
+            match_camera_audio("Elgato HD60 X", &devs).as_deref(),
+            Some("Elgato HD60 X Audio")
+        );
+        // A plain webcam with no matching audio device gets NO audio (the
+        // user's own mic is added separately) — never the first mic.
+        assert_eq!(match_camera_audio("Integrated Webcam", &devs), None);
+        assert_eq!(
+            match_camera_audio("Logitech BRIO", &["Microphone (Logitech BRIO)".to_string()]).as_deref(),
+            Some("Microphone (Logitech BRIO)")
+        );
+    }
+}
+
 fn source_input_id(source_id: &str) -> String {
     format!("src-{source_id}")
 }
@@ -860,43 +984,32 @@ impl Shell {
     /// audio (see `auto_camera_audio`).
     /// Lists available audio input devices (Windows DirectShow; empty elsewhere).
     pub fn list_audio_devices(&self) -> Vec<String> {
-        #[cfg(windows)]
+        #[cfg(any(windows, sf_wincheck))]
         {
             sf_capture::dshow::list_audio_devices().unwrap_or_default()
         }
-        #[cfg(not(windows))]
+        #[cfg(not(any(windows, sf_wincheck)))]
         {
             Vec::new()
         }
     }
 
-    /// Picks an audio device for a camera automatically: prefers one
-    /// whose name matches the camera/capture-card, else the first input.
-    /// Empty on platforms without audio capture.
+    /// Picks the audio device that belongs to a camera / capture card, by
+    /// name. Only a device whose name shares a distinctive word with the
+    /// camera's (e.g. "Elgato HD60 X" ↔ "Elgato HD60 X Audio") is chosen —
+    /// never just "the first microphone", which used to double the audio
+    /// when the user also added that microphone as its own source.
     pub fn auto_camera_audio(&self, camera_device: Option<&str>) -> Option<String> {
-        let devs = self.list_audio_devices();
-        if devs.is_empty() {
-            return None;
-        }
-        if let Some(cam) = camera_device {
-            let cam_l = cam.to_lowercase();
-            if let Some(m) = devs.iter().find(|d| {
-                let dl = d.to_lowercase();
-                dl.contains(&cam_l) || cam_l.contains(&dl)
-            }) {
-                return Some(m.clone());
-            }
-        }
-        devs.into_iter().next()
+        match_camera_audio(camera_device?, &self.list_audio_devices())
     }
 
     /// Lists available camera devices (Windows DirectShow; empty elsewhere).
     pub fn list_cameras(&self) -> Vec<String> {
-        #[cfg(windows)]
+        #[cfg(any(windows, sf_wincheck))]
         {
             sf_capture::dshow::list_devices().unwrap_or_default()
         }
-        #[cfg(not(windows))]
+        #[cfg(not(any(windows, sf_wincheck)))]
         {
             Vec::new()
         }
@@ -937,7 +1050,7 @@ impl Shell {
         if let SourceKind::Media { path } = &kind {
             self.open_media_producer(&id, path)?;
         }
-        #[cfg(windows)]
+        #[cfg(any(windows, sf_wincheck))]
         if let SourceKind::Camera {
             device,
             width,
@@ -954,11 +1067,11 @@ impl Shell {
             let f = if *fps == 30 || *fps == 60 { *fps } else { 30 };
             self.open_camera_producer(&id, device.as_deref(), audio_device.as_deref(), w, h, f)?;
         }
-        #[cfg(windows)]
+        #[cfg(any(windows, sf_wincheck))]
         if let SourceKind::AudioInput { device } = &kind {
             self.open_audio_producer(&id, device.as_deref())?;
         }
-        #[cfg(windows)]
+        #[cfg(any(windows, sf_wincheck))]
         if matches!(kind, SourceKind::Screen) {
             self.open_screen_producer(&id)?;
         }
@@ -1012,9 +1125,13 @@ impl Shell {
         }
         self.mixer.channels.remove(source_id);
         self.media_producers.remove(source_id);
-        #[cfg(windows)]
-        self.audio_producers.remove(source_id);
-        self.media_last_frame.remove(source_id);
+        // Dropping the LiveInput signals its capture thread to stop (never
+        // joins: a wedged driver can't hang this command).
+        self.audio_inputs.remove(source_id);
+        self.voice_enhancers.remove(source_id);
+        self.audio_bus.remove(source_id);
+        self.source_frames.remove(source_id);
+        self.resized_frames.retain(|(id, _, _), _| id != source_id);
         self.camera_formats.remove(source_id);
         // Drop any cached text rasterizations for this source.
         self.text_cache.retain(|(sid, _, _, _), _| sid != source_id);
@@ -1181,45 +1298,84 @@ impl Shell {
             .ok_or_else(|| ShellError::UnknownScene(scene_id.to_string()))?
             .sources
             .clone();
-        sources.retain(|s| s.visible);
+        sources.retain(|s| {
+            s.visible && s.kind.is_real() && !matches!(s.kind, SourceKind::AudioInput { .. })
+        });
         sources.sort_by_key(|s| s.order);
-        let mut canvas = vec![0u8; w as usize * h as usize * 4];
+        // Fast path: a single opaque video layer needs no composite — the
+        // graded frame *is* the program frame (saves a full-frame blend
+        // and a copy per tick).
+        let single_opaque = sources.len() == 1
+            && matches!(
+                sources[0].kind,
+                SourceKind::Media { .. } | SourceKind::Camera { .. } | SourceKind::Screen
+            );
+        let mut canvas: Option<Vec<u8>> = None;
         for src in &sources {
-            if !src.kind.is_real() {
-                continue;
-            }
-            // Audio-only sources feed the mixer, not the picture.
-            if matches!(src.kind, SourceKind::AudioInput { .. }) {
-                continue;
-            }
             let input_id = src
                 .input_id
                 .as_ref()
                 .ok_or_else(|| ShellError::UnknownSource(src.id.clone()))?;
-            let pixels = match &src.kind {
+            let pixels: std::sync::Arc<Vec<u8>> = match &src.kind {
                 SourceKind::Media { .. } | SourceKind::Camera { .. } | SourceKind::Screen => {
-                    // Pull the next decoded/live frame; skip the source for
-                    // this frame when none is ready (producer handles pacing).
+                    // The tick's cached frame (one pull per source per
+                    // tick); skip the layer until the first frame arrives.
                     match self.pull_media_frame(&src.id, w, h) {
                         Some(px) => px,
                         None => continue,
                     }
                 }
-                SourceKind::Text { text } => self.text_pixels(&src.id, text, w, h),
-                _ => source_pixels(&src.kind, w, h),
+                SourceKind::Text { text } => {
+                    std::sync::Arc::new(self.text_pixels(&src.id, text, w, h))
+                }
+                _ => std::sync::Arc::new(source_pixels(&src.kind, w, h)),
             };
+            let g0 = std::time::Instant::now();
             let frame = self.engine.grade_input_frame(input_id, w, h, &pixels)?;
-            // Hybrid composite: GPU "over" blend first (pooled out texture),
-            // CPU fallback when the GPU pass is unavailable or fails.
-            match self.engine.gpu_composite_over(&canvas, &frame.pixels, w, h) {
-                Ok(px) => canvas = px,
-                Err(_) => composite_over(&mut canvas, &frame.pixels),
+            self.perf_gpu_us_accum += g0.elapsed().as_micros() as u64;
+            // Color Studio live tap: hand over the exact graded frame that
+            // goes to program/encoder (and the raw one for before/after).
+            let watch = self.studio_watching(input_id);
+            let out_pixels = if single_opaque {
+                if watch.is_some() {
+                    frame.pixels.clone()
+                } else {
+                    // Moved, no copy.
+                    canvas = Some(frame.pixels);
+                    continue;
+                }
+            } else {
+                let base = canvas.take().unwrap_or_else(|| vec![0u8; w as usize * h as usize * 4]);
+                let g1 = std::time::Instant::now();
+                let blended = match self.engine.gpu_composite_over(&base, &frame.pixels, w, h) {
+                    Ok(px) => px,
+                    Err(_) => {
+                        let mut b = base;
+                        composite_over(&mut b, &frame.pixels);
+                        b
+                    }
+                };
+                self.perf_gpu_us_accum += g1.elapsed().as_micros() as u64;
+                canvas = Some(blended);
+                Vec::new()
+            };
+            if single_opaque {
+                canvas = Some(out_pixels);
+            }
+            if let Some(mode) = watch {
+                let raw = (mode != crate::color_library::PreviewMode::After).then(|| Frame {
+                    width: w,
+                    height: h,
+                    pixels: std::sync::Arc::try_unwrap(pixels).unwrap_or_else(|a| (*a).clone()),
+                });
+                let input_id = input_id.clone();
+                self.studio_tap_store(&input_id, frame, raw);
             }
         }
         Ok(Frame {
             width: w,
             height: h,
-            pixels: canvas,
+            pixels: canvas.unwrap_or_else(|| vec![0u8; w as usize * h as usize * 4]),
         })
     }
 
@@ -1241,21 +1397,7 @@ impl Shell {
     /// jittered the pipeline on every poll). Other scenes render on demand
     /// at monitor size.
     pub fn scene_monitor_jpg(&mut self, scene_id: &str) -> Result<Vec<u8>, ShellError> {
-        if scene_id == self.program_scene_id {
-            if let Some(jpg) = self.monitor_jpeg() {
-                return Ok(jpg);
-            }
-        }
-        // The preview scene monitor is refreshed by the media tick every
-        // tick — serve it from the cache instead of re-rendering (and
-        // re-pulling cameras) on every poll.
-        if scene_id == self.preview_scene_id {
-            if let Some(jpg) = self.preview_monitor_jpeg() {
-                return Ok(jpg);
-            }
-        }
-        let frame = self.render_scene_frame(scene_id, crate::MONITOR_W, crate::MONITOR_H)?;
-        crate::encode_jpeg(&frame, 82)
+        self.monitor_snapshot(scene_id)?.to_jpeg()
     }
 
     /// Program-monitor frame: during an auto transition this is the live
@@ -1313,6 +1455,8 @@ impl Shell {
                     .collect(),
                 monitor_enabled: self.audio_monitor.is_some(),
                 enhancer: self.enhancer_settings(),
+                voice: self.voice_stats(),
+                av_sync: self.av_sync.clone(),
             },
             stream_settings: self.stream_settings.clone(),
             stream_lifecycle: self.stream_lifecycle.clone(),
@@ -1494,7 +1638,7 @@ impl Shell {
 fn parse_stream_platform(platform: &str) -> Result<StreamPlatform, ShellError> {
     match platform {
         "youtube" => Ok(StreamPlatform::Youtube),
-        "twitch" => Ok(StreamPlatform::Twitch),
+        "tiktok" => Ok(StreamPlatform::Tiktok),
         "facebook" => Ok(StreamPlatform::Facebook),
         "custom_rtmp" => Ok(StreamPlatform::CustomRtmp),
         _ => Err(ShellError::UnknownStreamPlatform(platform.to_string())),
@@ -1689,7 +1833,7 @@ impl Shell {
         // Drop the old producer + negotiated-format entry before reopening.
         self.media_producers.remove(source_id);
         self.camera_formats.remove(source_id);
-        #[cfg(windows)]
+        #[cfg(any(windows, sf_wincheck))]
         {
             let (w, h) = if width > 0 && height > 0 {
                 (width, height)

@@ -5,22 +5,34 @@
 //! state machines. All logic lives on [`Shell`](super::Shell)
 //! (headless-testable, no tauri dependency).
 //!
-//! # What is real vs. honest stub here
+//! # Live pipeline (one tick = one output frame)
 //!
-//! - REAL: media-file sources (decode via `MediaFileProducer`, frames into
-//!   the composite, audio into the `sf-audio` mixer → live meters);
-//!   recording the program bus to MP4/MKV via `sf-encode` + `sf-output`
-//!   (driven by [`Shell::av_tick`], which the adapter calls on its fixed
-//!   33.3 ms media tick — so the shell records at 30 fps);
-//!   RTMP streaming attempts via `sf-output`'s `Streamer` + `RealTransport`
-//!   (connects for real; fails cleanly with a redacted error when the
-//!   server is unreachable; exponential-backoff reconnect is live).
-//! - HONEST stubs: `Screen` (no capture hardware on a headless VM;
-//!   `#[cfg(windows)]` scaffolds exist in `sf-capture`); `Camera` on
-//!   non-Windows (on Windows, DirectShow capture via `sf-capture::dshow`
-//!   is wired — hardware-unverified); hardware encoders (selection logic
-//!   is real; NVENC/QSV/AMF only exist on Windows GPUs — here libx264 is
-//!   used, verified by roundtrip tests).
+//! ```text
+//!  capture threads ──newest frame──► [1] source cache (1 pull / source / tick)
+//!  mic threads ──timed PCM──► audio bus           │
+//!                                │                 ▼
+//!                                │        [2] grade + composite (GPU)
+//!                                │                 │  program frame (one copy)
+//!                                ▼                 ├──► monitor (downscaled)
+//!                     [3] aligned mix ──────►  [4] ONE encoder pair
+//!                                                   ├──► recorder (rebased)
+//!                                                   └──► RTMP send thread
+//! ```
+//!
+//! * **Time-based media clock.** Every tick carries its scheduled time on
+//!   the pipeline clock (`sf_capture::clock`). Video PTS = that time (frame
+//!   slot), audio block length = wall time since the last tick. A late or
+//!   skipped tick therefore never shifts the stream timeline — the old
+//!   frame-counted PTS made the stream fall behind real time under load,
+//!   which is what grew into a one-minute delay.
+//! * **One pull per source per tick.** Program, preview monitor, Color
+//!   Studio and every scene read the same cached frame; nobody steals
+//!   frames from anybody, and nothing renders a second time on a UI poll.
+//! * **One encoder** feeds both the recording and the stream (no duplicate
+//!   encode when both run). A sink that joins late gets a forced IDR and
+//!   its own timestamp origin.
+//! * **A/V alignment.** Live audio is played at the age of the video frame
+//!   rendered in the same tick (+ the manual offset); see `sf_audio::bus`.
 //!
 //! # Stream-key hygiene
 //!
@@ -30,6 +42,7 @@
 //! FFmpeg error echoes the URL.
 
 use std::collections::VecDeque;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use sf_audio::AudioFrame;
@@ -37,6 +50,17 @@ use sf_capture::{
     media::MediaFileProducer, CapturedFrame, CaptureError, FrameProducer, StreamInfo,
 };
 use sf_encode::{AudioEncoder, EncodedPacket, EncoderId, VideoEncoder, VideoEncoderOpts};
+use sf_engine::Frame;
+use sf_output::{
+    redact_url, ContainerFormat, RealTransport, ReconnectPolicy, Recorder, StreamTarget, Streamer,
+};
+
+use super::production::{
+    transition_progress, EnhancerView, RecordFormat, RecordRuntime, StreamLifecycle, VoiceStatsView,
+};
+use super::{Shell, ShellError};
+use crate::production::crossfade;
+use crate::production::SourceKind;
 
 /// Maps a Video panel encoder name to [`EncoderId`]. `"auto"` is handled by
 /// the caller (registry probing); unknown names yield `None`.
@@ -49,36 +73,19 @@ fn encoder_id_from_name(name: &str) -> Option<EncoderId> {
         _ => None,
     }
 }
-use sf_engine::Frame;
-use sf_output::{
-    redact_url, ContainerFormat, RealTransport, ReconnectPolicy, Recorder, StreamTarget, Streamer,
-};
-
-use super::production::{transition_progress, EnhancerView, RecordFormat, RecordRuntime, StreamLifecycle};
-use crate::production::SourceKind;
-use super::{Shell, ShellError};
-use crate::production::crossfade;
-
-/// Legacy fixed program size / tick constants. The live values now come
-/// from [`crate::production::VideoSettings`] (`video_settings` on the
-/// shell); these remain for reference.
-pub const AV_W: u32 = 640;
-/// See [`AV_W`].
-pub const AV_H: u32 = 360;
-/// See [`AV_W`].
-pub const AV_FRAME_US: i64 = 33_333;
 
 /// Hard timeout for DirectShow device opens. FFmpeg's interrupt callback
 /// is NOT consulted while DirectShow builds its COM filter graph, so a
 /// wedged driver (or a device held exclusive by another app) can block
-/// `avformat_open_input` forever — holding the shell Mutex and freezing
-/// the whole app ("Not Responding"). Opening on a dedicated thread bounds
-/// the damage: on timeout the thread is abandoned (it holds no shell
-/// locks) and the user gets a clean error instead of a dead app.
+/// `avformat_open_input` forever. Opening on a dedicated thread bounds the
+/// damage: on timeout the thread is abandoned and the user gets a clean
+/// error instead of a dead app.
+#[cfg(any(windows, sf_wincheck))]
 const DEVICE_OPEN_TIMEOUT: Duration = Duration::from_secs(8);
 
 /// Runs a device `open` on a dedicated thread with a hard timeout.
 /// Also converts an FFmpeg panic into a clean error.
+#[cfg(any(windows, sf_wincheck))]
 fn open_device<T, F>(label: &str, open: F) -> Result<T, ShellError>
 where
     T: Send + 'static,
@@ -104,47 +111,191 @@ where
     }
 }
 
-/// An active recording session: encoders + muxer + clocks.
-pub(crate) struct ActiveRecording {
-    video_enc: VideoEncoder,
-    audio_enc: Option<AudioEncoder>,
-    recorder: Recorder,
-    /// Output path (kept for diagnostics / future "reveal in folder").
-    #[allow(dead_code)]
-    path: String,
-    video_pts_us: i64,
-    audio_pts_us: i64,
+/// Moves a live audio producer onto its own capture thread
+/// (`sf_audio::LiveInput`). Chunks carry their capture time, so the bus
+/// can align them to video. The tick only drains a FIFO.
+#[cfg(any(windows, sf_wincheck))]
+fn spawn_live_audio(
+    source_id: &str,
+    mut prod: sf_capture::audio_in::AudioInputProducer,
+) -> Result<sf_audio::LiveInput, ShellError> {
+    sf_audio::LiveInput::spawn_timed(source_id, move || match prod.next_audio() {
+        Ok(Some(c)) => Ok(Some(sf_audio::TimedChunk {
+            samples: c.samples,
+            captured_at_us: c.captured_at_us,
+        })),
+        Ok(None) => Ok(None),
+        Err(e) => Err(e.to_string()),
+    })
+    .map_err(|e| ShellError::Capture(format!("cannot start audio capture thread: {e}")))
 }
 
-// SAFETY: the fields hold FFmpeg encoder/muxer contexts, which are raw
-// pointers (`!Send`) only by conservatism — they carry no thread affinity,
-// and every session is only ever touched through the shell's `Mutex`
-// (commands and the poll loop lock it exclusively). Serialized use of
-// FFmpeg contexts across threads is safe.
-unsafe impl Send for ActiveRecording {}
+// ---------------------------------------------------------------------------
+// Source frame cache
+// ---------------------------------------------------------------------------
 
-/// An active streaming session: async RTMP send worker + encoders + clocks.
+/// The newest frame of one video source, shared by every consumer of the
+/// tick (program, preview monitor, Color Studio, other scenes).
+pub(crate) struct SourceFrame {
+    pub(crate) width: u32,
+    pub(crate) height: u32,
+    pub(crate) data: Arc<Vec<u8>>,
+    /// Capture time on the pipeline clock.
+    pub(crate) captured_at_us: i64,
+    /// Increments on every new frame (resize cache key).
+    pub(crate) seq: u64,
+    /// Smoothed age of the displayed frame at tick time, µs.
+    pub(crate) age_ema_us: f64,
+    /// Tick times at which a new frame arrived (last second) → fps.
+    arrivals: VecDeque<i64>,
+    /// Last capture error (device lost …), shown in diagnostics.
+    pub(crate) last_error: Option<String>,
+}
+
+impl SourceFrame {
+    pub(crate) fn fps(&self) -> f32 {
+        self.arrivals.len() as f32
+    }
+}
+
+/// Video-age smoothing factor per tick (≈ 0.7 s time constant at 30 fps).
+const AGE_EMA_ALPHA: f64 = 0.05;
+
+// ---------------------------------------------------------------------------
+// Output engine: one encoder pair, fanned out to recorder + stream
+// ---------------------------------------------------------------------------
+
+/// Per-sink timestamp rebasing: each output starts at 0 on its own first
+/// keyframe, and a resumed recording continues seamlessly.
+#[derive(Default)]
+struct Rebase {
+    /// `out = in − base`; `None` → waiting for the next keyframe.
+    base_us: Option<i64>,
+    /// Where the next video frame should land after a (re)start.
+    next_out_us: i64,
+}
+
+impl Rebase {
+    /// Rebased copy of `p`, or `None` while waiting for a keyframe.
+    fn map(&mut self, p: &EncodedPacket, frame_us: i64) -> Option<EncodedPacket> {
+        if self.base_us.is_none() {
+            if p.stream_index == 0 && p.is_keyframe {
+                self.base_us = Some(p.pts_us - self.next_out_us);
+            } else {
+                return None;
+            }
+        }
+        let base = self.base_us?;
+        let pts = p.pts_us - base;
+        let dts = p.dts_us - base;
+        if pts < 0 || dts < 0 {
+            return None; // audio from before this sink's first frame
+        }
+        if p.stream_index == 0 {
+            self.next_out_us = pts + frame_us;
+        }
+        Some(EncodedPacket {
+            data: p.data.clone(),
+            pts_us: pts,
+            dts_us: dts,
+            is_keyframe: p.is_keyframe,
+            stream_index: p.stream_index,
+        })
+    }
+
+    /// Wait for a keyframe again, continuing the timeline (pause/resume).
+    fn restart_continuous(&mut self) {
+        self.base_us = None;
+    }
+
+    /// Wait for a keyframe again, restarting at 0 (new RTMP connection).
+    fn restart_at_zero(&mut self) {
+        self.base_us = None;
+        self.next_out_us = 0;
+    }
+}
+
+pub(crate) struct RecordSink {
+    recorder: Recorder,
+    rebase: Rebase,
+    /// Paused on the previous tick (resume → keyframe + continuous rebase).
+    was_paused: bool,
+    #[allow(dead_code)]
+    path: String,
+}
+
+/// An active streaming sink: async RTMP send worker + drop accounting.
 ///
 /// The [`SendWorker`](crate::send_worker::SendWorker) owns the RTMP
-/// [`Streamer`] on its own thread (OBS's dedicated send thread): the media
-/// tick encodes and hands packets over with non-blocking `try_send`, so a
-/// stalled network can never stall rendering. The worker owns the
-/// connect/reconnect backoff; the tick mirrors its status into
-/// [`StreamLifecycle`] and applies the OBS time-based drop policy.
-pub(crate) struct ActiveStream {
+/// [`Streamer`] on its own thread (OBS's dedicated send thread): the tick
+/// hands packets over with non-blocking `try_send`, so a stalled network
+/// can never stall rendering.
+pub(crate) struct StreamSink {
     send: crate::send_worker::SendWorker,
-    video_enc: VideoEncoder,
-    audio_enc: Option<AudioEncoder>,
-    video_pts_us: i64,
-    audio_pts_us: i64,
+    rebase: Rebase,
     /// `(dts_us, kind)` of packets handed to the send thread but not yet
-    /// acked — drives the exact buffered-span computation for the drop
-    /// policy. FIFO: the worker acks in send order.
+    /// acked — drives the buffered-span drop policy and the latency meter.
     pending: VecDeque<(i64, PacketKind)>,
-    /// Last acked byte total (drives the kbps meter).
+    /// Newest dts handed over (rebased µs).
+    newest_dts_us: i64,
     bytes_sent: u64,
-    /// Worker's last reported status.
     worker_status: crate::send_worker::WorkerStatus,
+}
+
+/// The shared encoder pair plus its sinks. Exists while at least one sink
+/// (recording or stream) is active.
+pub(crate) struct OutputEngine {
+    video_enc: VideoEncoder,
+    audio_enc: AudioEncoder,
+    pub(crate) record: Option<RecordSink>,
+    pub(crate) stream: Option<StreamSink>,
+    /// Frames actually encoded (diagnostics: encoder fps).
+    encoded_times: VecDeque<i64>,
+    /// Ticks whose frame mapped to an already-encoded slot.
+    pub(crate) skipped_slots: u64,
+    pub(crate) last_audio_encode_us: u64,
+}
+
+// SAFETY: FFmpeg encoder/muxer contexts are `!Send` only by conservatism —
+// they carry no thread affinity, and the engine is only ever touched
+// through the shell's `Mutex`.
+unsafe impl Send for OutputEngine {}
+
+impl OutputEngine {
+    pub(crate) fn encoder_name(&self) -> &'static str {
+        self.video_enc.encoder_name()
+    }
+
+    pub(crate) fn encoder_is_hardware(&self) -> bool {
+        self.video_enc.encoder_id().is_hardware()
+    }
+
+    pub(crate) fn last_encode_us(&self) -> u64 {
+        self.video_enc.last_encode_us()
+    }
+
+    pub(crate) fn encoder_fps(&self) -> f32 {
+        self.encoded_times.len() as f32
+    }
+
+    pub(crate) fn has_sinks(&self) -> bool {
+        self.record.is_some() || self.stream.is_some()
+    }
+}
+
+impl StreamSink {
+    pub(crate) fn bytes_sent(&self) -> u64 {
+        self.bytes_sent
+    }
+
+    /// Video handed to the send thread but not yet on the network, µs.
+    pub(crate) fn buffered_video_us(&self) -> i64 {
+        buffered_video_us(&self.pending, self.newest_dts_us)
+    }
+
+    pub(crate) fn is_live(&self) -> bool {
+        self.worker_status == crate::send_worker::WorkerStatus::Live
+    }
 }
 
 /// Packet class for the drop policy: video delta frames may be shed under
@@ -154,22 +305,6 @@ pub(crate) enum PacketKind {
     VideoKey,
     VideoDelta,
     Audio,
-}
-
-impl ActiveStream {
-    pub(crate) fn bytes_sent(&self) -> u64 {
-        self.bytes_sent
-    }
-    pub(crate) fn encoder_name(&self) -> &'static str {
-        self.video_enc.encoder_name()
-    }
-
-    /// Buffered video span in microseconds: newest dts handed to the worker
-    /// minus the oldest unacked video dts. Mirrors OBS's
-    /// `last_dts_usec - first_video.dts_usec` buffer-duration metric.
-    fn buffered_video_us(&self, newest_dts: i64) -> i64 {
-        buffered_video_us(&self.pending, newest_dts)
-    }
 }
 
 /// Buffered video span over a pending-packet deque: newest dts minus the
@@ -193,20 +328,18 @@ pub(crate) fn drop_decision(kind: PacketKind, buffered_us: i64) -> bool {
     kind == PacketKind::VideoDelta && buffered_us > crate::send_worker::DROP_VIDEO_BUFFER_US
 }
 
-// SAFETY: same argument as `ActiveRecording` — FFmpeg contexts with no
-// thread affinity, all access serialized by the shell's `Mutex`.
-unsafe impl Send for ActiveStream {}
+// ---------------------------------------------------------------------------
+// Producers
+// ---------------------------------------------------------------------------
 
 /// Producers hold FFmpeg decoder/scaler contexts, which are raw pointers
 /// and therefore `!Send`. Every producer is only ever touched through the
-/// shell's `Mutex` (Tauri commands and the poll loop lock it exclusively),
-/// and FFmpeg contexts are safe to move between threads as long as
-/// concurrent use is serialized — so this wrapper is sound.
+/// shell's `Mutex`, so this wrapper is sound.
 pub(crate) enum ProducerKind {
     Media(MediaFileProducer),
-    #[cfg(windows)]
+    #[cfg(any(windows, sf_wincheck))]
     Camera(sf_capture::dshow::DshowProducer),
-    #[cfg(windows)]
+    #[cfg(any(windows, sf_wincheck))]
     Screen(sf_capture::gdigrab::ScreenProducer),
 }
 
@@ -235,9 +368,9 @@ impl FrameProducer for ProducerKind {
     fn next_frame(&mut self) -> Result<Option<CapturedFrame>, CaptureError> {
         match self {
             ProducerKind::Media(p) => p.next_frame(),
-            #[cfg(windows)]
+            #[cfg(any(windows, sf_wincheck))]
             ProducerKind::Camera(p) => p.next_frame(),
-            #[cfg(windows)]
+            #[cfg(any(windows, sf_wincheck))]
             ProducerKind::Screen(p) => p.next_frame(),
         }
     }
@@ -245,33 +378,45 @@ impl FrameProducer for ProducerKind {
     fn stream_info(&self) -> StreamInfo {
         match self {
             ProducerKind::Media(p) => p.stream_info(),
-            #[cfg(windows)]
+            #[cfg(any(windows, sf_wincheck))]
             ProducerKind::Camera(p) => p.stream_info(),
-            #[cfg(windows)]
+            #[cfg(any(windows, sf_wincheck))]
             ProducerKind::Screen(p) => p.stream_info(),
         }
     }
 }
 
 impl ProducerKind {
-    /// Next normalized audio chunk, if the producer has audio.
-    /// Cameras opened with an audio device (`open_with_audio`) deliver
-    /// it here; screen capture has no audio.
+    /// Next normalized audio chunk, if the producer carries audio itself
+    /// (media files). Live cameras deliver audio through a separate
+    /// `LiveInput` under the same source id.
     fn next_audio(&mut self) -> Result<Option<sf_capture::media::DecodedAudio>, CaptureError> {
         match self {
             ProducerKind::Media(p) => p.next_audio(),
-            #[cfg(windows)]
-            ProducerKind::Camera(p) => p.next_audio(),
-            #[cfg(windows)]
-            ProducerKind::Screen(_) => Ok(None),
+            #[cfg(any(windows, sf_wincheck))]
+            ProducerKind::Camera(_) | ProducerKind::Screen(_) => Ok(None),
+        }
+    }
+
+    /// Live capture-thread stats (devices only).
+    pub(crate) fn live_stats(&self) -> Option<sf_capture::LiveVideoStats> {
+        match self {
+            ProducerKind::Media(_) => None,
+            #[cfg(any(windows, sf_wincheck))]
+            ProducerKind::Camera(p) => Some(p.live_stats()),
+            #[cfg(any(windows, sf_wincheck))]
+            ProducerKind::Screen(p) => Some(p.live_stats()),
         }
     }
 }
 
-/// Nearest-neighbor RGBA resize (shell-grade; production will use the GPU).
+/// Nearest-neighbor RGBA resize (CPU fallback when the GPU resize fails).
 pub(crate) fn resize_rgba_nearest(src: &[u8], sw: u32, sh: u32, dw: u32, dh: u32) -> Vec<u8> {
     let (sw, sh, dw, dh) = (sw.max(1), sh.max(1), dw.max(1), dh.max(1));
     let mut out = vec![0u8; dw as usize * dh as usize * 4];
+    if src.len() < sw as usize * sh as usize * 4 {
+        return out;
+    }
     for y in 0..dh {
         let sy = (y as u64 * sh as u64 / dh as u64) as u32;
         for x in 0..dw {
@@ -321,9 +466,9 @@ impl Shell {
     }
 
     /// Opens a DirectShow camera producer for a source (Windows only).
-    /// Called from `source_add` before the source is pushed, so a missing
-    /// camera fails cleanly.
-    #[cfg(windows)]
+    /// Video and audio open as SEPARATE dshow graphs (like OBS's separate
+    /// video/audio sources), each with its own non-blocking capture thread.
+    #[cfg(any(windows, sf_wincheck))]
     pub(crate) fn open_camera_producer(
         &mut self,
         source_id: &str,
@@ -333,52 +478,36 @@ impl Shell {
         height: u32,
         fps: u32,
     ) -> Result<(), ShellError> {
-        // Timeout-guarded (see `open_device`): a wedged camera driver
-        // must never freeze the app.
-        //
-        // Video and audio open as SEPARATE dshow graphs (like OBS's
-        // separate video/audio sources). A combined `video=X:audio=Y`
-        // context lets the audio packet flood starve video packets in the
-        // drain loop — the capture delay then grows without bound (the
-        // "one minute late" bug).
         let device_owned = device.map(|d| d.to_string());
         let audio_owned = audio_device.map(|d| d.to_string());
         let prod: sf_capture::dshow::DshowProducer = open_device("camera", move || {
             match device_owned.as_deref() {
-                // Video-only; audio (if any) gets its own graph below.
                 Some(d) => sf_capture::dshow::DshowProducer::open(d, width, height, fps),
                 None => sf_capture::dshow::DshowProducer::open_default(width, height, fps),
             }
         })?;
-        // Remember what the camera actually negotiated (codec/res/fps) for
-        // diagnostics — shown in the UI, not just what was requested.
         self.camera_formats
             .insert(source_id.to_string(), prod.negotiated_format().to_string());
         self.media_producers.insert(
             source_id.to_string(),
             SendProducer(ProducerKind::Camera(prod)),
         );
-        // Separate audio graph (OBS parity): never share the video's dshow
-        // context.
         if let Some(a) = audio_owned {
             if !a.is_empty() {
                 let audio_prod: sf_capture::audio_in::AudioInputProducer =
                     open_device("camera audio", move || {
                         sf_capture::audio_in::AudioInputProducer::open(Some(a.as_str()))
                     })?;
-                self.audio_producers
-                    .insert(source_id.to_string(), audio_prod);
+                let live = spawn_live_audio(source_id, audio_prod)?;
+                self.audio_inputs.insert(source_id.to_string(), live);
             }
         }
         Ok(())
     }
 
-    /// Opens a desktop screen producer (Windows gdigrab). Called from
-    /// `source_add` before the source is pushed, so a failed grab fails
-    /// cleanly.
-    #[cfg(windows)]
+    /// Opens a desktop screen producer (Windows gdigrab).
+    #[cfg(any(windows, sf_wincheck))]
     pub(crate) fn open_screen_producer(&mut self, source_id: &str) -> Result<(), ShellError> {
-        // Timeout-guarded like the other device opens (see `open_device`).
         let prod: sf_capture::gdigrab::ScreenProducer =
             open_device("screen capture", || sf_capture::gdigrab::ScreenProducer::open(30))?;
         self.media_producers.insert(
@@ -389,15 +518,13 @@ impl Shell {
     }
 
     /// Negotiated camera format for a source, e.g.
-    /// `"mjpeg 1920x1080 @30fps (via mjpeg)"`. `None` for non-camera
-    /// sources or when the camera was never opened.
+    /// `"mjpeg 1920x1080 @30fps (via mjpeg)"`.
     pub fn camera_format(&self, source_id: &str) -> Option<String> {
         self.camera_formats.get(source_id).cloned()
     }
 
     /// Audio device label for a source: the mic name for audio inputs,
-    /// the camera's audio device when set. `None` for sources without an
-    /// audio device (media files, silent sources).
+    /// the camera's audio device when set.
     pub fn source_audio_device(&self, source_id: &str) -> Option<String> {
         let src = self
             .scenes
@@ -412,12 +539,8 @@ impl Shell {
     }
 
     /// Opens a DirectShow audio-input producer (microphone/line-in,
-    /// Windows only). Called from `source_add` before the source is
-    /// pushed, so a missing device fails cleanly.
-    ///
-    /// The open runs on a timeout-guarded thread (see `open_device`): a
-    /// wedged audio driver must never freeze the app.
-    #[cfg(windows)]
+    /// Windows only) on its own capture thread.
+    #[cfg(any(windows, sf_wincheck))]
     pub(crate) fn open_audio_producer(
         &mut self,
         source_id: &str,
@@ -428,57 +551,152 @@ impl Shell {
             open_device("audio input", move || {
                 sf_capture::audio_in::AudioInputProducer::open(device_owned.as_deref())
             })?;
-        self.audio_producers.insert(source_id.to_string(), prod);
+        let live = spawn_live_audio(source_id, prod)?;
+        self.audio_inputs.insert(source_id.to_string(), live);
         Ok(())
     }
 
-    /// Pulls the next decoded frame for a media source, resized to the
-    /// composite size. Returns `None` when no frame is ready; freezes on
-    /// the last frame at end-of-stream (documented behavior).
-    pub(crate) fn pull_media_frame(&mut self, source_id: &str, w: u32, h: u32) -> Option<Vec<u8>> {
-        let frame = {
-            let prod = self.media_producers.get_mut(source_id)?;
-            match prod.next_frame() {
-                Ok(Some(f)) => Some(f),
-                Ok(None) => None,
-                Err(CaptureError::EndOfStream) => {
-                    // Freeze on the last frame; stop polling the demuxer.
-                    self.media_producers.remove(source_id);
-                    None
+    // ------------------------------------------------------------------
+    // [1] Source frame cache
+    // ------------------------------------------------------------------
+
+    /// Capture stage of the tick: pull every video producer exactly once
+    /// (newest frame — the capture threads already dropped anything older)
+    /// and update per-source age / fps.
+    pub(crate) fn refresh_source_frames(&mut self, tick_us: i64) {
+        let ids: Vec<String> = self.media_producers.keys().cloned().collect();
+        for id in ids {
+            let Some(prod) = self.media_producers.get_mut(&id) else {
+                continue;
+            };
+            let result = prod.next_frame();
+            match result {
+                Ok(Some(f)) => {
+                    let entry = self.source_frames.entry(id.clone()).or_insert_with(|| {
+                        SourceFrame {
+                            width: f.width,
+                            height: f.height,
+                            data: Arc::new(Vec::new()),
+                            captured_at_us: f.captured_at_us,
+                            seq: 0,
+                            age_ema_us: (tick_us - f.captured_at_us).max(0) as f64,
+                            arrivals: VecDeque::new(),
+                            last_error: None,
+                        }
+                    });
+                    entry.width = f.width;
+                    entry.height = f.height;
+                    entry.captured_at_us = f.captured_at_us;
+                    entry.data = Arc::new(f.data);
+                    entry.seq += 1;
+                    entry.arrivals.push_back(tick_us);
+                    entry.last_error = None;
                 }
-                Err(_) => return None,
-            }
-        };
-        match frame {
-            Some(f) => {
-                let px = if f.width == w && f.height == h {
-                    f.data
-                } else {
-                    // Hybrid: GPU resize first, fall back to CPU on error.
-                    match self.engine.gpu_resize_rgba(&f.data, f.width, f.height, w, h) {
-                        Ok(px) => px,
-                        Err(_) => resize_rgba_nearest(&f.data, f.width, f.height, w, h),
+                Ok(None) => {}
+                Err(CaptureError::EndOfStream) => {
+                    // Media file ended: freeze on the last frame; stop
+                    // polling the demuxer.
+                    self.media_producers.remove(&id);
+                }
+                Err(e) => {
+                    if let Some(entry) = self.source_frames.get_mut(&id) {
+                        entry.last_error = Some(e.to_string());
                     }
-                };
-                self.media_last_frame
-                    .insert(source_id.to_string(), (w, h, px.clone()));
-                Some(px)
+                }
             }
-            None => self
-                .media_last_frame
-                .get(source_id)
-                .map(|(_, _, px)| px.clone()),
+            if let Some(entry) = self.source_frames.get_mut(&id) {
+                while entry
+                    .arrivals
+                    .front()
+                    .is_some_and(|&t| tick_us - t > 1_000_000)
+                {
+                    entry.arrivals.pop_front();
+                }
+                let age = (tick_us - entry.captured_at_us).max(0) as f64;
+                entry.age_ema_us += AGE_EMA_ALPHA * (age - entry.age_ema_us);
+            }
         }
     }
 
-    /// Pause/resume a media source's playback. While paused the video
-    /// freezes on the last frame and its audio goes silent. Returns the
-    /// new paused state.
+    /// The current frame of a video source at `w`×`h`: served from the
+    /// per-tick cache (resized once per new frame per size). Never pulls
+    /// the producer — so a UI poll or a second scene can't steal frames.
+    pub(crate) fn pull_media_frame(
+        &mut self,
+        source_id: &str,
+        w: u32,
+        h: u32,
+    ) -> Option<Arc<Vec<u8>>> {
+        let f = self.source_frames.get(source_id)?;
+        if f.data.is_empty() {
+            return None;
+        }
+        if f.width == w && f.height == h {
+            return Some(Arc::clone(&f.data));
+        }
+        let key = (source_id.to_string(), w, h);
+        if let Some((seq, px)) = self.resized_frames.get(&key) {
+            if *seq == f.seq {
+                return Some(Arc::clone(px));
+            }
+        }
+        let (sw, sh, seq, data) = (f.width, f.height, f.seq, Arc::clone(&f.data));
+        let px = match self.engine.gpu_resize_rgba(&data, sw, sh, w, h) {
+            Ok(px) => px,
+            Err(_) => resize_rgba_nearest(&data, sw, sh, w, h),
+        };
+        let px = Arc::new(px);
+        self.resized_frames.insert(key, (seq, Arc::clone(&px)));
+        Some(px)
+    }
+
+    /// Smoothed age of the program's main live picture (first visible
+    /// camera, else screen, else media) — the A/V alignment reference.
+    pub(crate) fn program_video_age_us(&self) -> Option<i64> {
+        let scene = self
+            .scenes
+            .iter()
+            .find(|s| s.id == self.program_scene_id)?;
+        let rank = |k: &SourceKind| match k {
+            SourceKind::Camera { .. } => Some(0),
+            SourceKind::Screen => Some(1),
+            SourceKind::Media { .. } => Some(2),
+            _ => None,
+        };
+        scene
+            .sources
+            .iter()
+            .filter(|s| s.visible)
+            .filter_map(|s| Some((rank(&s.kind)?, s)))
+            .filter(|(_, s)| self.source_frames.contains_key(&s.id))
+            .min_by_key(|(r, s)| (*r, s.order))
+            .and_then(|(_, s)| self.source_frames.get(&s.id))
+            .map(|f| f.age_ema_us as i64)
+    }
+
+    /// Requested play age for a live audio source (see `sf_audio::bus`):
+    /// its own camera's picture age (camera audio) or the program
+    /// picture's age (external mic), plus the manual offset.
+    fn audio_target_age_us(&self, audio_id: &str) -> Option<i64> {
+        let offset = self.av_sync.offset_ms as i64 * 1000;
+        if !self.av_sync.auto {
+            return Some(offset.max(0));
+        }
+        let video_age = self
+            .source_frames
+            .get(audio_id)
+            .map(|f| f.age_ema_us as i64)
+            .or_else(|| self.program_video_age_us())?;
+        Some((video_age + offset).max(0))
+    }
+
+    /// Pause/resume a media source's playback.
     pub fn media_set_paused(&mut self, source_id: &str, paused: bool) -> Result<bool, ShellError> {
         let prod = self
             .media_producers
             .get_mut(source_id)
             .ok_or_else(|| ShellError::UnknownSource(source_id.to_string()))?;
+        #[allow(unreachable_patterns)]
         match &mut prod.0 {
             ProducerKind::Media(p) => {
                 p.set_paused(paused);
@@ -491,8 +709,6 @@ impl Shell {
     }
 
     /// Enable/disable local speaker monitoring of the master mix.
-    /// Opening is lazy and fallible: no output device → clean error,
-    /// never a startup crash.
     pub fn set_monitor_enabled(&mut self, enabled: bool) -> Result<(), ShellError> {
         if enabled && self.audio_monitor.is_none() {
             match crate::audio_monitor::AudioMonitor::open() {
@@ -516,7 +732,7 @@ impl Shell {
 
     /// Current enhancer settings for the UI.
     pub fn enhancer_settings(&self) -> EnhancerView {
-        let s = self.audio_enhancer.settings();
+        let s = &self.enhancer_settings;
         EnhancerView {
             enabled: s.enabled,
             gate_enabled: s.gate_enabled,
@@ -525,55 +741,112 @@ impl Shell {
             eq_mid_db: s.eq_mid_db,
             eq_high_db: s.eq_high_db,
             compressor_enabled: s.compressor_enabled,
+            ai_denoise: s.ai_denoise,
+            ai_strength: s.ai_strength,
         }
     }
 
     /// Applies enhancer settings from the UI (clamped to sane ranges).
     pub fn set_enhancer_settings(&mut self, v: EnhancerView) {
-        self.audio_enhancer.set_settings(sf_audio::EnhancerSettings {
+        let num = |x: f32, lo: f32, hi: f32, dflt: f32| {
+            if x.is_finite() {
+                x.clamp(lo, hi)
+            } else {
+                dflt
+            }
+        };
+        let settings = sf_audio::EnhancerSettings {
             enabled: v.enabled,
             gate_enabled: v.gate_enabled,
-            gate_threshold_db: v.gate_threshold_db.clamp(-60.0, 0.0),
-            eq_low_db: v.eq_low_db.clamp(-12.0, 12.0),
-            eq_mid_db: v.eq_mid_db.clamp(-12.0, 12.0),
-            eq_high_db: v.eq_high_db.clamp(-12.0, 12.0),
+            gate_threshold_db: num(v.gate_threshold_db, -60.0, 0.0, -40.0),
+            eq_low_db: num(v.eq_low_db, -12.0, 12.0, 0.0),
+            eq_mid_db: num(v.eq_mid_db, -12.0, 12.0, 0.0),
+            eq_high_db: num(v.eq_high_db, -12.0, 12.0, 0.0),
             compressor_enabled: v.compressor_enabled,
-        });
-    }
-
-    /// True when any open media producer has an audio stream.
-    fn has_audio_sources(&self) -> bool {
-        if self
-            .media_producers
-            .values()
-            .any(|p| p.stream_info().has_audio)
-        {
-            return true;
-        }
-        #[cfg(windows)]
-        if !self.audio_producers.is_empty() {
-            return true;
-        }
-        false
-    }
-
-    // ------------------------------------------------------------------
-    // Audio: pull + mix + meters
-    // ------------------------------------------------------------------
-
-    /// Pulls pending audio chunks from all media producers, runs the
-    /// `sf-audio` mixer, and refreshes meter state. Returns the owned
-    /// mixed samples (empty when nothing flowed). This is the single
-    /// place meters become real.
-    pub(crate) fn pump_audio(&mut self) -> Vec<f32> {
-        // Sync mixer registration with the current media + audio-input sources.
-        let ids: Vec<String> = {
-            #[allow(unused_mut)]
-            let mut v: Vec<String> = self.media_producers.keys().cloned().collect();
-            #[cfg(windows)]
-            v.extend(self.audio_producers.keys().cloned());
-            v
+            ai_denoise: v.ai_denoise,
+            ai_strength: num(v.ai_strength, 0.0, 1.0, 1.0),
         };
+        for e in self.voice_enhancers.values_mut() {
+            e.set_settings(settings.clone());
+        }
+        self.enhancer_settings = settings;
+    }
+
+    /// A/V sync settings (auto alignment + manual offset).
+    pub fn av_sync_get(&self) -> crate::production::AvSyncView {
+        self.av_sync.clone()
+    }
+
+    /// Sets A/V sync: `auto` aligns audio to the picture's measured age;
+    /// `offset_ms` (−100…+100, + = later audio) is added on top.
+    pub fn av_sync_set(&mut self, auto: bool, offset_ms: i32) -> crate::production::AvSyncView {
+        self.av_sync = crate::production::AvSyncView {
+            auto,
+            offset_ms: offset_ms.clamp(-100, 100),
+        };
+        self.av_sync.clone()
+    }
+
+    /// Live per-voice-source telemetry for the UI (enhancer + bus + device).
+    pub fn voice_stats(&self) -> std::collections::HashMap<String, VoiceStatsView> {
+        self.audio_inputs
+            .iter()
+            .map(|(id, inp)| {
+                let e = self
+                    .voice_enhancers
+                    .get(id)
+                    .map(|e| e.stats())
+                    .unwrap_or_default();
+                let b = self.audio_bus.stats(id);
+                let device = match inp.status() {
+                    sf_audio::LiveStatus::Starting => "starting".to_string(),
+                    sf_audio::LiveStatus::Running => "running".to_string(),
+                    sf_audio::LiveStatus::Error(m) => format!("error: {m}"),
+                    sf_audio::LiveStatus::Stopped => "stopped".to_string(),
+                };
+                (
+                    id.clone(),
+                    VoiceStatsView {
+                        vad: e.vad,
+                        gain_reduction_db: e.gain_reduction_db,
+                        gate_closed: e.gate_closed,
+                        latency_ms: e.latency_ms,
+                        process_us: e.process_us,
+                        buffered_ms: b.buffered_ms,
+                        underruns: b.underruns,
+                        dropped_frames: b.dropped_frames + inp.dropped_frames(),
+                        device,
+                        audio_age_ms: b.audio_age_ms,
+                        target_age_ms: b.target_age_ms,
+                        corrections: b.corrections,
+                    },
+                )
+            })
+            .collect()
+    }
+
+    // ------------------------------------------------------------------
+    // [3] Audio: pull + align + enhance + mix + meters
+    // ------------------------------------------------------------------
+
+    /// Mixes exactly `frames` sample frames (48 kHz stereo) for the tick at
+    /// `tick_us`. `frames` comes from the wall-clock [`sf_audio::AudioTimeline`],
+    /// so the audio timeline always covers real elapsed time.
+    ///
+    /// 1. Live inputs: drain their capture threads (with capture times).
+    /// 2. Media files: decode until the bus holds one block + prebuffer.
+    /// 3. Live sources are pulled *aligned* to the picture's age; voice
+    ///    sources go through their enhancer pre-fader; the mixer sums.
+    pub(crate) fn pump_audio(&mut self, frames: usize, tick_us: i64) -> Vec<f32> {
+        let media_ids: Vec<String> = self
+            .media_producers
+            .iter()
+            .filter(|(id, p)| p.stream_info().has_audio && !self.audio_inputs.contains_key(*id))
+            .map(|(id, _)| id.clone())
+            .collect();
+        let live_ids: Vec<String> = self.audio_inputs.keys().cloned().collect();
+        let ids: Vec<String> = media_ids.iter().chain(live_ids.iter()).cloned().collect();
+
         for id in &ids {
             if !self.audio_mixer.source_ids().contains(id) {
                 let gain = self.mixer.channels.get(id).map(|c| c.gain).unwrap_or(1.0);
@@ -593,87 +866,76 @@ impl Shell {
         }
         self.audio_mixer.set_master_gain(self.mixer.master.gain);
         self.audio_mixer.set_master_mute(self.mixer.master.mute);
+        self.audio_bus.retain(&ids);
+        self.voice_enhancers.retain(|k, _| live_ids.contains(k));
 
-        // Drain a bounded number of chunks per producer per tick.
-        let mut chunks: Vec<(String, Vec<f32>, u32, u32)> = Vec::new();
-        for id in &ids {
-            if let Some(prod) = self.media_producers.get_mut(id) {
-                for _ in 0..4 {
-                    match prod.next_audio() {
-                        Ok(Some(c)) => {
-                            chunks.push((id.clone(), c.samples, c.channels, c.sample_rate))
-                        }
-                        _ => break,
-                    }
-                }
+        if ids.is_empty() || frames == 0 {
+            return vec![0.0; frames * 2];
+        }
+
+        let mut tmp: Vec<f32> = Vec::new();
+        for (id, input) in &self.audio_inputs {
+            tmp.clear();
+            let at = input.drain_into_timed(&mut tmp);
+            if !tmp.is_empty() {
+                self.audio_bus.push_timed(id, &tmp, at);
             }
         }
-        // Live audio inputs: drain up to 2 chunks per tick (~42 ms of
-        // 48 kHz audio covers the 33 ms tick; the producer's queue is
-        // newest-wins so nothing accumulates).
-        #[cfg(windows)]
-        for (id, prod) in self.audio_producers.iter_mut() {
-            for _ in 0..2 {
+        let target = self.audio_bus.refill_target_frames(frames);
+        for id in &media_ids {
+            let Some(prod) = self.media_producers.get_mut(id) else {
+                continue;
+            };
+            let mut guard = 0;
+            while self.audio_bus.buffered_frames(id) < target && guard < 64 {
+                guard += 1;
                 match prod.next_audio() {
-                    Ok(Some(c)) => {
-                        chunks.push((id.clone(), c.samples, c.channels, c.sample_rate))
+                    Ok(Some(c)) if c.channels == 2 && c.sample_rate == 48_000 => {
+                        self.audio_bus.push(id, &c.samples)
                     }
+                    Ok(Some(_)) => {}
                     _ => break,
                 }
             }
         }
-        if chunks.is_empty() {
-            return Vec::new();
+
+        let mut blocks: Vec<(String, Vec<f32>)> = Vec::with_capacity(ids.len());
+        for id in &ids {
+            let mut block = Vec::with_capacity(frames * 2);
+            if live_ids.contains(id) {
+                let target_age = self.audio_target_age_us(id);
+                self.audio_bus
+                    .pull_aligned(id, frames, &mut block, tick_us, target_age);
+                let settings = &self.enhancer_settings;
+                let enh = self.voice_enhancers.entry(id.clone()).or_insert_with(|| {
+                    let mut e = sf_audio::Enhancer::new(48_000);
+                    e.set_settings(settings.clone());
+                    e
+                });
+                enh.process(&mut block);
+            } else {
+                self.audio_bus.pull(id, frames, &mut block);
+            }
+            blocks.push((id.clone(), block));
         }
-        let frames: Vec<(&str, AudioFrame)> = chunks
+        let frames_in: Vec<(&str, AudioFrame)> = blocks
             .iter()
-            .map(|(id, s, ch, sr)| {
-                (
-                    id.as_str(),
-                    AudioFrame {
-                        samples: s,
-                        channels: *ch,
-                        sample_rate: *sr,
-                    },
-                )
-            })
+            .map(|(id, b)| (id.as_str(), AudioFrame::new(b, 2, 48_000)))
             .collect();
-        let mixed = self.audio_mixer.mix(&frames);
+        let mixed = self.audio_mixer.mix(&frames_in);
         for m in &mixed.per_source {
             self.meter_values.insert(m.id.clone(), m.peak);
         }
-        if !mixed.samples.is_empty() {
-            self.meters_live = true;
-        }
-        let mut out = mixed.samples;
-        // Free offline enhancer (gate → EQ → compressor) on the master mix.
-        self.audio_enhancer.process(&mut out);
-        out
+        self.meters_live = true;
+        mixed.samples
     }
 
     // ------------------------------------------------------------------
-    // Program frame (raw, for encode)
+    // [2] Program frame
     // ------------------------------------------------------------------
 
     /// Raw RGBA program frame: live crossfade during an auto transition,
-    /// otherwise the program scene composite. Mirrors `program_frame_png`.
-    /// Renders the preview scene at monitor size and caches it for the UI
-    /// monitors. Called by the media tick every tick so the preview
-    /// monitor stays as fresh as the program monitor without re-rendering
-    /// (and re-pulling cameras) on every UI poll — a major source of
-    /// perceived capture latency.
-    fn refresh_preview_monitor(&mut self) {
-        let preview_id = self.preview_scene_id.clone();
-        if preview_id == self.program_scene_id || preview_id.is_empty() {
-            return;
-        }
-        if let Ok(f) =
-            self.render_scene_frame(&preview_id, crate::MONITOR_W, crate::MONITOR_H)
-        {
-            self.set_preview_monitor_frame(f);
-        }
-    }
-
+    /// otherwise the program scene composite.
     pub(crate) fn program_frame_raw(
         &mut self,
         width: u32,
@@ -701,7 +963,7 @@ impl Shell {
     }
 
     // ------------------------------------------------------------------
-    // Recording
+    // [4] Output engine
     // ------------------------------------------------------------------
 
     fn video_encoder_opts(&self) -> VideoEncoderOpts {
@@ -712,24 +974,29 @@ impl Shell {
             fps_num: vs.output_fps,
             fps_den: 1,
             bitrate_bps: vs.bitrate_kbps * 1000,
+            // 2-second keyframe interval: YouTube/Facebook/TikTok ingest
+            // requirement (≤ 2–4 s) and fast viewer join.
             gop: vs.output_fps * 2,
             preset: "veryfast".to_string(),
         }
     }
 
     /// Opens the video encoder honoring the Video panel's encoder override:
-    /// `"auto"` probes the registry (NVENC → QSV → AMF → x264 → mpeg4),
-    /// anything else forces that encoder (falls back to auto on failure).
-    fn open_video_encoder(&self, opts: VideoEncoderOpts) -> Result<VideoEncoder, ShellError> {
-        let name = self.video_settings.encoder.as_str();
+    /// `"auto"` probes NVENC → QSV → AMF → x264 → mpeg4 (falls back when an
+    /// encoder exists in the registry but fails to open on this machine).
+    fn open_video_encoder(&mut self, opts: VideoEncoderOpts) -> Result<VideoEncoder, ShellError> {
+        let name = self.video_settings.encoder.clone();
+        self.encoder_note = None;
         if name != "auto" {
-            if let Some(id) = encoder_id_from_name(name) {
+            if let Some(id) = encoder_id_from_name(&name) {
                 match VideoEncoder::open_with_encoder(id, opts.clone()) {
                     Ok(enc) => return Ok(enc),
                     Err(e) => {
-                        // Forced encoder failed (e.g. NVENC without NVIDIA
-                        // GPU) — fall through to auto so start still works.
-                        eprintln!("video: forced encoder {name} failed ({e}); falling back to auto");
+                        // e.g. NVENC selected on a machine without an
+                        // NVIDIA GPU: fall back, and say so in diagnostics.
+                        self.encoder_note = Some(format!(
+                            "{name} unavailable ({e}); using automatic selection"
+                        ));
                     }
                 }
             }
@@ -737,32 +1004,50 @@ impl Shell {
         VideoEncoder::open(opts).map_err(|e| ShellError::Capture(format!("video encoder: {e}")))
     }
 
-    /// Rebuilds the live video encoders (stream and/or record) with the
-    /// current output settings — used for real-time FPS changes mid
-    /// session. Each encoder is replaced only after its successor opens,
-    /// so a failure leaves the working encoder untouched. The first packet
-    /// out of a fresh encoder is a keyframe, so decoders resync
-    /// immediately; PTS stays continuous via the running `video_pts_us`
-    /// clock (`VideoEncoder::encode_rgba` anchors to it).
-    pub(crate) fn reinit_video_encoders(&mut self) -> Result<(), ShellError> {
-        if self.active_stream.is_some() {
-            let enc = self.open_video_encoder(self.video_encoder_opts())?;
-            if let Some(a) = self.active_stream.as_mut() {
-                a.video_enc = enc;
-            }
+    /// Creates the shared encoder pair if no sink is running yet.
+    fn ensure_output_engine(&mut self) -> Result<(), String> {
+        if self.output.is_some() {
+            return Ok(());
         }
-        if self.active_recording.is_some() {
-            let enc = self.open_video_encoder(self.video_encoder_opts())?;
-            if let Some(rec) = self.active_recording.as_mut() {
-                rec.video_enc = enc;
+        let opts = self.video_encoder_opts();
+        let video_enc = self.open_video_encoder(opts).map_err(|e| e.to_string())?;
+        let audio_enc = AudioEncoder::open().map_err(|e| format!("audio encoder: {e}"))?;
+        self.output = Some(OutputEngine {
+            video_enc,
+            audio_enc,
+            record: None,
+            stream: None,
+            encoded_times: VecDeque::new(),
+            skipped_slots: 0,
+            last_audio_encode_us: 0,
+        });
+        Ok(())
+    }
+
+    /// Drops the encoder pair once no sink uses it.
+    fn release_output_engine_if_idle(&mut self) {
+        if self.output.as_ref().is_some_and(|o| !o.has_sinks()) {
+            self.output = None;
+        }
+    }
+
+    /// Rebuilds the shared video encoder with the current output settings
+    /// (live fps change). The successor is opened first, so a failure
+    /// leaves the working encoder untouched. Its first frame is an IDR and
+    /// PTS stay on the same wall clock.
+    pub(crate) fn reinit_video_encoders(&mut self) -> Result<(), ShellError> {
+        if self.output.is_some() {
+            let opts = self.video_encoder_opts();
+            let enc = self.open_video_encoder(opts)?;
+            if let Some(o) = self.output.as_mut() {
+                o.video_enc = enc;
             }
         }
         Ok(())
     }
 
-    /// Starts recording the program bus to `record_settings.path`.
-    /// Real backend: libx264 (or the selected system encoder) + AAC into
-    /// fragmented MP4 / MKV. Failures move the lifecycle to `Error`.
+    /// Starts recording the program output to `record_settings.path`
+    /// (fragmented MP4 / MKV). Shares the encoder with a running stream.
     pub fn record_start(&mut self) -> Result<(), ShellError> {
         let can_start = self.record_runtime.is_none() || self.record_error.is_some();
         if !can_start {
@@ -781,36 +1066,30 @@ impl Shell {
             RecordFormat::Mp4 => ContainerFormat::Mp4Fragmented,
             RecordFormat::Mkv => ContainerFormat::Mkv,
         };
-        let build = || -> Result<ActiveRecording, String> {
-            let video_enc = self
-                .open_video_encoder(self.video_encoder_opts())
-                .map_err(|e| e.to_string())?;
+        let build = |s: &mut Shell| -> Result<(), String> {
+            s.ensure_output_engine()?;
+            let o = s.output.as_mut().expect("engine exists");
             let mut recorder =
                 Recorder::create(&path, fmt).map_err(|e| format!("recorder: {e}"))?;
             recorder
-                .add_video_stream(&video_enc.parameters())
+                .add_video_stream(&o.video_enc.parameters())
                 .map_err(|e| format!("recorder: {e}"))?;
-            let audio_enc = if self.has_audio_sources() {
-                let enc = AudioEncoder::open().map_err(|e| format!("audio encoder: {e}"))?;
-                recorder
-                    .add_audio_stream(&enc.parameters(), enc.sample_rate())
-                    .map_err(|e| format!("recorder: {e}"))?;
-                Some(enc)
-            } else {
-                None
-            };
-            Ok(ActiveRecording {
-                video_enc,
-                audio_enc,
+            // Always an audio track (silent until a source plays): a mic
+            // added mid-recording must still be heard.
+            recorder
+                .add_audio_stream(&o.audio_enc.parameters(), o.audio_enc.sample_rate())
+                .map_err(|e| format!("recorder: {e}"))?;
+            o.video_enc.force_keyframe();
+            o.record = Some(RecordSink {
                 recorder,
+                rebase: Rebase::default(),
+                was_paused: false,
                 path: path.clone(),
-                video_pts_us: 0,
-                audio_pts_us: 0,
-            })
+            });
+            Ok(())
         };
-        match build() {
-            Ok(rec) => {
-                self.active_recording = Some(rec);
+        match build(self) {
+            Ok(()) => {
                 self.record_runtime = Some(RecordRuntime {
                     started: Instant::now(),
                     accumulated: Duration::ZERO,
@@ -821,7 +1100,10 @@ impl Shell {
                 Ok(())
             }
             Err(m) => {
-                self.active_recording = None;
+                if let Some(o) = self.output.as_mut() {
+                    o.record = None;
+                }
+                self.release_output_engine_if_idle();
                 self.record_runtime = None;
                 self.record_error = Some(m.clone());
                 self.emit_record_state();
@@ -830,139 +1112,56 @@ impl Shell {
         }
     }
 
-    /// Stops recording: flushes encoders, finalizes the file, back to Idle.
+    /// Stops recording and finalizes the file. The encoder keeps running
+    /// if the stream still uses it.
     pub fn record_stop(&mut self) -> Result<(), ShellError> {
-        if let Some(mut rec) = self.active_recording.take() {
+        let sink = self.output.as_mut().and_then(|o| o.record.take());
+        if let Some(mut rec) = sink {
+            let frame_us = self.frame_interval_us() as i64;
             let mut failed: Option<String> = None;
-            let mut drain =
-                |enc: &mut dyn FnMut() -> Result<Vec<EncodedPacket>, String>,
-                 write: &mut dyn FnMut(&EncodedPacket) -> Result<(), String>| {
-                    if failed.is_some() {
-                        return;
-                    }
-                    match enc() {
-                        Ok(pkts) => {
-                            for p in &pkts {
-                                if let Err(e) = write(p) {
-                                    failed = Some(e);
-                                    break;
-                                }
-                            }
+            // Last sink: flush the encoders into the file (zero-latency
+            // settings leave nothing buffered in video; AAC may hold one
+            // frame). Otherwise the stream keeps the encoder.
+            if self.output.as_ref().is_some_and(|o| o.stream.is_none()) {
+                let o = self.output.as_mut().expect("checked");
+                let mut pkts = o.video_enc.flush().unwrap_or_default();
+                pkts.extend(o.audio_enc.flush().unwrap_or_default());
+                for p in &pkts {
+                    if let Some(p) = rec.rebase.map(p, frame_us) {
+                        let r = if p.stream_index == 0 {
+                            rec.recorder.write_video(&p)
+                        } else {
+                            rec.recorder.write_audio(&p)
+                        };
+                        if let Err(e) = r {
+                            failed = Some(format!("write: {e}"));
+                            break;
                         }
-                        Err(e) => failed = Some(e),
                     }
-                };
-            let mut v = rec.video_enc;
-            drain(
-                &mut || v.flush().map_err(|e| format!("video flush: {e}")),
-                &mut |p| {
-                    rec.recorder
-                        .write_video(p)
-                        .map_err(|e| format!("write video: {e}"))
-                },
-            );
-            if let Some(mut a) = rec.audio_enc.take() {
-                drain(
-                    &mut || a.flush().map_err(|e| format!("audio flush: {e}")),
-                    &mut |p| {
-                        rec.recorder
-                            .write_audio(p)
-                            .map_err(|e| format!("write audio: {e}"))
-                    },
-                );
+                }
             }
             if failed.is_none() {
                 if let Err(e) = rec.recorder.finish() {
                     failed = Some(format!("finalize: {e}"));
                 }
             }
-            // `finish` consumes the recorder; on earlier failure the file
-            // is left fragmented-but-present (crash-safe by design).
             if let Some(m) = failed {
                 self.record_error = Some(m);
             }
         }
+        self.release_output_engine_if_idle();
         self.record_runtime = None;
         self.emit_record_state();
         Ok(())
     }
 
-    /// One recording step, called from [`Shell::av_tick`]: encodes the
-    /// given program frame and the mixed audio, and writes. Errors fail
-    /// the recording loudly (lifecycle `Error`) rather than dropping
-    /// silently.
-    pub(crate) fn record_tick(&mut self, frame: &Frame, audio: &[f32]) {
-        let frame_us = self.frame_interval_us();
-        let rec = match self.active_recording.as_mut() {
-            Some(r) => r,
-            None => return,
-        };
-        if self
-            .record_runtime
-            .as_ref()
-            .map(|r| r.paused)
-            .unwrap_or(true)
-        {
-            return;
-        }
-        let mut failed: Option<String> = None;
-        let vpts = rec.video_pts_us;
-        rec.video_pts_us += frame_us as i64;
-        match rec.video_enc.encode_rgba(&frame.pixels, vpts) {
-            Ok(pkts) => {
-                for p in &pkts {
-                    if let Err(e) = rec.recorder.write_video(p) {
-                        failed = Some(format!("write video: {e}"));
-                        break;
-                    }
-                }
-            }
-            Err(e) => failed = Some(format!("encode video: {e}")),
-        }
-        if failed.is_none() && !audio.is_empty() {
-            if let Some(aenc) = rec.audio_enc.as_mut() {
-                let apts = rec.audio_pts_us;
-                rec.audio_pts_us += audio.len() as i64 / 2 * 1_000_000 / 48_000;
-                match aenc.encode_pcm(&audio, apts) {
-                    Ok(pkts) => {
-                        for p in &pkts {
-                            if let Err(e) = rec.recorder.write_audio(p) {
-                                failed = Some(format!("write audio: {e}"));
-                                break;
-                            }
-                        }
-                    }
-                    Err(e) => failed = Some(format!("encode audio: {e}")),
-                }
-            }
-        }
-        if let Some(m) = failed {
-            // Fail loudly: drop the session, surface the error.
-            // The frame never made it through encode/write: count it as
-            // skipped on the render side (not a network drop).
-            self.perf_skipped_render += 1;
-            self.active_recording = None;
-            self.record_runtime = None;
-            self.record_error = Some(m);
-            self.emit_record_state();
-        }
-    }
-
-    // ------------------------------------------------------------------
-    // Streaming
-    // ------------------------------------------------------------------
-
-    /// Starts streaming: builds encoders and spawns the async RTMP send
-    /// worker, which connects on its own thread (the media tick never blocks
-    /// on TCP connect). Lifecycle goes `Connecting` → `Live`, or → `Error`
-    /// with a redacted message if the server is unreachable; the key never
-    /// appears in any message.
+    /// Starts streaming: spawns the async RTMP send worker (connects on
+    /// its own thread). Shares the encoder with a running recording.
     pub fn stream_start(&mut self) -> Result<(), ShellError> {
         self.stream_start_with_policy(ReconnectPolicy::default())
     }
 
     /// [`stream_start`](Self::stream_start) with an explicit reconnect policy.
-    /// Public so embedders (and tests) can tune or fast-fail the backoff.
     pub fn stream_start_with_policy(
         &mut self,
         policy: ReconnectPolicy,
@@ -975,55 +1174,49 @@ impl Shell {
                 ))
             }
         }
-        let url = self.stream_settings.url.trim_end_matches('/').to_string();
-        let key = self.stream_settings.key.clone();
-        if url.is_empty() {
-            let m = "no stream URL set".to_string();
-            self.stream_lifecycle = StreamLifecycle::Error { message: m.clone() };
-            self.emit_stream_state();
-            return Err(ShellError::Stream(m));
+        // A failed previous session may still hold its sink.
+        if let Some(old) = self.output.as_mut().and_then(|o| o.stream.take()) {
+            old.send.shutdown_detached();
         }
-        let full_url = if key.is_empty() {
-            url.clone()
-        } else {
-            format!("{url}/{key}")
+        let target = match crate::platforms::resolve_target(&self.stream_settings) {
+            Ok(t) => t,
+            Err(m) => {
+                self.stream_lifecycle = StreamLifecycle::Error { message: m.clone() };
+                self.emit_stream_state();
+                self.release_output_engine_if_idle();
+                return Err(ShellError::Stream(m));
+            }
         };
-        let build = || -> Result<ActiveStream, String> {
-            let video_enc = self
-                .open_video_encoder(self.video_encoder_opts())
-                .map_err(|e| e.to_string())?;
-            let audio_enc = if self.has_audio_sources() {
-                Some(AudioEncoder::open().map_err(|e| format!("audio encoder: {e}"))?)
-            } else {
-                None
-            };
-            let audio_params = audio_enc.as_ref().map(|a| a.parameters());
-            let target = StreamTarget::Rtmp(full_url.clone());
-            let transport =
-                RealTransport::new(target.clone(), video_enc.parameters(), audio_params);
-            let streamer = Streamer::new(target, transport, policy);
-            // The worker connects asynchronously; the tick never stalls on
-            // the network from here on.
-            let send = crate::send_worker::SendWorker::spawn(full_url.clone(), key.clone(), streamer);
-            Ok(ActiveStream {
+        let full_url = target.full_url;
+        let key = self.stream_settings.key.clone();
+        let build = |s: &mut Shell| -> Result<(), String> {
+            s.ensure_output_engine()?;
+            let o = s.output.as_mut().expect("engine exists");
+            let audio_params = Some(o.audio_enc.parameters());
+            let st = StreamTarget::Rtmp(full_url.clone());
+            let transport = RealTransport::new(st.clone(), o.video_enc.parameters(), audio_params);
+            let streamer = Streamer::new(st, transport, policy);
+            let send =
+                crate::send_worker::SendWorker::spawn(full_url.clone(), key.clone(), streamer);
+            o.stream = Some(StreamSink {
                 send,
-                video_enc,
-                audio_enc,
-                video_pts_us: 0,
-                audio_pts_us: 0,
+                rebase: Rebase::default(),
                 pending: VecDeque::new(),
+                newest_dts_us: 0,
                 bytes_sent: 0,
                 worker_status: crate::send_worker::WorkerStatus::Connecting,
-            })
+            });
+            Ok(())
         };
-        match build() {
-            Ok(active) => {
+        match build(self) {
+            Ok(()) => {
                 self.stream_lifecycle = StreamLifecycle::Connecting;
-                self.active_stream = Some(active);
+                self.stream_started_at = Some(Instant::now());
                 self.emit_stream_state();
                 Ok(())
             }
             Err(m) => {
+                self.release_output_engine_if_idle();
                 let msg = sanitize_stream_error(&full_url, &key, "stream setup failed", &m);
                 self.stream_lifecycle = StreamLifecycle::Error {
                     message: msg.clone(),
@@ -1034,35 +1227,33 @@ impl Shell {
         }
     }
 
-    /// Stops streaming (any state → `Idle`), asking the send worker to shut
-    /// down and close the transport.
+    /// Stops streaming (any state → `Idle`). Never blocks the caller on
+    /// the network: the worker closes the connection on its own thread.
     pub fn stream_stop(&mut self) -> Result<(), ShellError> {
-        if let Some(active) = self.active_stream.take() {
-            // Bounded wait: the worker exits promptly on Shutdown.
-            let _bytes = active.send.shutdown();
+        if let Some(sink) = self.output.as_mut().and_then(|o| o.stream.take()) {
+            sink.send.shutdown_detached();
         }
+        self.release_output_engine_if_idle();
         self.stream_lifecycle = StreamLifecycle::Idle;
+        self.stream_started_at = None;
         self.emit_stream_state();
         Ok(())
     }
 
-    /// Drains the RTMP send worker's events without encoding a frame.
-    /// Keeps the stream lifecycle truthful even when the render stage has
-    /// nothing to send. Public so hosts can poll it from their own loop.
+    /// Drains the RTMP send worker's events. Keeps the stream lifecycle
+    /// truthful even when nothing is encoded. Public so hosts can poll it.
     pub fn stream_drain_worker(&mut self) {
-        if self.active_stream.is_none() {
-            return;
-        }
         let mut rekey = false;
         let mut lifecycle_changed = false;
         {
-            let a = self.active_stream.as_mut().expect("checked above");
+            let Some(a) = self.output.as_mut().and_then(|o| o.stream.as_mut()) else {
+                return;
+            };
             let lifecycle = &mut self.stream_lifecycle;
             for ev in a.send.drain_events() {
                 match ev {
                     crate::send_worker::SendEvent::Ack { dts_us, bytes_sent } => {
                         a.bytes_sent = bytes_sent;
-                        // FIFO: the worker acks in send order.
                         while let Some(&(d, _)) = a.pending.front() {
                             if d <= dts_us {
                                 a.pending.pop_front();
@@ -1072,8 +1263,6 @@ impl Shell {
                         }
                     }
                     crate::send_worker::SendEvent::Status(s) => {
-                        let became_live = s == crate::send_worker::WorkerStatus::Live
-                            && a.worker_status != crate::send_worker::WorkerStatus::Live;
                         a.worker_status = s.clone();
                         let next = match &s {
                             crate::send_worker::WorkerStatus::Connecting => {
@@ -1093,13 +1282,12 @@ impl Shell {
                             *lifecycle = next;
                             lifecycle_changed = true;
                         }
-                        if became_live {
-                            rekey = true;
-                        }
                     }
                     crate::send_worker::SendEvent::Resync => {
-                        // Worker dropped stale packets on (re)connect.
+                        // Fresh (re)connection: the worker dropped stale
+                        // packets. Restart this sink at 0 on a new IDR.
                         a.pending.clear();
+                        a.rebase.restart_at_zero();
                         rekey = true;
                     }
                     crate::send_worker::SendEvent::Stopped { bytes_sent } => {
@@ -1109,13 +1297,8 @@ impl Shell {
             }
         }
         if rekey {
-            // Fresh connection: restart the video encoder so the first
-            // packet is a keyframe and decoders resync immediately. PTS
-            // stays continuous via the running `video_pts_us` clock.
-            if let Ok(enc) = self.open_video_encoder(self.video_encoder_opts()) {
-                if let Some(a) = self.active_stream.as_mut() {
-                    a.video_enc = enc;
-                }
+            if let Some(o) = self.output.as_mut() {
+                o.video_enc.force_keyframe();
             }
         }
         if lifecycle_changed {
@@ -1123,11 +1306,10 @@ impl Shell {
         }
     }
 
-    /// Hands one encoded packet to the send worker, applying the OBS
-    /// time-based drop policy: when the worker's buffered video span exceeds
-    /// 900 ms, non-keyframe video is shed (counted as a network drop). Audio
-    /// and keyframes are never dropped.
-    fn stream_enqueue(a: &mut ActiveStream, packet: EncodedPacket, dropped: &mut u64) {
+    /// Hands one packet to the send worker, applying the OBS time-based
+    /// drop policy: past 900 ms of unsent video, non-keyframe video is
+    /// shed (counted as a network drop). Audio and keyframes never are.
+    fn stream_enqueue(a: &mut StreamSink, packet: EncodedPacket, dropped: &mut u64) {
         let kind = if packet.stream_index == 0 {
             if packet.is_keyframe {
                 PacketKind::VideoKey
@@ -1137,176 +1319,221 @@ impl Shell {
         } else {
             PacketKind::Audio
         };
-        if kind == PacketKind::VideoDelta
-            && drop_decision(kind, a.buffered_video_us(packet.dts_us))
-        {
+        if kind != PacketKind::Audio {
+            a.newest_dts_us = a.newest_dts_us.max(packet.dts_us);
+        }
+        if drop_decision(kind, buffered_video_us(&a.pending, packet.dts_us)) {
             *dropped += 1;
             return;
         }
         a.pending.push_back((packet.dts_us, kind));
-        if let Err(e) = a.send.try_send(packet) {
-            // Backstop: the worker is wedged (the drop policy above should
-            // have shed load long before the 256-packet queue fills).
+        if a.send.try_send(packet).is_err() {
             a.pending.pop_back();
             *dropped += 1;
-            let _ = e;
         }
     }
 
-    /// One streaming step, called from [`Shell::av_tick`]: drains worker
-    /// events, encodes the given program frame and mixed audio, and hands
-    /// the packets to the send thread with a non-blocking `try_send`.
-    /// The network can never stall this tick.
-    pub(crate) fn stream_tick(&mut self, frame: &Frame, audio: &[f32]) {
-        if self.active_stream.is_none() {
-            return;
-        }
+    /// Encodes the program frame and the tick's audio ONCE and fans the
+    /// packets out to the recording and the stream.
+    pub(crate) fn output_tick(&mut self, frame: &Frame, audio: &[f32], tick_us: i64) {
         self.stream_drain_worker();
-        // Only encode when the worker is actually live: packets handed over
-        // while connecting/reconnecting/failed would be dropped by the
-        // worker (and never acked, which would poison the pending-packet
-        // accounting). Skipping encode here also saves CPU during outages.
-        let live = self
-            .active_stream
+        let frame_us = self.frame_interval_us() as i64;
+        let record_active = self
+            .record_runtime
             .as_ref()
-            .map(|a| a.worker_status == crate::send_worker::WorkerStatus::Live)
+            .map(|r| !r.paused)
             .unwrap_or(false);
-        if !live {
+        let Some(o) = self.output.as_mut() else {
+            return;
+        };
+        let stream_live = o.stream.as_ref().is_some_and(|s| s.is_live());
+        // Recording resume: continue the file's timeline on a fresh IDR.
+        if let Some(rec) = o.record.as_mut() {
+            if !record_active {
+                rec.was_paused = true;
+            } else if rec.was_paused {
+                rec.was_paused = false;
+                rec.rebase.restart_continuous();
+                o.video_enc.force_keyframe();
+            }
+        }
+        let wants_output = (o.record.is_some() && record_active) || stream_live;
+        if !wants_output {
+            // Nobody consumes packets this tick (stream still connecting,
+            // recording paused): skip the encoder entirely.
             return;
         }
-        let frame_us = self.frame_interval_us();
-        // Encode video (stays on the tick, like OBS's video-io thread —
-        // only the network send moved off-thread).
-        let vpackets: Vec<EncodedPacket>;
-        {
-            let a = self.active_stream.as_mut().expect("checked above");
-            let vpts = a.video_pts_us;
-            a.video_pts_us += frame_us as i64;
-            match a.video_enc.encode_rgba(&frame.pixels, vpts) {
-                Ok(pkts) => vpackets = pkts,
-                Err(e) => {
-                    self.perf_skipped_render += 1;
-                    let _ = e;
-                    vpackets = Vec::new();
-                }
-            }
-        }
-        for p in vpackets {
-            let a = self.active_stream.as_mut().expect("checked above");
-            Self::stream_enqueue(a, p, &mut self.perf_dropped_network);
-        }
-        // Encode audio.
-        if !audio.is_empty() {
-            let apackets: Vec<EncodedPacket>;
-            {
-                let a = self.active_stream.as_mut().expect("checked above");
-                if let Some(aenc) = a.audio_enc.as_mut() {
-                    let apts = a.audio_pts_us;
-                    a.audio_pts_us += audio.len() as i64 / 2 * 1_000_000 / 48_000;
-                    match aenc.encode_pcm(&audio, apts) {
-                        Ok(pkts) => apackets = pkts,
-                        Err(e) => {
-                            self.perf_skipped_render += 1;
-                            let _ = e;
-                            apackets = Vec::new();
-                        }
-                    }
+        let mut packets: Vec<EncodedPacket> = Vec::new();
+        let mut errors: Vec<String> = Vec::new();
+        match o.video_enc.encode_rgba(&frame.pixels, tick_us) {
+            Ok(p) => {
+                if p.is_empty() {
+                    o.skipped_slots += 1;
                 } else {
-                    apackets = Vec::new();
+                    o.encoded_times.push_back(tick_us);
+                }
+                packets.extend(p);
+            }
+            Err(e) => errors.push(format!("encode video: {e}")),
+        }
+        while o
+            .encoded_times
+            .front()
+            .is_some_and(|&t| tick_us - t > 1_000_000)
+        {
+            o.encoded_times.pop_front();
+        }
+        if !audio.is_empty() {
+            let t = Instant::now();
+            // The block covers the wall time just before this tick.
+            let start = tick_us - (audio.len() / 2) as i64 * 1_000_000 / 48_000;
+            match o.audio_enc.encode_pcm(audio, start) {
+                Ok(p) => packets.extend(p),
+                Err(e) => errors.push(format!("encode audio: {e}")),
+            }
+            o.last_audio_encode_us = t.elapsed().as_micros() as u64;
+        }
+
+        let mut record_failed: Option<String> = errors.first().cloned();
+        if let Some(rec) = o.record.as_mut() {
+            if record_active && record_failed.is_none() {
+                for p in &packets {
+                    let Some(p) = rec.rebase.map(p, frame_us) else {
+                        continue;
+                    };
+                    let r = if p.stream_index == 0 {
+                        rec.recorder.write_video(&p)
+                    } else {
+                        rec.recorder.write_audio(&p)
+                    };
+                    if let Err(e) = r {
+                        record_failed = Some(format!("write: {e}"));
+                        break;
+                    }
                 }
             }
-            for p in apackets {
-                let a = self.active_stream.as_mut().expect("checked above");
-                Self::stream_enqueue(a, p, &mut self.perf_dropped_network);
+        }
+        if let Some(s) = o.stream.as_mut() {
+            if stream_live {
+                for p in &packets {
+                    if let Some(p) = s.rebase.map(p, frame_us) {
+                        Self::stream_enqueue(s, p, &mut self.perf_dropped_network);
+                    }
+                }
             }
+        }
+        if !errors.is_empty() {
+            self.perf_skipped_render += 1;
+        }
+        if let Some(m) = record_failed.filter(|_| self.output.as_ref().is_some_and(|o| o.record.is_some()) && record_active) {
+            // Fail the recording loudly; the stream (if any) keeps going.
+            if let Some(o) = self.output.as_mut() {
+                o.record = None;
+            }
+            self.release_output_engine_if_idle();
+            self.record_runtime = None;
+            self.record_error = Some(m);
+            self.emit_record_state();
         }
     }
 
     // ------------------------------------------------------------------
-    // Poll entry
+    // Tick entry
     // ------------------------------------------------------------------
 
-    /// Called by the adapter's fixed 33.3 ms media tick (after `transition_tick` runs
-    /// on the separate 66 ms UI poll loop):
-    /// renders one program frame, pumps audio (meters + record/stream
-    /// feed), and advances recording and streaming. Never panics;
-    /// backend failures degrade to lifecycle `Error` states.
+    /// One media tick at the current time. Hosts with a deadline clock
+    /// should call [`Self::av_tick_at`] with the scheduled tick time.
     pub fn av_tick(&mut self) {
-        let tick_start = std::time::Instant::now();
-        let recording = self.active_recording.is_some();
-        let streaming = self.active_stream.is_some();
-        if !recording && !streaming {
-            // Audio metering runs even when idle so the UI meters stay live.
-            let t = std::time::Instant::now();
-            self.pump_audio();
-            // The program monitor must stay live even when idle: render the
-            // program scene small directly on this tick. (When recording or
-            // streaming the full-res frame below is downscaled instead, so
-            // the camera is only ever pulled once per tick.)
-            if let Ok(f) = self.program_frame_raw(
-                crate::MONITOR_W,
-                crate::MONITOR_H,
-            ) {
-                self.set_monitor_frame(f);
-            }
-            // Keep the preview-scene monitor as fresh as the program one.
-            self.refresh_preview_monitor();
-            self.perf_stages_us = [0, t.elapsed().as_micros() as u64, 0, 0];
-            // Track perf even when idle so the panel shows live values.
-            let tick_us = tick_start.elapsed().as_micros() as u64;
-            self.perf_mark_tick(tick_us);
-            self.perf_mark_frame();
-            return;
-        }
-        let t0 = std::time::Instant::now();
-        let (ow, oh) = (
-            self.video_settings.output_width,
-            self.video_settings.output_height,
-        );
-        let frame = match self.program_frame_raw(ow, oh) {
-            Ok(f) => f,
-            Err(_) => {
-                // Render stage couldn't produce a frame this tick: count it
-                // as skipped (render-side, not network).
-                self.perf_skipped_render += 1;
-                return;
-            }
+        self.av_tick_at(sf_capture::clock::now_us());
+    }
+
+    /// One media tick scheduled at `tick_us` (pipeline clock, see
+    /// [`crate::media_clock_us`]): capture → render → audio → encode →
+    /// send, plus the monitors. Never panics; backend failures degrade to
+    /// lifecycle `Error` states.
+    pub fn av_tick_at(&mut self, tick_us: i64) {
+        let tick_start = Instant::now();
+        let frame_us = self.frame_interval_us() as i64;
+        // [1] capture
+        let t = Instant::now();
+        self.refresh_source_frames(tick_us);
+        let capture_us = t.elapsed().as_micros() as u64;
+        self.retire_stale_caches();
+
+        // [2] render — full output size only when something encodes it.
+        let encoding = self.output.is_some();
+        let (w, h) = if encoding {
+            (
+                self.video_settings.output_width,
+                self.video_settings.output_height,
+            )
+        } else {
+            (crate::MONITOR_W, crate::MONITOR_H)
         };
-        let render_us = t0.elapsed().as_micros() as u64;
-        // Audio metering runs on every tick; the same mixed block feeds
-        // the record/stream encoders below.
-        let t1 = std::time::Instant::now();
-        let audio = self.pump_audio();
-        let audio_us = t1.elapsed().as_micros() as u64;
-        // Local speaker monitoring (when enabled): the same mixed block.
+        let t = Instant::now();
+        self.perf_gpu_us_accum = 0;
+        let frame = self.program_frame_raw(w, h);
+        let render_us = t.elapsed().as_micros() as u64;
+
+        // [3] audio — exactly the wall time since the previous tick.
+        let t = Instant::now();
+        let first_block = (48_000 * frame_us / 1_000_000) as usize;
+        let frames = self.audio_timeline.frames_until(tick_us, first_block);
+        let audio = self.pump_audio(frames, tick_us);
         if let Some(monitor) = &self.audio_monitor {
-            monitor.push(&audio);
+            // After a long stall play only the newest 100 ms locally.
+            let keep = audio.len().min(4_800 * 2);
+            monitor.push(&audio[audio.len() - keep..]);
         }
-        let t2 = std::time::Instant::now();
-        if recording {
-            self.record_tick(&frame, &audio);
+        let audio_us = t.elapsed().as_micros() as u64;
+
+        // [4] encode + send
+        let t = Instant::now();
+        match frame {
+            Ok(frame) => {
+                if encoding {
+                    self.output_tick(&frame, &audio, tick_us);
+                }
+                let encode_us = t.elapsed().as_micros() as u64;
+                self.set_monitor_frame(frame);
+                // The UI shows one output (program). A separate preview
+                // scene is only rendered when a host asks for it
+                // (`monitor_snapshot`) — never every tick.
+                self.perf_stages_us = [capture_us, render_us, audio_us, encode_us];
+            }
+            Err(_) => {
+                self.perf_skipped_render += 1;
+                self.perf_stages_us = [capture_us, render_us, audio_us, 0];
+            }
         }
-        let record_us = t2.elapsed().as_micros() as u64;
-        let t3 = std::time::Instant::now();
-        if streaming {
-            self.stream_tick(&frame, &audio);
-        }
-        let stream_us = t3.elapsed().as_micros() as u64;
-        self.perf_stages_us = [render_us, audio_us, record_us, stream_us];
-        // Refresh the live program monitor from the frame this tick already
-        // rendered (downscaled) — the UI serves this instead of re-rendering.
-        self.set_monitor_frame(frame);
-        // Same for the preview-scene monitor.
-        self.refresh_preview_monitor();
-        let tick_us = tick_start.elapsed().as_micros() as u64;
-        self.perf_mark_tick(tick_us);
+        self.last_program_video_age_us = self.program_video_age_us();
+        let tick_us_spent = tick_start.elapsed().as_micros() as u64;
+        self.perf_mark_tick(tick_us_spent);
         self.perf_mark_frame();
+    }
+
+    /// Drop cached frames of sources that no longer exist.
+    fn retire_stale_caches(&mut self) {
+        if self.source_frames.len() > self.media_producers.len() {
+            let live: std::collections::HashSet<&String> = self
+                .scenes
+                .iter()
+                .flat_map(|s| s.sources.iter().map(|x| &x.id))
+                .collect();
+            self.source_frames.retain(|k, _| live.contains(k));
+        }
+        if !self.resized_frames.is_empty() {
+            let frames = &self.source_frames;
+            self.resized_frames
+                .retain(|(id, _, _), (seq, _)| frames.get(id).is_some_and(|f| f.seq == *seq));
+        }
     }
 }
 
 #[cfg(test)]
 mod drop_policy_tests {
-    use super::{buffered_video_us, drop_decision, PacketKind};
+    use super::{buffered_video_us, drop_decision, PacketKind, Rebase};
+    use sf_encode::EncodedPacket;
     use std::collections::VecDeque;
 
     #[test]
@@ -1319,7 +1546,6 @@ mod drop_policy_tests {
         ]
         .into_iter()
         .collect();
-        // Newest video dts 1_100_000, oldest unacked video 1_010_000.
         assert_eq!(buffered_video_us(&pending, 1_100_000), 90_000);
     }
 
@@ -1334,12 +1560,43 @@ mod drop_policy_tests {
 
     #[test]
     fn only_delta_video_is_shed() {
-        // Under the 900ms threshold: nothing drops.
         assert!(!drop_decision(PacketKind::VideoDelta, 899_999));
-        // Past it: delta video sheds...
         assert!(drop_decision(PacketKind::VideoDelta, 900_001));
-        // ...but keyframes and audio never do.
         assert!(!drop_decision(PacketKind::VideoKey, 5_000_000));
         assert!(!drop_decision(PacketKind::Audio, 5_000_000));
+    }
+
+    fn pkt(stream: u8, pts: i64, key: bool) -> EncodedPacket {
+        EncodedPacket {
+            data: vec![1],
+            pts_us: pts,
+            dts_us: pts,
+            is_keyframe: key,
+            stream_index: stream,
+        }
+    }
+
+    #[test]
+    fn late_sink_starts_at_zero_on_keyframe_and_resumes_continuously() {
+        let mut r = Rebase::default();
+        // Joins mid-session: delta + audio before the IDR are skipped.
+        assert!(r.map(&pkt(0, 10_000_000, false), 33_333).is_none());
+        assert!(r.map(&pkt(1, 10_010_000, false), 33_333).is_none());
+        let k = r.map(&pkt(0, 10_033_333, true), 33_333).unwrap();
+        assert_eq!(k.pts_us, 0);
+        let a = r.map(&pkt(1, 10_040_000, false), 33_333).unwrap();
+        assert_eq!(a.pts_us, 6_667);
+        // Audio from before the sink's first frame is dropped.
+        assert!(r.map(&pkt(1, 10_000_000, false), 33_333).is_none());
+        let d = r.map(&pkt(0, 10_066_666, false), 33_333).unwrap();
+        assert_eq!(d.pts_us, 33_333);
+        // Paused for 20 s, resumed on an IDR: file time continues.
+        r.restart_continuous();
+        let k2 = r.map(&pkt(0, 30_000_000, true), 33_333).unwrap();
+        assert_eq!(k2.pts_us, 66_666);
+        // New RTMP connection: starts over at 0.
+        r.restart_at_zero();
+        let k3 = r.map(&pkt(0, 40_000_000, true), 33_333).unwrap();
+        assert_eq!(k3.pts_us, 0);
     }
 }

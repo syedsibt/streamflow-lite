@@ -1,0 +1,43 @@
+{
+  "name": "Vintage",
+  "version": 1,
+  "category": "Creative",
+  "params": {
+    "saturation": 75,
+    "temperature": 7300,
+    "tint": 6,
+    "contrast": -8,
+    "faded_film": 35,
+    "lift": [
+      0.01,
+      0.005,
+      -0.005,
+      0
+    ],
+    "gain": [
+      1.04,
+      1.0,
+      0.9,
+      1.0
+    ],
+    "curves": {
+      "master": {
+        "points": [
+          [
+            0,
+            0.04
+          ],
+          [
+            0.5,
+            0.5
+          ],
+          [
+            1,
+            0.94
+          ]
+        ]
+      }
+    }
+  },
+  "skin_protect": true
+}

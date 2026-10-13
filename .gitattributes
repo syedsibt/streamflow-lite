@@ -1,0 +1,4 @@
+# Generated assets are compared byte-for-byte with generator output:
+# keep LF on every platform (Windows checkouts would otherwise get CRLF).
+*.cube text eol=lf
+*.sflook text eol=lf

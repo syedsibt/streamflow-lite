@@ -272,6 +272,10 @@ pub struct Engine {
     look_registry: LookRegistry,
     state: State,
     lut_cache: HashMap<String, CubeFile>,
+    /// LUT files that failed to load/parse, with the error. A bad LUT is
+    /// skipped (the rest of the grade still applies) instead of failing the
+    /// frame — a broken `.cube` must never stop the live program.
+    lut_errors: HashMap<String, String>,
     scopes: ScopeHub,
     /// Previous linear frame per input, feeding temporal noise reduction.
     /// Recreated when the frame size changes.
@@ -340,6 +344,7 @@ impl Engine {
             look_registry: LookRegistry::default(),
             state: State::new(),
             lut_cache: HashMap::new(),
+            lut_errors: HashMap::new(),
             scopes: ScopeHub::new(),
             nr_prev: HashMap::new(),
             frame_seq: HashMap::new(),
@@ -708,6 +713,18 @@ impl Engine {
     ///
     /// Returns [`EngineError`] on unknown inputs, bad pixel lengths, LUT
     /// load failures, or any render-layer error.
+    /// Forget a cached/failed LUT so the next frame re-reads the file
+    /// (call after a LUT file is (re)imported or replaced on disk).
+    pub fn invalidate_lut(&mut self, path: &str) {
+        self.lut_cache.remove(path);
+        self.lut_errors.remove(path);
+    }
+
+    /// Error recorded for a LUT path that could not be loaded, if any.
+    pub fn lut_error(&self, path: &str) -> Option<&str> {
+        self.lut_errors.get(path).map(String::as_str)
+    }
+
     pub fn grade_input_frame(
         &mut self,
         input_id: &str,
@@ -725,7 +742,28 @@ impl Engine {
         let stack = input.filters.clone();
 
         // 1. Effective grade: base + look filters folded in, in stack order.
-        let effective = resolve_grade(&base, &stack, &self.look_registry);
+        let mut effective = resolve_grade(&base, &stack, &self.look_registry);
+        // Resolve the LUT up front; on failure drop it from this frame's
+        // grade (remembered in `lut_errors`, never retried per frame).
+        if let Some(path) = effective.lut.as_ref().map(|l| l.file.clone()) {
+            if !self.lut_cache.contains_key(&path) && !self.lut_errors.contains_key(&path) {
+                match std::fs::read_to_string(&path)
+                    .map_err(|e| e.to_string())
+                    .and_then(|t| sf_render::lut::parse_cube(&t).map_err(|e| e.to_string()))
+                {
+                    Ok(cube) => {
+                        self.lut_cache.insert(path.clone(), cube);
+                    }
+                    Err(e) => {
+                        eprintln!("LUT '{path}' skipped: {e}");
+                        self.lut_errors.insert(path.clone(), e);
+                    }
+                }
+            }
+            if !self.lut_cache.contains_key(&path) {
+                effective.lut = None;
+            }
+        }
 
         // 2. Active effect slots, in stack order. AI kinds route to the C7
         //    AI paths below (BackgroundReplace only with a model, otherwise
@@ -753,16 +791,8 @@ impl Engine {
         if effective.is_identity() && active.is_empty() {
             out_tex = Arc::new(src);
         } else {
-            // Resolve + cache the LUT (if any) before touching the GPU.
+            // The LUT (if any) was resolved and cached above.
             let lut_path: Option<String> = effective.lut.as_ref().map(|l| l.file.clone());
-            if let Some(path) = &lut_path {
-                if !self.lut_cache.contains_key(path) {
-                    let text = std::fs::read_to_string(path)?;
-                    let cube = sf_render::lut::parse_cube(&text)
-                        .map_err(|e| EngineError::LutLoad(format!("{path}: {e}")))?;
-                    self.lut_cache.insert(path.clone(), cube);
-                }
-            }
             // Working targets are acquired before `lut` borrows
             // `self.lut_cache`: `work_targets` needs `&mut self`.
             let (linear_a, linear_b, out) = self.work_targets(width, height);

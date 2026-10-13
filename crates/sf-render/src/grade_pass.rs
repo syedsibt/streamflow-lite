@@ -346,7 +346,7 @@ impl GradePass {
     /// [`ColorGrade::is_identity`] is true — the caller keeps using the
     /// source in that case.
     ///
-    /// Per-grade resources are dirty-flag cached: the 160-byte uniform
+    /// Per-grade resources are dirty-flag cached: the 176-byte uniform
     /// buffer (from [`ColorGrade::to_uniform`](sf_color::grade::ColorGrade::to_uniform)),
     /// the 1024x2 `rgba32float` curves texture (from `baked.data`,
     /// interleaved to texels on upload), and the 33^3 `rgba16float` 3D LUT

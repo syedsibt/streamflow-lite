@@ -7,12 +7,16 @@
 //! the default output device via `cpal` (WASAPI on Windows, ALSA on Linux).
 //!
 //! # Realtime rules
-//! * The tick pushes 48 kHz stereo f32 chunks into a bounded ring buffer
-//!   (2 s cap, oldest dropped). The cpal callback drains it; underrun →
+//! * The tick pushes 48 kHz stereo f32 chunks into a ring buffer bounded by
+//!   *latency*, not memory: past [`MAX_LATENCY_FRAMES`] (120 ms) the oldest
+//!   audio is dropped back to [`TRIM_TO_FRAMES`] (50 ms). The old 2 s cap
+//!   let device/tick clock drift grow monitoring delay to two seconds.
+//! * The cpal callback drains it; underrun → plays what's there, pads
 //!   silence, never a stall.
-//! * When the device runs at a rate other than 48 kHz, the callback
-//!   linear-resamples on the fly (most Windows devices are 48 kHz, so
-//!   this is usually a straight copy).
+//! * When the device runs at a rate other than 48 kHz (e.g. 44.1 kHz), the
+//!   callback linear-resamples with a fractional read position carried
+//!   across callbacks. (The previous version cleared the whole ring after
+//!   every callback, throwing away most of the audio on such devices.)
 
 use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
@@ -21,13 +25,17 @@ use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 
 /// Tick rate we produce (matches `sf-capture`'s normalized audio).
 const TICK_RATE: u32 = 48_000;
-/// Ring capacity in stereo frames (2 s at 48 kHz).
-const RING_FRAMES: usize = 96_000;
+/// Queue depth (stereo frames) beyond which monitoring is trimmed (120 ms).
+const MAX_LATENCY_FRAMES: usize = TICK_RATE as usize * 120 / 1000;
+/// Depth a trim cuts back to (50 ms).
+const TRIM_TO_FRAMES: usize = TICK_RATE as usize * 50 / 1000;
 
 struct Shared {
     /// Interleaved stereo f32 at [`TICK_RATE`].
     buf: VecDeque<f32>,
     device_rate: u32,
+    /// Fractional read position (in source frames) for resampling.
+    phase: f64,
 }
 
 /// Local monitor: master mix → default output device.
@@ -69,31 +77,32 @@ impl AudioMonitor {
                 }
             }
         }
-        let (stream_config, sample_format): (cpal::StreamConfig, cpal::SampleFormat) =
-            match chosen {
+        let (stream_config, sample_format): (cpal::StreamConfig, cpal::SampleFormat) = match chosen
+        {
+            Some(c) => {
+                let sf = c.sample_format();
+                (c.into(), sf)
+            }
+            None => match fallback {
                 Some(c) => {
+                    let rate = c.max_sample_rate();
                     let sf = c.sample_format();
-                    (c.into(), sf)
+                    (c.with_sample_rate(rate).into(), sf)
                 }
-                None => match fallback {
-                    Some(c) => {
-                        let rate = c.max_sample_rate();
-                        let sf = c.sample_format();
-                        (c.with_sample_rate(rate).into(), sf)
-                    }
-                    None => {
-                        let dc = device
-                            .default_output_config()
-                            .map_err(|e| format!("default output config: {e}"))?;
-                        let sf = dc.sample_format();
-                        (dc.into(), sf)
-                    }
-                },
-            };
+                None => {
+                    let dc = device
+                        .default_output_config()
+                        .map_err(|e| format!("default output config: {e}"))?;
+                    let sf = dc.sample_format();
+                    (dc.into(), sf)
+                }
+            },
+        };
         let device_rate = stream_config.sample_rate.0;
         let shared = Arc::new(Mutex::new(Shared {
-            buf: VecDeque::with_capacity(RING_FRAMES * 2),
+            buf: VecDeque::with_capacity(MAX_LATENCY_FRAMES * 2 + 8192),
             device_rate,
+            phase: 0.0,
         }));
         let shared_cb = Arc::clone(&shared);
         let err_fn = |err| eprintln!("audio monitor stream error: {err}");
@@ -149,59 +158,66 @@ impl AudioMonitor {
         let Ok(mut s) = self.shared.lock() else {
             return;
         };
-        for &v in samples {
-            if s.buf.len() >= RING_FRAMES * 2 {
-                s.buf.pop_front();
-            }
-            s.buf.push_back(v);
-        }
+        s.buf.extend(samples.iter().copied());
+        trim_to_live(&mut s);
+    }
+}
+
+/// Drop the oldest audio when the queue exceeds the latency budget.
+fn trim_to_live(s: &mut Shared) {
+    let frames = s.buf.len() / 2;
+    if frames > MAX_LATENCY_FRAMES {
+        let drop = frames - TRIM_TO_FRAMES;
+        s.buf.drain(..drop * 2);
+        s.phase = 0.0;
     }
 }
 
 /// Fill `out` (interleaved stereo f32) from the ring, resampling
-/// 48 kHz → device rate with linear interpolation. Underrun → silence.
+/// 48 kHz → device rate with linear interpolation. Underrun → whatever is
+/// queued, then silence.
 fn write_output(out: &mut [f32], shared: &Arc<Mutex<Shared>>) {
     let Ok(mut s) = shared.lock() else {
         out.fill(0.0);
         return;
     };
     let frames_needed = out.len() / 2;
-    if s.buf.len() < frames_needed * 2 {
-        // Underrun: play what we have, pad silence. (Don't drain
-        // partially — keep it simple and predictable.)
-        out.fill(0.0);
-        return;
-    }
     if s.device_rate == TICK_RATE {
-        for (d, v) in out.iter_mut().zip(s.buf.drain(..frames_needed * 2)) {
+        let have = (s.buf.len() / 2).min(frames_needed);
+        for (d, v) in out.iter_mut().zip(s.buf.drain(..have * 2)) {
             *d = v;
         }
+        for v in out.iter_mut().skip(have * 2) {
+            *v = 0.0;
+        }
         return;
     }
-    // Linear resample 48 kHz → device_rate.
-    let ratio = TICK_RATE as f64 / s.device_rate as f64;
-    let have_frames = s.buf.len() / 2;
-    let frames_out = ((have_frames as f64 / ratio) as usize).min(frames_needed);
-    // Drain everything we have (leftovers are cleared below anyway).
-    let src: Vec<f32> = s.buf.drain(..).collect();
-    let src_frames = src.len() / 2;
-    for i in 0..frames_out {
-        let pos = i as f64 * ratio;
-        let i0 = pos as usize;
-        let i1 = (i0 + 1).min(src_frames.saturating_sub(1));
-        let t = (pos - i0 as f64) as f32;
-        for ch in 0..2 {
-            let a = src.get(i0 * 2 + ch).copied().unwrap_or(0.0);
-            let b = src.get(i1 * 2 + ch).copied().unwrap_or(0.0);
-            out[i * 2 + ch] = a + (b - a) * t;
+    // Linear resample 48 kHz → device_rate, carrying the fractional read
+    // position across callbacks so no source audio is skipped.
+    let step = TICK_RATE as f64 / s.device_rate as f64;
+    let mut written = 0;
+    while written < frames_needed {
+        let i0 = s.phase as usize;
+        // Need frames i0 and i0+1 to interpolate.
+        if (i0 + 1) * 2 + 1 >= s.buf.len() {
+            break;
         }
+        let t = (s.phase - i0 as f64) as f32;
+        for ch in 0..2 {
+            let a = s.buf[i0 * 2 + ch];
+            let b = s.buf[(i0 + 1) * 2 + ch];
+            out[written * 2 + ch] = a + (b - a) * t;
+        }
+        written += 1;
+        s.phase += step;
     }
-    for v in out.iter_mut().skip(frames_out * 2) {
+    // Release fully consumed source frames.
+    let consumed = (s.phase as usize).min(s.buf.len() / 2);
+    s.buf.drain(..consumed * 2);
+    s.phase -= consumed as f64;
+    for v in out.iter_mut().skip(written * 2) {
         *v = 0.0;
     }
-    // Drop any leftover source frames we didn't consume (newest-wins:
-    // the monitor must never fall behind realtime).
-    s.buf.clear();
 }
 
 #[cfg(test)]
@@ -213,6 +229,7 @@ mod tests {
         let shared = Arc::new(Mutex::new(Shared {
             buf: VecDeque::new(),
             device_rate: 48_000,
+            phase: 0.0,
         }));
         let mut out = vec![9.9f32; 8];
         write_output(&mut out, &shared);
@@ -224,9 +241,51 @@ mod tests {
         let shared = Arc::new(Mutex::new(Shared {
             buf: VecDeque::from(vec![0.5f32, -0.5, 0.25, -0.25]),
             device_rate: 48_000,
+            phase: 0.0,
         }));
         let mut out = vec![0.0f32; 4];
         write_output(&mut out, &shared);
         assert_eq!(out, vec![0.5, -0.5, 0.25, -0.25]);
+    }
+
+    #[test]
+    fn resampling_consumes_source_continuously() {
+        // 44.1 kHz device: over many callbacks, consumed source frames must
+        // track 48000/44100 × played frames (nothing thrown away).
+        let shared = Arc::new(Mutex::new(Shared {
+            buf: VecDeque::new(),
+            device_rate: 44_100,
+            phase: 0.0,
+        }));
+        let mut played = 0usize;
+        let mut pushed = 0usize;
+        for _ in 0..50 {
+            {
+                let mut s = shared.lock().unwrap();
+                s.buf.extend(std::iter::repeat(0.3f32).take(960 * 2));
+                pushed += 960;
+            }
+            let mut out = vec![0.0f32; 441 * 2];
+            write_output(&mut out, &shared);
+            played += out.iter().filter(|&&v| v != 0.0).count() / 2;
+        }
+        let left = shared.lock().unwrap().buf.len() / 2;
+        let consumed = pushed - left;
+        let expected = (played as f64 * 48_000.0 / 44_100.0) as usize;
+        assert!(
+            (consumed as i64 - expected as i64).abs() <= 2,
+            "{consumed} vs {expected}"
+        );
+    }
+
+    #[test]
+    fn latency_is_bounded() {
+        let mut s = Shared {
+            buf: VecDeque::from(vec![0.0f32; 48_000 * 2]),
+            device_rate: 48_000,
+            phase: 0.0,
+        };
+        trim_to_live(&mut s);
+        assert_eq!(s.buf.len() / 2, TRIM_TO_FRAMES);
     }
 }
