@@ -9,6 +9,8 @@ name: Linux QA
 
 on:
   workflow_dispatch:
+  push:
+    branches: ["feat/**"]
 
 jobs:
   ui:
