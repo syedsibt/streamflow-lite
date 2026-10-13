@@ -25,6 +25,7 @@ const report = { checks: [], errors: [] };
 const check = (name, ok, detail = "") => {
   report.checks.push({ name, ok: !!ok, detail });
   console.log(`${ok ? "PASS" : "FAIL"}  ${name}${detail ? " — " + detail : ""}`);
+  if (!ok && process.env.GITHUB_ACTIONS) console.log(`::error title=UI check::${name}${detail ? " — " + detail.slice(0, 300) : ""}`);
 };
 
 const browser = await chromium.launch();
@@ -32,6 +33,7 @@ const page = await browser.newPage({ viewport: { width: 1600, height: 900 }, dev
 page.on("pageerror", (e) => report.errors.push(String(e)));
 page.on("console", (m) => m.type() === "error" && report.errors.push("console: " + m.text()));
 await page.addInitScript({ path: path.join(here, "mock-tauri.js") });
+try {
 await page.goto("http://localhost:4173/");
 await page.waitForSelector(".source-strip .src-tile", { timeout: 15000 });
 await page.waitForTimeout(800);
@@ -139,6 +141,10 @@ await page.waitForTimeout(600);
 await shot("12-video-input-capture-card");
 await page.getByRole("button", { name: "Done" }).click();
 
+} catch (e) {
+  report.errors.push("script: " + String(e && e.stack ? e.stack : e).slice(0, 800));
+  await page.screenshot({ path: path.join(out, "zz-crash.png") }).catch(() => {});
+}
 check("No page errors", report.errors.length === 0, report.errors.slice(0, 5).join(" || "));
 fs.writeFileSync(path.join(out, "report.json"), JSON.stringify(report, null, 2));
 await browser.close();

@@ -12,6 +12,11 @@ on:
   push:
     branches: ["feat/**"]
 
+# Results are also pushed to `qa-results-*` branches (screenshots, logs,
+# CSVs) so they can be read with plain git.
+permissions:
+  contents: write
+
 jobs:
   ui:
     runs-on: ubuntu-24.04
@@ -36,6 +41,14 @@ jobs:
       - name: UI checks + screenshots
         working-directory: apps/desktop
         run: node qa/shots.mjs
+      - name: Publish results (qa-results-ui)
+        if: always()
+        run: |
+          mkdir -p /tmp/pub && cp -r $GITHUB_WORKSPACE/apps/desktop/qa-out/* /tmp/pub/ 2>/dev/null || true
+          cd /tmp/pub && git init -q && git checkout -q -b qa-results-ui
+          echo "$GITHUB_SHA" > SHA && git add -A
+          git -c user.name=ci -c user.email=ci@localhost commit -qm "QA $GITHUB_SHA"
+          git push -qf "https://x-access-token:${{ github.token }}@github.com/${{ github.repository }}" qa-results-ui
       - name: Upload screenshots
         if: always()
         uses: actions/upload-artifact@v4
@@ -72,8 +85,17 @@ jobs:
           cargo test -p sf-ui-backend --no-fail-fast > backend-test.log 2>&1
           code=$?
           grep -E "^test .* FAILED$|^test result|panicked at|^error" backend-test.log | head -150 || true
+          grep -E "^test .* FAILED$" backend-test.log | head -20 | sed 's/^/::error title=backend test::/' || true
           tail -30 backend-test.log
           exit $code
+      - name: Publish results (qa-results-rust)
+        if: always()
+        run: |
+          mkdir -p /tmp/pub && cp -r $GITHUB_WORKSPACE/backend-test.log /tmp/pub/ 2>/dev/null || true
+          cd /tmp/pub && git init -q && git checkout -q -b qa-results-rust
+          echo "$GITHUB_SHA" > SHA && git add -A
+          git -c user.name=ci -c user.email=ci@localhost commit -qm "QA $GITHUB_SHA"
+          git push -qf "https://x-access-token:${{ github.token }}@github.com/${{ github.repository }}" qa-results-rust
       - name: Upload test log
         if: always()
         uses: actions/upload-artifact@v4
@@ -121,6 +143,14 @@ jobs:
             echo "== $f"; cat $f.csv
             awk -F, 'NR>2 {c+=$2; t+=$6; n++} END {printf "AVG cpu=%.1f%% tick_ms=%.2f (n=%d)\n", c/n, t/n, n}' $f.csv
           done
+      - name: Publish results (qa-results-bench)
+        if: always()
+        run: |
+          mkdir -p /tmp/pub && cp -r $GITHUB_WORKSPACE/*.csv /tmp/pub/ 2>/dev/null || true
+          cd /tmp/pub && git init -q && git checkout -q -b qa-results-bench
+          echo "$GITHUB_SHA" > SHA && git add -A
+          git -c user.name=ci -c user.email=ci@localhost commit -qm "QA $GITHUB_SHA"
+          git push -qf "https://x-access-token:${{ github.token }}@github.com/${{ github.repository }}" qa-results-bench
       - uses: actions/upload-artifact@v4
         if: always()
         with:
