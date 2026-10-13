@@ -60,7 +60,6 @@ jobs:
     runs-on: ubuntu-24.04
     env:
       CARGO_TERM_COLOR: never
-      VK_ICD_FILENAMES: /usr/share/vulkan/icd.d/lvp_icd.x86_64.json
     steps:
       - uses: actions/checkout@v4
       - name: System libraries (FFmpeg 6.1, lavapipe, ALSA)
@@ -68,8 +67,10 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends pkg-config clang libclang-dev \
             libavcodec-dev libavformat-dev libavutil-dev libswscale-dev libswresample-dev \
-            libavdevice-dev libavfilter-dev mesa-vulkan-drivers libvulkan1 libasound2-dev ffmpeg
-          ls /usr/share/vulkan/icd.d/
+            libavdevice-dev libavfilter-dev mesa-vulkan-drivers libvulkan1 vulkan-tools libasound2-dev ffmpeg
+          echo "::notice title=vulkan icd::$(ls /usr/share/vulkan/icd.d/ | tr '\n' ' ')"
+          vulkaninfo --summary > vulkan.txt 2>&1 || true
+          echo "::notice title=vulkaninfo::$(grep -E 'deviceName|deviceType|apiVersion|ERROR' vulkan.txt | tr '\n' ' ' | cut -c1-600)"
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - name: sf-audio tests
@@ -110,7 +111,6 @@ jobs:
     runs-on: ubuntu-24.04
     env:
       CARGO_TERM_COLOR: never
-      VK_ICD_FILENAMES: /usr/share/vulkan/icd.d/lvp_icd.x86_64.json
     steps:
       - uses: actions/checkout@v4
         with:

@@ -2260,3 +2260,6 @@ input[type="color"] { width: 64px; height: 30px; padding: 0; border: 1px solid v
 .bitrate-picks { display: flex; gap: 4px; flex-wrap: wrap; }
 .bitrate-picks .tool small { color: var(--label-3); margin-left: 3px; }
 .bitrate-note { color: #f3c47a; font-size: 11px; }
+.field.stack { grid-template-columns: minmax(0, 1fr); }
+.field.stack .field-control { justify-content: flex-start; }
+.bitrate .inline-controls input { max-width: 140px; flex: 0 1 140px; }

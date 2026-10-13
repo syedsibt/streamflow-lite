@@ -44,9 +44,9 @@ function bitrateRange(h: number, fps: number): [number, number] {
 
 /** Like `Field`, but a <div>: a <label> around several buttons would
  * forward clicks on its empty space to the first button. */
-function FieldBox({ label, hint, children }: { label: string; hint?: string; children: ReactNode }) {
+function FieldBox({ label, hint, children, stack }: { label: string; hint?: string; children: ReactNode; stack?: boolean }) {
   return (
-    <div className="field" role="group" aria-label={label}>
+    <div className={"field" + (stack ? " stack" : "")} role="group" aria-label={label}>
       <span className="field-label">{label}</span>
       <span className="field-control">{children}</span>
       {hint && <span className="field-hint">{hint}</span>}
@@ -58,7 +58,7 @@ const BITRATE_MIN = 300;
 const BITRATE_MAX = 60000;
 
 /** Bitrate: quick picks from the recommended range, or any custom value. */
-function BitrateField({ vs, setVs, apply }: { vs: VideoSettings; setVs: (v: VideoSettings) => void; apply: (v: VideoSettings) => Promise<void> }) {
+function BitrateField({ vs, apply }: { vs: VideoSettings; apply: (v: VideoSettings) => Promise<void> }) {
   const [lo, hi] = bitrateRange(vs.output_height, vs.output_fps);
   const mid = Math.round((lo + hi) / 2 / 100) * 100;
   const picks = [
@@ -79,7 +79,7 @@ function BitrateField({ vs, setVs, apply }: { vs: VideoSettings; setVs: (v: Vide
   const b = vs.bitrate_kbps;
   const note = b > hi * 1.25 ? `More than ${vs.output_height}p needs (${lo}–${hi}) — uses upload and encoder time for nothing.` : b < lo * 0.8 ? `Below the usual ${lo}–${hi} for ${vs.output_height}p${vs.output_fps > 30 ? "60" : "30"} — the picture may look blocky.` : null;
   return (
-    <FieldBox label="Bitrate" hint={`Recommended for ${vs.output_height}p${vs.output_fps > 30 ? "60" : "30"}: ${lo}–${hi} kbps · any value ${BITRATE_MIN}–${BITRATE_MAX}`}>
+    <FieldBox stack label="Bitrate" hint={`Recommended for ${vs.output_height}p${vs.output_fps > 30 ? "60" : "30"}: ${lo}–${hi} kbps · any value ${BITRATE_MIN}–${BITRATE_MAX}`}>
       <div className="bitrate">
         <div className="bitrate-picks">
           {picks.map((p) => (
@@ -96,11 +96,7 @@ function BitrateField({ vs, setVs, apply }: { vs: VideoSettings; setVs: (v: Vide
             max={BITRATE_MAX}
             step={100}
             value={text}
-            onChange={(e) => {
-              setText(e.target.value);
-              const n = Number(e.target.value);
-              if (Number.isFinite(n)) setVs({ ...vs, bitrate_kbps: n });
-            }}
+            onChange={(e) => setText(e.target.value)}
             onBlur={commit}
             onKeyDown={(e) => e.key === "Enter" && commit()}
           />
@@ -313,7 +309,7 @@ export default function OutputPanel() {
                   ))}
                 </select>
               </Field>
-              <BitrateField vs={vs} setVs={setVs} apply={applyOutput} />
+              <BitrateField vs={vs} apply={applyOutput} />
               <Row title="Keyframe interval" subtitle="Fixed at 2 seconds — what YouTube, Facebook and TikTok require" trailing={<span className="mono">2 s</span>} />
               <Row title="Audio" subtitle="AAC, 48 kHz stereo" trailing={<span className="mono">128 kbps</span>} />
               {diag?.encoder && <Row title="Encoder in use" subtitle={diag.encoder.note ?? (diag.encoder.hardware ? "Hardware" : "Software (CPU)")} trailing={<span className="mono">{diag.encoder.name}</span>} />}
