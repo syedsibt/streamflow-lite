@@ -1,0 +1,281 @@
+   Compiling sf-color v0.1.0 (/home/runner/work/streamflow-lite/streamflow-lite/crates/sf-color)
+   Compiling sf-ai-runtime v0.1.0 (/home/runner/work/streamflow-lite/streamflow-lite/crates/sf-ai-runtime)
+   Compiling sf-encode v0.1.0 (/home/runner/work/streamflow-lite/streamflow-lite/crates/sf-encode)
+   Compiling sf-capture v0.1.0 (/home/runner/work/streamflow-lite/streamflow-lite/crates/sf-capture)
+   Compiling sf-graphics v0.1.0 (/home/runner/work/streamflow-lite/streamflow-lite/crates/sf-graphics)
+warning: variable does not need to be mutable
+   --> crates/sf-capture/src/audio_in.rs:108:13
+    |
+108 |         let mut decoder = ff::codec::context::Context::from_parameters(audio_stream.parameters())
+    |             ----^^^^^^^
+    |             |
+    |             help: remove this `mut`
+    |
+    = note: `#[warn(unused_mut)]` (part of `#[warn(unused)]`) on by default
+
+warning: variable does not need to be mutable
+   --> crates/sf-capture/src/demux.rs:183:21
+    |
+183 |                 let mut dec = ff::codec::context::Context::from_parameters(s.parameters())
+    |                     ----^^^
+    |                     |
+    |                     help: remove this `mut`
+
+warning: method `drain_live` is never used
+   --> crates/sf-capture/src/demux.rs:361:19
+    |
+130 | impl DemuxDecoder {
+    | ----------------- method in this implementation
+...
+361 |     pub(crate) fn drain_live(&mut self) -> Result<LiveDrain, CaptureError> {
+    |                   ^^^^^^^^^^
+    |
+    = note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
+
+   Compiling sf-filters v0.1.0 (/home/runner/work/streamflow-lite/streamflow-lite/crates/sf-filters)
+   Compiling sf-render v0.1.0 (/home/runner/work/streamflow-lite/streamflow-lite/crates/sf-render)
+   Compiling sf-scopes v0.1.0 (/home/runner/work/streamflow-lite/streamflow-lite/crates/sf-scopes)
+   Compiling sf-ai-color v0.1.0 (/home/runner/work/streamflow-lite/streamflow-lite/crates/sf-ai-color)
+   Compiling sf-filterfx v0.1.0 (/home/runner/work/streamflow-lite/streamflow-lite/crates/sf-filterfx)
+warning: `sf-capture` (lib) generated 3 warnings (run `cargo fix --lib -p sf-capture` to apply 2 suggestions)
+   Compiling sf-state v0.1.0 (/home/runner/work/streamflow-lite/streamflow-lite/crates/sf-state)
+   Compiling sf-ipc v0.1.0 (/home/runner/work/streamflow-lite/streamflow-lite/crates/sf-ipc)
+   Compiling sf-output v0.1.0 (/home/runner/work/streamflow-lite/streamflow-lite/crates/sf-output)
+   Compiling sf-engine v0.1.0 (/home/runner/work/streamflow-lite/streamflow-lite/crates/sf-engine)
+   Compiling sf-audio v0.1.0 (/home/runner/work/streamflow-lite/streamflow-lite/crates/sf-audio)
+   Compiling sf-ui-backend v0.1.0 (/home/runner/work/streamflow-lite/streamflow-lite/apps/desktop/backend)
+warning: field `device_rate` is never read
+  --> apps/desktop/backend/src/audio_monitor.rs:47:9
+   |
+42 | pub struct AudioMonitor {
+   |            ------------ field in this struct
+...
+47 |     pub device_rate: u32,
+   |         ^^^^^^^^^^^
+   |
+   = note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
+
+warning: function `camera_fps_or_default` is never used
+    --> apps/desktop/backend/src/production.rs:2604:15
+     |
+2604 | pub(crate) fn camera_fps_or_default(fps: u32) -> u32 {
+     |               ^^^^^^^^^^^^^^^^^^^^^
+
+warning: `sf-ui-backend` (lib test) generated 2 warnings (2 duplicates)
+warning: `sf-ui-backend` (lib) generated 2 warnings
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 4.54s
+     Running unittests src/lib.rs (target/debug/deps/sf_ui_backend-466d0445516a4b43)
+
+running 33 tests
+test audio_monitor::tests::passthrough_at_48k ... ok
+test audio_monitor::tests::latency_is_bounded ... ok
+test av_backends::drop_policy_tests::buffered_span_empty_is_zero ... ok
+test audio_monitor::tests::silence_on_empty_buffer ... ok
+test av_backends::drop_policy_tests::late_sink_starts_at_zero_on_keyframe_and_resumes_continuously ... ok
+test av_backends::drop_policy_tests::buffered_span_ignores_audio ... ok
+test av_backends::drop_policy_tests::only_delta_video_is_shed ... ok
+test color_library::tests::preview_mode_parses ... ok
+test color_library::tests::slug_is_filesystem_safe ... ok
+test color_library::tests::split_puts_before_on_the_left ... ok
+test deadline_tests::clamped_and_zero_safe ... ok
+test color_library::tests::unsupported_lut_extensions_are_explained ... ok
+test deadline_tests::no_overdue_no_missed ... ok
+test deadline_tests::counts_whole_intervals ... ok
+test downscale_tests::empty_input_is_safe ... ok
+test downscale_tests::solid_color_stays_solid ... ok
+test health::tests::contained_panic_is_recorded ... ok
+test jpeg_speed::monitor_jpeg_cost ... ignored
+test platforms::tests::custom_validates_scheme ... ok
+test platforms::tests::facebook_requires_rtmps ... ok
+test platforms::tests::tiktok_needs_server_url ... ok
+test platforms::tests::youtube_default_server_and_key_validation ... ok
+test production::camera_audio_tests::pairs_capture_card_audio_by_name_only ... ok
+test production::transition_tests::fade_passes_through_black_and_wipe_moves_an_edge ... ok
+test production::transition_tests::pan_and_trim ... ok
+test production::transition_tests::placement_fill_crops_centre_and_fit_letterboxes ... ok
+test test_pattern::tests::any_size_returns_exact_buffer ... ok
+test audio_monitor::tests::resampling_consumes_source_continuously ... ok
+test test_pattern::tests::static_elements_are_exact ... ok
+test test_pattern::tests::sweep_and_frame_boxes_move_with_time ... ok
+test test_pattern::tests::per_frame_cost_is_small ... ok
+test downscale_tests::output_dimensions_match ... ok
+test diagnostics::tests::cpu_and_memory_are_measured ... ok
+
+test result: ok. 32 passed; 0 failed; 1 ignored; 0 measured; 0 filtered out; finished in 0.70s
+
+     Running tests/av_backends.rs (target/debug/deps/av_backends-4be8abad35f672a9)
+
+running 11 tests
+test latency_bench ... ignored
+test media_source_bad_path_fails_cleanly ... ok
+test live_meters_peak_hold_and_solo_flag ... ok
+test media_source_renders_and_meters_go_live ... ok
+[h264_nvenc @ 0x7f80403a0440] Cannot load libcuda.so.1
+[h264_qsv @ 0x7f80403a0440] Specified pixel format yuv420p is not supported by the h264_qsv encoder.
+[h264_qsv @ 0x7f80403a0440] Supported pixel formats:
+[h264_qsv @ 0x7f80403a0440]   nv12
+[h264_qsv @ 0x7f80403a0440]   qsv
+[libx264 @ 0x7f80403a0440] using cpu capabilities: MMX2 SSE2Fast SSSE3 SSE4.2 AVX FMA3 BMI2 AVX2 AVX512
+[libx264 @ 0x7f80403a0440] profile High, level 4.0, 4:2:0, 8-bit
+[libx264 @ 0x7f80403a0440] 264 - core 164 r3108 31e19f9 - H.264/MPEG-4 AVC codec - Copyleft 2003-2023 - http://www.videolan.org/x264.html - options: cabac=1 ref=1 deblock=1:0:0 analyse=0x3:0x113 me=hex subme=2 psy=1 psy_rd=1.00:0.00 mixed_ref=0 me_range=16 chroma_me=1 trellis=0 8x8dct=1 cqm=0 deadzone=21,11 fast_pskip=1 chroma_qp_offset=0 threads=4 lookahead_threads=4 sliced_threads=1 slices=4 nr=0 decimate=1 interlaced=0 bluray_compat=0 constrained_intra=0 bframes=0 weightp=1 keyint=60 keyint_min=6 scenecut=40 intra_refresh=0 rc_lookahead=0 rc=cbr mbtree=0 bitrate=8000 ratetol=1.0 qcomp=0.60 qpmin=0 qpmax=69 qpstep=4 vbv_maxrate=8000 vbv_bufsize=8000 nal_hrd=cbr filler=1 ip_ratio=1.40 aq=1:1.00
+test program_monitor_serves_live_jpeg_from_tick_cache ... ok
+test record_requires_output_path ... ok
+[mp4 @ 0x7f8040853b80] Estimating the duration of the last packet in a fragment, consider setting the duration field in AVPacket instead.
+[libx264 @ 0x7f80403a0440] frame I:1     Avg QP:10.94  size: 21358
+[libx264 @ 0x7f80403a0440] frame P:4     Avg QP:12.99  size: 11327
+[libx264 @ 0x7f80403a0440] mb I  I16..4: 89.5%  3.8%  6.7%
+[libx264 @ 0x7f80403a0440] mb P  I16..4: 18.0%  0.0%  0.4%  P16..4:  6.3%  1.1%  0.3%  0.0%  0.0%    skip:73.9%
+[libx264 @ 0x7f80403a0440] 8x8 transform intra:2.3% inter:20.3%
+[libx264 @ 0x7f80403a0440] coded y,uvDC,uvAC intra: 4.2% 2.7% 2.1% inter: 3.6% 2.3% 1.7%
+[libx264 @ 0x7f80403a0440] i16 v,h,dc,p: 84% 14%  2%  0%
+[libx264 @ 0x7f80403a0440] i8 v,h,dc,ddl,ddr,vr,hd,vl,hu: 48% 22% 29%  1%  0%  0%  0%  0%  0%
+[libx264 @ 0x7f80403a0440] i4 v,h,dc,ddl,ddr,vr,hd,vl,hu: 41% 26% 25%  1%  1%  2%  1%  1%  1%
+[libx264 @ 0x7f80403a0440] i8c dc,h,v,p: 88%  6%  6%  0%
+[libx264 @ 0x7f80403a0440] Weighted P-Frames: Y:0.0% UV:0.0%
+[libx264 @ 0x7f80403a0440] kb/s:3200.02
+[aac @ 0x7f8040383e40] Qavg: 65536.000
+ALSA lib confmisc.c:855:(parse_card) cannot find card '0'
+ALSA lib conf.c:5208:(_snd_config_evaluate) function snd_func_card_inum returned error: No such file or directory
+ALSA lib confmisc.c:422:(snd_func_concat) error evaluating strings
+ALSA lib conf.c:5208:(_snd_config_evaluate) function snd_func_concat returned error: No such file or directory
+ALSA lib confmisc.c:1342:(snd_func_refer) error evaluating name
+ALSA lib conf.c:5208:(_snd_config_evaluate) function snd_func_refer returned error: No such file or directory
+ALSA lib conf.c:5731:(snd_config_expand) Evaluate error: No such file or directory
+ALSA lib pcm.c:2721:(snd_pcm_open_noupdate) Unknown PCM default
+test source_audio_device_labels ... ok
+test record_produces_real_mp4 ... ok
+[h264_nvenc @ 0x55e8ef8539c0] Cannot load libcuda.so.1
+[h264_qsv @ 0x55e8ef8539c0] Specified pixel format yuv420p is not supported by the h264_qsv encoder.
+[h264_qsv @ 0x55e8ef8539c0] Supported pixel formats:
+[h264_qsv @ 0x55e8ef8539c0]   nv12
+[h264_qsv @ 0x55e8ef8539c0]   qsv
+[libx264 @ 0x55e8ef8539c0] using cpu capabilities: MMX2 SSE2Fast SSSE3 SSE4.2 AVX FMA3 BMI2 AVX2 AVX512
+[libx264 @ 0x55e8ef8539c0] profile High, level 4.0, 4:2:0, 8-bit
+[libx264 @ 0x55e8ef8539c0] 264 - core 164 r3108 31e19f9 - H.264/MPEG-4 AVC codec - Copyleft 2003-2023 - http://www.videolan.org/x264.html - options: cabac=1 ref=1 deblock=1:0:0 analyse=0x3:0x113 me=hex subme=2 psy=1 psy_rd=1.00:0.00 mixed_ref=0 me_range=16 chroma_me=1 trellis=0 8x8dct=1 cqm=0 deadzone=21,11 fast_pskip=1 chroma_qp_offset=0 threads=4 lookahead_threads=4 sliced_threads=1 slices=4 nr=0 decimate=1 interlaced=0 bluray_compat=0 constrained_intra=0 bframes=0 weightp=1 keyint=60 keyint_min=6 scenecut=40 intra_refresh=0 rc_lookahead=0 rc=cbr mbtree=0 bitrate=8000 ratetol=1.0 qcomp=0.60 qpmin=0 qpmax=69 qpstep=4 vbv_maxrate=8000 vbv_bufsize=8000 nal_hrd=cbr filler=1 ip_ratio=1.40 aq=1:1.00
+[tcp @ 0x7f80d80027c0] Connection to tcp://127.0.0.1:1935?tcp_nodelay=1 failed: Connection refused
+[rtmp @ 0x7f80d8002140] Cannot open connection tcp://127.0.0.1:1935?tcp_nodelay=1
+[aac @ 0x55e8f03ff8c0] Qavg: nan
+test stream_start_unreachable_fails_cleanly_without_key_leak ... ok
+test duplicated_scene_shares_the_capture ... ok
+[libx264 @ 0x7f810a7a4840] using cpu capabilities: MMX2 SSE2Fast SSSE3 SSE4.2 AVX FMA3 BMI2 AVX2 AVX512
+[libx264 @ 0x7f810a7a4840] profile High, level 3.1, 4:2:0, 8-bit
+[libx264 @ 0x7f810a7a4840] 264 - core 164 r3108 31e19f9 - H.264/MPEG-4 AVC codec - Copyleft 2003-2023 - http://www.videolan.org/x264.html - options: cabac=1 ref=1 deblock=1:0:0 analyse=0x3:0x113 me=hex subme=2 psy=1 psy_rd=1.00:0.00 mixed_ref=0 me_range=16 chroma_me=1 trellis=0 8x8dct=1 cqm=0 deadzone=21,11 fast_pskip=1 chroma_qp_offset=0 threads=4 lookahead_threads=4 sliced_threads=1 slices=4 nr=0 decimate=1 interlaced=0 bluray_compat=0 constrained_intra=0 bframes=0 weightp=1 keyint=60 keyint_min=6 scenecut=40 intra_refresh=0 rc_lookahead=0 rc=cbr mbtree=0 bitrate=2500 ratetol=1.0 qcomp=0.60 qpmin=0 qpmax=69 qpstep=4 vbv_maxrate=2500 vbv_bufsize=2500 nal_hrd=cbr filler=1 ip_ratio=1.40 aq=1:1.00
+[mp4 @ 0x7f8009efd280] Estimating the duration of the last packet in a fragment, consider setting the duration field in AVPacket instead.
+[libx264 @ 0x7f810a7a4840] frame I:3     Avg QP: 5.21  size: 18194
+[libx264 @ 0x7f810a7a4840] frame P:138   Avg QP: 3.13  size: 10047
+[libx264 @ 0x7f810a7a4840] mb I  I16..4: 85.6%  6.4%  7.9%
+[libx264 @ 0x7f810a7a4840] mb P  I16..4:  2.5%  1.7%  0.5%  P16..4:  3.7%  1.4%  0.2%  0.0%  0.0%    skip:89.9%
+[libx264 @ 0x7f810a7a4840] 8x8 transform intra:26.5% inter:8.9%
+[libx264 @ 0x7f810a7a4840] coded y,uvDC,uvAC intra: 30.7% 54.1% 52.1% inter: 2.2% 3.7% 3.2%
+[libx264 @ 0x7f810a7a4840] i16 v,h,dc,p: 87%  8%  4%  1%
+[libx264 @ 0x7f810a7a4840] i8 v,h,dc,ddl,ddr,vr,hd,vl,hu: 91%  2%  7%  0%  0%  0%  0%  0%  0%
+[libx264 @ 0x7f810a7a4840] i4 v,h,dc,ddl,ddr,vr,hd,vl,hu: 60% 24% 13%  1%  0%  1%  0%  1%  1%
+[libx264 @ 0x7f810a7a4840] i8c dc,h,v,p: 29% 12% 51%  7%
+[libx264 @ 0x7f810a7a4840] Weighted P-Frames: Y:0.0% UV:0.0%
+[libx264 @ 0x7f810a7a4840] kb/s:2453.00
+[aac @ 0x7f810adfaf00] Qavg: 364.278
+[aac @ 0x7f810adfaf00] 2 frames left in the queue on closing
+[in#0/flv @ 0x560d7d6aed80] Error during demuxing: Input/output error
+[in#0/flv @ 0x560d7d6aed80] Error retrieving a packet from demuxer: Input/output error
+test stream_and_record_share_one_encoder_and_follow_wall_clock ... ok
+
+test result: ok. 10 passed; 0 failed; 1 ignored; 0 measured; 0 filtered out; finished in 8.41s
+
+     Running tests/bench_longrun.rs (target/debug/deps/bench_longrun-4c831ab190def069)
+
+running 1 test
+test longrun_resources ... ignored
+
+test result: ok. 0 passed; 0 failed; 1 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/production.rs (target/debug/deps/production-25f2850a66527b99)
+
+running 25 tests
+test camera_reconfigure_updates_kind_and_lists_sources ... ok
+test camera_auto_audio_attaches ... ok
+test composite_order_and_visibility ... ok
+test cut_swaps_program_instantly ... ok
+test deleting_program_scene_falls_back_sanely ... ok
+test image_source_overlays_with_transparency ... ok
+test layouts_place_video_sources_bottom_first ... ok
+test auto_transition_ticks_and_commits ... ok
+test macro_apply_look_hits_program_sources_through_real_pipeline ... ok
+test macro_add_dispatch_remove ... ok
+test mixer_effects_per_channel_and_master ... ok
+test mixer_gain_mute_and_master ... ok
+test placed_source_lands_in_its_box ... ok
+test lightweight_paths_keep_results_correct ... ok
+[h264_nvenc @ 0x7f475647f000] Cannot load libcuda.so.1
+[h264_qsv @ 0x7f475647f000] Specified pixel format yuv420p is not supported by the h264_qsv encoder.
+[h264_qsv @ 0x7f475647f000] Supported pixel formats:
+[h264_qsv @ 0x7f475647f000]   nv12
+[h264_qsv @ 0x7f475647f000]   qsv
+[libx264 @ 0x7f475647f000] using cpu capabilities: MMX2 SSE2Fast SSSE3 SSE4.2 AVX FMA3 BMI2 AVX2 AVX512
+[libx264 @ 0x7f475647f000] profile High, level 4.0, 4:2:0, 8-bit
+[libx264 @ 0x7f475647f000] 264 - core 164 r3108 31e19f9 - H.264/MPEG-4 AVC codec - Copyleft 2003-2023 - http://www.videolan.org/x264.html - options: cabac=1 ref=1 deblock=1:0:0 analyse=0x3:0x113 me=hex subme=2 psy=1 psy_rd=1.00:0.00 mixed_ref=0 me_range=16 chroma_me=1 trellis=0 8x8dct=1 cqm=0 deadzone=21,11 fast_pskip=1 chroma_qp_offset=0 threads=4 lookahead_threads=4 sliced_threads=1 slices=4 nr=0 decimate=1 interlaced=0 bluray_compat=0 constrained_intra=0 bframes=0 weightp=1 keyint=60 keyint_min=6 scenecut=40 intra_refresh=0 rc_lookahead=0 rc=cbr mbtree=0 bitrate=8000 ratetol=1.0 qcomp=0.60 qpmin=0 qpmax=69 qpstep=4 vbv_maxrate=8000 vbv_bufsize=8000 nal_hrd=cbr filler=1 ip_ratio=1.40 aq=1:1.00
+test scene_crud_with_guards ... ok
+[mp4 @ 0x7f475411ef40] Estimating the duration of the last packet in a fragment, consider setting the duration field in AVPacket instead.
+[libx264 @ 0x7f475647f000] frame I:1     Avg QP:10.91  size: 21466
+[libx264 @ 0x7f475647f000] frame P:1     Avg QP:22.77  size:  1846
+[libx264 @ 0x7f475647f000] mb I  I16..4: 89.6%  3.7%  6.6%
+[libx264 @ 0x7f475647f000] mb P  I16..4:  1.7%  0.0%  0.3%  P16..4:  1.8%  0.2%  0.0%  0.0%  0.0%    skip:96.0%
+[libx264 @ 0x7f475647f000] 8x8 transform intra:3.7% inter:3.6%
+[libx264 @ 0x7f475647f000] coded y,uvDC,uvAC intra: 5.6% 2.5% 2.0% inter: 0.5% 0.1% 0.0%
+[libx264 @ 0x7f475647f000] i16 v,h,dc,p: 80% 16%  4%  0%
+[libx264 @ 0x7f475647f000] i8 v,h,dc,ddl,ddr,vr,hd,vl,hu: 45% 23% 31%  1%  0%  0%  0%  0%  0%
+[libx264 @ 0x7f475647f000] i4 v,h,dc,ddl,ddr,vr,hd,vl,hu: 40% 25% 25%  2%  1%  2%  2%  2%  1%
+[libx264 @ 0x7f475647f000] i8c dc,h,v,p: 90%  5%  5%  0%
+[libx264 @ 0x7f475647f000] Weighted P-Frames: Y:0.0% UV:0.0%
+[libx264 @ 0x7f475647f000] kb/s:2797.44
+[aac @ 0x7f4756800540] Qavg: 65536.000
+test record_lifecycle_records_for_real ... ok
+test scene_render_returns_valid_nonblank_png_via_real_pipeline ... ok
+test scenes_reorder ... ok
+test source_crud_reorder_visibility ... ok
+test transition_progress_math_is_pure_and_eased ... ok
+[h264_nvenc @ 0x7f47867f4900] Cannot load libcuda.so.1
+[h264_qsv @ 0x7f47867f4900] Specified pixel format yuv420p is not supported by the h264_qsv encoder.
+[h264_qsv @ 0x7f47867f4900] Supported pixel formats:
+[h264_qsv @ 0x7f47867f4900]   nv12
+[h264_qsv @ 0x7f47867f4900]   qsv
+[libx264 @ 0x7f47867f4900] using cpu capabilities: MMX2 SSE2Fast SSSE3 SSE4.2 AVX FMA3 BMI2 AVX2 AVX512
+[libx264 @ 0x7f47867f4900] profile High, level 4.0, 4:2:0, 8-bit
+[libx264 @ 0x7f47867f4900] 264 - core 164 r3108 31e19f9 - H.264/MPEG-4 AVC codec - Copyleft 2003-2023 - http://www.videolan.org/x264.html - options: cabac=1 ref=1 deblock=1:0:0 analyse=0x3:0x113 me=hex subme=2 psy=1 psy_rd=1.00:0.00 mixed_ref=0 me_range=16 chroma_me=1 trellis=0 8x8dct=1 cqm=0 deadzone=21,11 fast_pskip=1 chroma_qp_offset=0 threads=4 lookahead_threads=4 sliced_threads=1 slices=4 nr=0 decimate=1 interlaced=0 bluray_compat=0 constrained_intra=0 bframes=0 weightp=1 keyint=60 keyint_min=6 scenecut=40 intra_refresh=0 rc_lookahead=0 rc=cbr mbtree=0 bitrate=8000 ratetol=1.0 qcomp=0.60 qpmin=0 qpmax=69 qpstep=4 vbv_maxrate=8000 vbv_bufsize=8000 nal_hrd=cbr filler=1 ip_ratio=1.40 aq=1:1.00
+[tcp @ 0x7f4764003200] Connection to tcp://127.0.0.1:1935?tcp_nodelay=1 failed: Connection refused
+[rtmp @ 0x7f4764002c00] Cannot open connection tcp://127.0.0.1:1935?tcp_nodelay=1
+test video_settings_defaults_and_roundtrip ... ok
+[aac @ 0x7f4786704f80] Qavg: nan
+test stream_lifecycle_fails_cleanly_and_redacts_key ... ok
+test video_settings_rejects_bad_values ... ok
+test static_scene_is_rendered_once_until_it_changes ... ok
+test every_output_resolution_is_accepted_and_renders ... ok
+
+test result: ok. 25 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 3.06s
+
+     Running tests/shell.rs (target/debug/deps/shell-f61d176e2d5ceefa)
+
+running 15 tests
+test filter_stack_add_reorder_intensity_toggle_remove ... ok
+test bad_lut_is_rejected_and_old_lut_kept ... ok
+test auto_color_applies_editable_params ... ok
+test load_lut_sets_ref ... ok
+test look_apply_and_list_looks ... ok
+test one_active_look_and_presets_roundtrip ... ok
+test preview_png_is_valid_and_throttled ... ok
+test lut_library_import_list_remove ... ok
+test reset_param_restores_neutral ... ok
+test preview_modes_render ... ok
+test set_curve_and_reset_sections ... ok
+test ui_event_serde_tags_match_spec ... ok
+test set_param_roundtrip_clamps_and_echoes ... ok
+test stack_limit_enforced_and_warns ... ok
+test scopes_subscribe_emit_frames_on_drain ... ok
+
+test result: ok. 15 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.49s
+
+   Doc-tests sf_ui_backend
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
