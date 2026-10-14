@@ -1,0 +1,85 @@
+{
+  "checks": [
+    {
+      "name": "Audio processing tab keeps the UI alive",
+      "ok": true,
+      "detail": ""
+    },
+    {
+      "name": "No React crash box after Audio processing",
+      "ok": true,
+      "detail": ""
+    },
+    {
+      "name": "Effect switch reaches the backend",
+      "ok": true,
+      "detail": "\"mixer_set_fx\""
+    },
+    {
+      "name": "Audio settings window lists channels + master",
+      "ok": true,
+      "detail": ""
+    },
+    {
+      "name": "Master shows the limiter on",
+      "ok": true,
+      "detail": ""
+    },
+    {
+      "name": "First click arms delete",
+      "ok": true,
+      "detail": ""
+    },
+    {
+      "name": "Second click deletes the source",
+      "ok": true,
+      "detail": ""
+    },
+    {
+      "name": "Drag moves the block",
+      "ok": true,
+      "detail": "Color #0073ff | download.png | Camera | Screen  →  Camera | Color #0073ff | download.png | Screen"
+    },
+    {
+      "name": "Reorder sent to backend with every source",
+      "ok": true,
+      "detail": "[\"s-mic\",\"s-screen\",\"s-img\",\"s-color\",\"s-cam\"]"
+    },
+    {
+      "name": "Six output resolutions",
+      "ok": true,
+      "detail": "360p\n640×360,480p\n854×480,540p\n960×540,720p\n1280×720,1080p\n1920×1080,1440p\n2560×1440"
+    },
+    {
+      "name": "1440p sent to backend",
+      "ok": true,
+      "detail": ""
+    },
+    {
+      "name": "Custom bitrate applied",
+      "ok": true,
+      "detail": ""
+    },
+    {
+      "name": "Bitrate warning for 360p at 12345 kbps",
+      "ok": true,
+      "detail": ""
+    },
+    {
+      "name": "Video input lists the camera's own sizes",
+      "ok": true,
+      "detail": "1080p — 1920×1080 (16:9) / 720p — 1280×720 (16:9) / 480p — 640×480 (4:3) / 360p — 640×360 (16:9)"
+    },
+    {
+      "name": "High preset asks the camera for 1920×1080",
+      "ok": true,
+      "detail": "{\"source_id\":\"s-cam\",\"device\":\"HD Webcam\",\"width\":1920,\"height\":1080,\"fps\":30,\"format\":null,\"audio_device\":\"Microphone (HD Webcam)\"}"
+    },
+    {
+      "name": "No page errors",
+      "ok": true,
+      "detail": ""
+    }
+  ],
+  "errors": []
+}
