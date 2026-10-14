@@ -2263,3 +2263,4 @@ input[type="color"] { width: 64px; height: 30px; padding: 0; border: 1px solid v
 .field.stack { grid-template-columns: minmax(0, 1fr); }
 .field.stack .field-control { justify-content: flex-start; }
 .bitrate .inline-controls input { max-width: 140px; flex: 0 1 140px; }
+.add-ch .add-mic { font-size: 11px; padding: 0 2px; overflow-wrap: anywhere; }

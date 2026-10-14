@@ -55,6 +55,30 @@ and when it is released. Measurements: see "Before / after" at the end.
    never backs up) but decodes nothing; it resumes within one frame
    (measured 61 ms in a test).
 
+### Added in v0.1.29
+
+8. **Still scenes are rendered once.** A scene of colour, image and text
+   layers only (ungraded, no transition, Color page closed) gets a content
+   key (every layer's settings + render size). While the key holds, the tick
+   renders nothing new for the monitor and the UI gets "unchanged" replies:
+   no composite, no resize, no JPEG, no transfer, no image decode in the
+   window. With nothing encoding, nothing is rendered at all. Any edit gives
+   a new key → exactly one new picture. (Encoding still renders every frame;
+   the encoder needs them.)
+9. **Unseen screen capture does no work.** Desktop capture grabs on each
+   read (no device queue), so while no scene shows it, it is not read at all
+   (before: BitBlt 30×/s, frames dropped). Cameras still drain their queue.
+10. **Preview-scene monitor** is polled with the same "only if new" call as
+    the program monitor (before: a JPEG every 100 ms even for a still scene),
+    and a still preview scene is served from a cached frame.
+11. **Monitor polling slows down for a still picture** (≈1 s without a new
+    frame → 10 checks/s instead of 30).
+12. **Meters**: after 2 s of silence they poll at 4 Hz instead of 25 Hz, and
+    a meter canvas is only redrawn when what it shows changes.
+13. **Audio effects cost nothing when off.** A channel with every effect off
+    has no effects chain at all (its memory is released); each switched-off
+    effect skips its loop. The delay line is bounded (≤ 1 s, 384 KB).
+
 ## Background loops
 
 | Loop | Rate | Note |
@@ -62,8 +86,9 @@ and when it is released. Measurements: see "Before / after" at the end.
 | Media tick | output fps | Does no video work when nothing needs a picture. |
 | UI event pump | 15 Hz | Drains engine events only. |
 | System metrics | 1 Hz | Own thread (PDH can be slow); never blocks the tick. |
-| Program monitor poll | 30 Hz, 15 Hz under load | Only while the Production page is visible and the window is not hidden; "unchanged" replies carry 0 bytes. |
-| Meters | 25 Hz | Only while a meter is on screen. |
+| Program monitor poll | 30 Hz, 15 Hz under load, 10 Hz for a still picture | Only while the Production page is visible and the window is not hidden; "unchanged" replies carry 0 bytes. |
+| Preview-scene monitor poll | 10 Hz | Only in studio mode (preview ≠ program); "unchanged" replies carry 0 bytes. |
+| Meters | 25 Hz, 4 Hz after 2 s of silence | Only while a meter is on screen; canvases redraw only on change. |
 | Diagnostics | 1 Hz | |
 | Full state refresh | 0.2 Hz (1 Hz while recording) | Was 0.5 Hz; changes arrive as events. |
 
@@ -106,3 +131,20 @@ before and after: no leak found; the work was CPU per frame, not memory.
 
 Not measured: GPU %, VRAM, audio latency and A/V sync under these loads
 (this VM has no real GPU or audio device); behaviour on Windows hardware.
+
+### v0.1.29: still scene (measured)
+
+Linux CI runner (ubuntu-24.04, lavapipe software GPU), same benchmark for
+both builds (`BENCH_SCENARIO=static`: colour + PNG + text, monitor 640×360,
+UI thread encodes only new monitor frames, as the app does), 90 s each.
+CPU = % of one core, this process.
+
+| Build | CPU | Engine time / frame | UI-side time / frame | RAM |
+|---|---:|---:|---:|---:|
+| v0.1.28 | 17.6 % | 0.51 ms | 5.29 ms | 161 MB flat |
+| v0.1.29 | 0.4 % | 0.04 ms | 0.03 ms | 171 MB flat |
+
+The moving test-signal scene is unchanged (17.5 % vs 17.4 %): it has to be
+redrawn every frame. RAM was flat in both; the 10 MB difference was not
+investigated.
+
